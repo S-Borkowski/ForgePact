@@ -4219,15 +4219,16 @@ static void InstallEquipTraceHooks()
 // self = the DYING ENEMY and argument 2 = the killing Player_obj (the earlier reading had
 // the roles swapped, which is why no kill ever showed enemy data).
 // ---- signature drops ----------------------------------------------------------------------
-// On a rare / champion / ancient kill roll g_SigDropPct; on a hit build the next signature item
+// On every monster kill roll g_SigDropPct (Angelic's own 1-in-7500, no pity); on a hit build the next signature item
 // through the game's own loader (InitItemFromJson(json, "region-account-timestamp-type")) and
 // drop it where the monster died (LootGroundCreateFromItem).  The forge hooks fire inside
 // InitItemFromJson -> CreateItemNew, so the built-in entry above dresses the item.
 // Vanilla rates (agreed 2026-09-06): rare/champion 0.05 pct, ancient 0.5 pct, and a pity
 // counter that guarantees a drop after 1500 rare-tier kills without one.  `sigdrop` tunes them.
-static double g_SigDropPct = 0.05;        // rare (2) and champion (3) kills
-static double g_SigDropAncientPct = 0.5;  // ancient (4) kills
-static long g_SigDropPity = 1500;         // 0 = no pity
+static const double kSigDropAngelicPct = 100.0 / 7500.0;   // the game's Angelic/Unholy base (1 in 7500)
+static double g_SigDropPct = kSigDropAngelicPct;           // normal, rare and champion kills
+static double g_SigDropAncientPct = kSigDropAngelicPct;    // ancient (4) kills
+static long g_SigDropPity = 0;                             // 0 = no pity (default)
 static long g_SigDropSinceLast = 0;
 static long g_SigDropRolls = 0, g_SigDropHits = 0, g_SigDropFails = 0;
 static int g_SigDropNext = 0;           // 0 = crown, 1 = belt (they alternate)
@@ -4277,7 +4278,7 @@ static void SignatureDropOnKill(CInstance* S)
     try {
         RValue enemy = S->ToRValue();
         const double rarity = HhReadNumber(enemy, "enemyRarity", -1.0);
-        if (rarity < 2.0) return;   // rares, champions, ancients only
+        if (rarity < 1.0) return;   // not a monster (no enemyRarity)
         ++g_SigDropRolls; ++g_SigDropSinceLast;
         const double pct = rarity >= 4.0 ? g_SigDropAncientPct : g_SigDropPct;
         const bool pity = g_SigDropPity > 0 && g_SigDropSinceLast >= g_SigDropPity;
@@ -4289,7 +4290,7 @@ static void SignatureDropOnKill(CInstance* S)
 static std::string SigPct(double p) { char b[32]; sprintf_s(b, "%.3g", p); std::string s(b); return s + " pct"; }
 static void SigDropStatus()
 {
-    Out("sigdrop: rare " + (g_SigDropPct > 0.0 ? SigPct(g_SigDropPct) : std::string("off")) + ", ancient " + SigPct(g_SigDropAncientPct)
+    Out("sigdrop: every kill " + (g_SigDropPct > 0.0 ? SigPct(g_SigDropPct) : std::string("off")) + ", ancient " + SigPct(g_SigDropAncientPct)
         + ", pity " + std::to_string(g_SigDropPity) + " (since last " + std::to_string(g_SigDropSinceLast) + ") | rolls=" + std::to_string(g_SigDropRolls)
         + " drops=" + std::to_string(g_SigDropHits) + " fails=" + std::to_string(g_SigDropFails) + " next=" + (g_SigDropNext == 0 ? "crown" : "belt"));
 }
@@ -9081,7 +9082,7 @@ static bool HandleHeadhunterCommand(const std::string& lc, const std::string& re
         std::string v = Lower(TrimCopy(rest));
         if (v.empty() || v == "status") SigDropStatus();
         else if (v == "off" || v == "0") { g_SigDropPct = 0.0; g_SigDropAncientPct = 0.0; g_SigDropPity = 0; SigDropStatus(); }
-        else if (v == "vanilla" || v == "default") { g_SigDropPct = 0.05; g_SigDropAncientPct = 0.5; g_SigDropPity = 1500; InstallHeadhunterHook(); SigDropStatus(); }
+        else if (v == "vanilla" || v == "default") { g_SigDropPct = kSigDropAngelicPct; g_SigDropAncientPct = kSigDropAngelicPct; g_SigDropPity = 0; InstallHeadhunterHook(); SigDropStatus(); }
         else {
             // sigdrop <rare pct> [ancient pct] [pity kills]
             try {

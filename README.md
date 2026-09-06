@@ -70,9 +70,9 @@ touched. Command: `enemyspeed <multiplier> [ct|all]` (`enemyspeed 1.5 ct`), `ene
 prints the status with path-start and applied counters.
 
 ### Signature drops
-Tyrant's Crown (Great Helm) and Headhunter (Heavy Belt) drop from the game's own monsters:
-rare and champion kills 0.05 %, Ancient kills 0.5 %, and a pity counter guarantees a drop
-after 1500 rare-tier kills without one. They arrive as SS-tier Unholy items, fully set up,
+Tyrant's Crown (Great Helm) and Headhunter (Heavy Belt) drop from the game's own monsters at
+the Angelic/Unholy rate: 1 in 7500 per kill, any monster, no guarantee counter; the two take
+turns. They arrive as SS-tier Unholy items, fully set up,
 and the plugin recognises them on every load even without the Item Editor. Plugin commands:
 `sigdrop status`, `sigdrop <rare pct> [ancient pct] [pity kills]`, `sigdrop vanilla`, `sigdrop off`.
 
