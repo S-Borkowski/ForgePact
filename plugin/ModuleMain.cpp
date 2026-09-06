@@ -2883,6 +2883,28 @@ static bool CustomForgeMatches(const CustomForgeEntry& entry,
     return true;
 }
 
+// The game guards socketing, grid moves, stacking, pickup and market sends with
+// ItemCheckHash: it re-runs the item's own GenerateItemHash() (sha1 over itemType +
+// itemDefinitionStruct + itemInfoStruct + itemStatStruct with a protected salt) and
+// refuses the action when the stored itemDataHash differs (ReportClient 49).  Dressing an
+// item rewrites those structs, so the stored hash is refreshed right after through the
+// same method - the game's own code computes it, the plugin never touches the salt.
+static std::string ReadItemHash(const RValue& item)
+{
+    try { RValue h = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("itemDataHash") }); if (h.m_Kind == VALUE_STRING) return h.ToString(); } catch (...) {}
+    return std::string();
+}
+static bool RefreshItemHash(const RValue& item)
+{
+    try {
+        RValue fn = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("GenerateItemHash") });
+        if (fn.m_Kind == VALUE_UNDEFINED || fn.m_Kind == VALUE_UNSET) return false;
+        g_Yytk->CallBuiltin("script_execute", { fn });   // bound method: runs with the item as self
+        return true;
+    } catch (...) { return false; }
+}
+
+static volatile LONG g_CustomForgeHashMisses = 0;
 static bool TryApplyCustomForge(RValue* candidate)
 {
     if (!candidate || candidate->m_Kind != VALUE_OBJECT || g_CustomForgeEntries.empty())
@@ -2989,6 +3011,17 @@ static bool TryApplyCustomForge(RValue* candidate)
                 InterlockedIncrement(&g_CustomForgeMechanicTags);
                 if (entry.mechanic == "tyrant") g_TyItemTagged = true;
                 if (entry.mechanic == "beacon") g_BeItemTagged = true;
+            }
+            {
+                const std::string before = ReadItemHash(*candidate);
+                const bool ok = RefreshItemHash(*candidate);
+                const std::string after = ReadItemHash(*candidate);
+#ifndef FORGEPACT_RELEASE
+                static LONG s_HashLogs = 0;
+                if (!ok || after.empty() || after == before || InterlockedIncrement(&s_HashLogs) <= 24)
+                    Out("forge hash: " + before.substr(0, 8) + " -> " + (after.empty() ? std::string("(none)") : after.substr(0, 8)) + (ok ? "" : " GenerateItemHash unavailable"));
+#endif
+                if (!ok) InterlockedIncrement(&g_CustomForgeHashMisses);
             }
             RememberForgedItem(*candidate);
             // This counter is part of the release runtime contract, not merely
@@ -3436,7 +3469,10 @@ static bool RarityFloorActive() { return g_RarRarePct > 0.0 || g_RarAncientPct >
 static bool g_TyHookInstalled = false, g_TyHookAttempted = false;
 static PFUNC_YYGMLScript g_Orig_EnemyRaritySettings = nullptr;
 // enemyAffix indices whose meaning is live-confirmed (see kHhAffixNames); 0 = champion marker.
-static const int kTyAffixPool[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 25, 30, 31, 36, 38 };
+// Left out on purpose (2026-09-07 player reports "the more I kill, the more there are"):
+// 1 fractal (copies), 4 haunted, 7 possessed, 21 fallenangel (rises again on death).  A raised
+// monster with one of those spawns new monsters, those get raised too, and the zone snowballs.
+static const int kTyAffixPool[] = { 2, 3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 25, 30, 31, 36, 38 };
 static std::mt19937& TyRng() { static std::mt19937 rng{ std::random_device{}() }; return rng; }
 static bool TyRoll(double pct) { if (pct <= 0.0) return false; if (pct >= 100.0) return true; return std::uniform_real_distribution<double>(0.0, 100.0)(TyRng()) < pct; }
 
@@ -8290,6 +8326,29 @@ static bool g_DkOn = false;
 static double g_DkChance = -1.0;      // -1 = auto (canavarin kendi chances[11]'i)
 static double g_DkChanceMult = 1.0;   // auto modunda dis kapi carpani
 static std::set<int> g_DkTipler = { 12 };   // ek zar atilacak damla tipleri (12 = zindan anahtari)
+// Tip 41 kapisi Relic ile Prime Evil parcalarini (DropBossParts / DropUberParts) paylasir.
+// Relic kaydiraci acildiginda sirf relic dussun: bizim ek zarimiz surerken parca betikleri
+// atlanir, oyunun kendi tip-41 zari (boss odalari) dokunulmadan kalir.
+static PFUNC_YYGMLScript g_Orig_DropBossParts = nullptr, g_Orig_DropUberParts = nullptr;
+static bool g_DkPartsGuard = false, g_DkPartsHooksTried = false;
+static volatile long g_DkPartsSkipped = 0;
+static RValue& Hook_DropBossParts(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
+{
+    if (g_DkPartsGuard) { InterlockedIncrement(&g_DkPartsSkipped); return R; }
+    return g_Orig_DropBossParts ? g_Orig_DropBossParts(S, O, R, argc, A) : R;
+}
+static RValue& Hook_DropUberParts(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
+{
+    if (g_DkPartsGuard) { InterlockedIncrement(&g_DkPartsSkipped); return R; }
+    return g_Orig_DropUberParts ? g_Orig_DropUberParts(S, O, R, argc, A) : R;
+}
+static void EnsurePartsGuardHooks()
+{
+    if (g_DkPartsHooksTried) return;
+    g_DkPartsHooksTried = true;
+    HookOneScript("DropBossParts", "fp_dk_bossparts", (PVOID)Hook_DropBossParts, &g_Orig_DropBossParts);
+    HookOneScript("DropUberParts", "fp_dk_uberparts", (PVOID)Hook_DropUberParts, &g_Orig_DropUberParts);
+}
 // Tip basina dis-kapi carpani.  Yoksa g_DkChanceMult'e duser.
 static std::map<int, double> g_DkTipCarpan;
 
@@ -8562,7 +8621,9 @@ static RValue& Hook_LoadDrops(CInstance* S, CInstance* O, RValue& R, int argc, R
             RValue tipRV((double)tipEk);
             A2[2] = &tipRV;
             RValue r2;
+            if (tipEk == 41) { EnsurePartsGuardHooks(); g_DkPartsGuard = true; }
             if (g_OrigLoadDrops) g_OrigLoadDrops(S, O, r2, argc, A2.data());
+            g_DkPartsGuard = false;
             InterlockedIncrement(&g_DkRolls);
 
             // Izi sil - ayni cerceve sonraki damla tipleri icin kullaniliyor.
@@ -8640,7 +8701,7 @@ static void DungeonKeyCmd(const std::string& rest)
             char cb[56]; sprintf_s(cb, "(x%.0f olcek %.5f)", kc, TipOlcek(x));
             liste += cb;
         }
-        Out(std::string("dungeonkey: ") + (g_DkOn ? "ACIK" : "kapali")
+        Out(std::string("dungeonkey: ") + (g_DkOn ? "ACIK" : "kapali") + " | prime evil parcasi atlandi=" + std::to_string(g_DkPartsSkipped)
             + " | tipler=" + (liste.empty() ? std::string("(bos)") : liste)
             + " | oran=" + o
             + " | ek zar=" + std::to_string(g_DkRolls)

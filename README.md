@@ -32,11 +32,15 @@ likely, still random, still capped by the game's own rules. The vanilla value is
 on first touch, so moving the slider twice never compounds. `x1` restores vanilla
 exactly.
 
-Key and Relic families are also gated a second time: outside their home zone the game
-rolls their drop type at zero chance, so the item can never come up no matter how good
-its rate is. ForgePact opens that outer roll for the families you enable — using the
-monster's **own** key chance as the base, never a fixed number. Families the zone
-already rolls natively are left untouched.
+Dungeon Keys, Angelic Keys and Relics are also gated a second time: outside their home
+zone the game rolls their drop type at zero chance, so the item can never come up no
+matter how good its rate is. ForgePact opens that outer roll for those three families
+when you raise them — using the monster's **own** key chance as the base, never a fixed
+number; Prime Evil parts, which share the relic roll, are skipped. Every other family
+(runes, gems, orbs, scrolls, shards, fragments, ruby keys) only scales its own roll where
+the game already drops it, so zone rules stay intact.
+
+Click the number next to any slider to type an exact value (Enter applies, Escape cancels).
 
 Special content is spawned through the game's **own** mechanic: ForgePact multiplies
 the `Spawn_<Name>_obj` marker objects and opens the shared `eSt` gate, then the game

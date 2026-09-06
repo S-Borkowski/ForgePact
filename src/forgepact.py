@@ -58,21 +58,25 @@ KEYS = [
     ("chaos", "Chaos + Crystal Keys", None),
     ("bifrost", "Bifrost Key", None),
     ("relic", "Relics", 41),
-    # Families below were live-tested 2026-09-06 (docs/drop-slider-static-analysis.md):
-    # x50 on ~100 kills gave 15 runes, 32 orbs, 449 scrolls, 658/447 fragments,
-    # 155 shards where vanilla gave none.  Gates from the 2026-08-27 type map.
+    # Families below were live-tested 2026-09-06 (docs/drop-slider-static-analysis.md).
+    # They carry NO drop type on purpose (1.3.13): the slider only scales the
+    # family's own vanilla roll where the game already rolls it.  1.3.10-1.3.12
+    # also opened the LoadDrops gate everywhere, which made every monster in
+    # every zone drop fragments, scrolls and shards (player reports 2026-09-07).
     ("rune", "Runes", None),
     ("stone", "Gems (chipped to flawless)", None),
     ("bossgem", "Boss Gems", None),
-    ("orb", "Orbs", 37),
-    ("scrollofra", "Scrolls of Ra", 34),
-    ("dimshard", "Dimensional Shards", 43),
-    ("battlefrag", "Battle Fragments", 25),
-    ("colosfrag", "Colosseum Fragments", 38),
-    # Not offered: Prime Evil parts share LoadDrops type 41 with Relics (opening
-    # it rains relics), and Satanic materials sit at base 100,000-50,000,000,
-    # which no division reaches.  Both stay usable from the plugin console.
-    ("ruby", "Ruby Keys", 18),
+    ("orb", "Orbs", None),
+    ("scrollofra", "Scrolls of Ra", None),
+    ("dimshard", "Dimensional Shards", None),
+    ("battlefrag", "Battle Fragments", None),
+    ("colosfrag", "Colosseum Fragments", None),
+    # Not offered: Prime Evil parts share LoadDrops type 41 with Relics (the
+    # plugin skips them while the relic gate rolls), and Satanic materials sit at
+    # base 100,000-50,000,000, which no division reaches.
+    # Ruby Keys: the game's own gate is already open (chances[18] = 1), only the
+    # key's 1-in-1,500,000 roll needs scaling.
+    ("ruby", "Ruby Keys", None),
 ]
 
 DROPS = [
@@ -1361,6 +1365,8 @@ h1{font-size:26px;margin:0;letter-spacing:2px;background:linear-gradient(90deg,v
 .row .lbl{width:200px;font-size:13px}
 .row .lbl .tag{font-size:10px;color:var(--mut);margin-left:6px}
 input[type=range]{flex:1;-webkit-appearance:none;height:6px;border-radius:3px;background:linear-gradient(90deg,#3a2516,#241811);outline:none}
+.numedit{width:62px;background:#1a120c;color:#ffd9a0;border:1px solid #6b4a2a;border-radius:6px;font:inherit;text-align:right;padding:2px 4px;outline:none}
+.numedit:focus{border-color:#ff9a3c}
 input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:radial-gradient(circle at 35% 35%,var(--ember2),var(--ember) 60%,#a03c08);cursor:pointer;box-shadow:0 0 10px #ff7a1a99}
 .val{width:52px;text-align:center;font-weight:bold;font-size:15px;color:var(--ember2)}
 .val.off{color:#777}
@@ -1591,7 +1597,32 @@ function row(sec,key,label,val,tagHtml,max,note,step){
   const n=note?`<div class="note" data-note="${key}">${note}</div>`:'';
   return `<div class="row"><span class="lbl">${label}${tagHtml||''}</span>
     <input type="range" min="${mn}" max="${mx}" step="${step||1}" value="${val}" data-sec="${sec}" data-key="${key}">
-    <span class="val ${off?'off':''}" style="width:64px">${sliderText(sec,val)}</span></div>${n}`;
+    <span class="val ${off?'off':''}" style="width:64px" title="Click to type a value">${sliderText(sec,val)}</span></div>${n}`;
+}
+// Click the value next to a slider to type it.  Sliders with 100-200 steps on a
+// 200 px track skip values (80, 85, 95 ...); typing lands exactly.  Enter or
+// leaving the box applies through the slider's own handlers, Escape cancels.
+function typable(r,valEl){
+  if(!r||!valEl||valEl.dataset.typable)return;
+  valEl.dataset.typable='1'; valEl.style.cursor='text'; valEl.title='Click to type a value';
+  valEl.onclick=()=>{
+    if(valEl.querySelector('input'))return;
+    const inp=document.createElement('input');
+    inp.type='number'; inp.className='numedit'; inp.min=r.min; inp.max=r.max; inp.step=r.step||1; inp.value=r.value;
+    valEl.textContent=''; valEl.appendChild(inp); inp.focus(); inp.select();
+    let finished=false;
+    const done=async(apply)=>{
+      if(finished)return; finished=true;
+      let v=parseFloat(inp.value);
+      if(apply&&isFinite(v)){
+        const st=parseFloat(r.step)||1, mn=parseFloat(r.min), mx=parseFloat(r.max);
+        v=Math.min(mx,Math.max(mn,v)); v=Math.round(v/st)*st; v=+v.toFixed(3);
+        r.value=v; if(r.oninput)r.oninput(); if(r.onchange)await r.onchange();
+      } else { if(r.oninput)r.oninput(); else valEl.textContent=r.value; }
+    };
+    inp.onkeydown=(e)=>{ if(e.key==='Enter'){e.preventDefault();done(true);} else if(e.key==='Escape'){e.preventDefault();done(false);} };
+    inp.onblur=()=>done(true);
+  };
 }
 // "x2" on its own says nothing - it means something different per family.
 // Chaos/Bifrost already have their gate open, so x2 really is double there.  For
@@ -1636,7 +1667,7 @@ function rareNote(key,v){
 function keyNote(key,dropType,v){
   if(v<=1) return 'off';
   if(key==='ruby') return `${v}x the key's own vanilla roll (base 1,500,000)`;
-  if(dropType===null||dropType===undefined) return `${v}x its vanilla drop rate`;
+  if(dropType===null||dropType===undefined) return `${v}x its vanilla drop rate, only where the game drops it anyway`;
   if(key==='relic'){
     // Same curve as the plugin:  probability = 0.00025 * v^2  (clamped at 1.0)
     const p=Math.min(1,0.00025*v*v);
@@ -1740,10 +1771,12 @@ function bind(){
       const res=await j('/api/set',{method:'POST',body:JSON.stringify({section:r.dataset.sec,key:r.dataset.key,value:+r.value})});
       toast((r.dataset.key)+' = '+sliderText(r.dataset.sec,+r.value)+' - '+(res.ok||res.err));
     };
+    typable(r,valEl);
   });
   const den=document.getElementById('den');
   den.oninput=()=>{document.getElementById('denval').textContent='x'+den.value};
   den.onchange=async()=>{const res=await j('/api/set',{method:'POST',body:JSON.stringify({key:'density',value:+den.value})});toast('density x'+den.value+' - '+(res.ok||res.err))};
+  typable(den,document.getElementById('denval'));
   document.getElementById('den_on').onchange=async(e)=>{
     const res=await j('/api/set',{method:'POST',body:JSON.stringify({key:'density_on',value:e.target.checked})});
     document.getElementById('denval').textContent=e.target.checked?'x'+den.value:'off';
@@ -1761,6 +1794,7 @@ function bind(){
     const res=await j('/api/set',{method:'POST',body:JSON.stringify({key:'enemy_speed',value:+esp.value})});
     toast('enemy speed '+espText(+esp.value)+' - '+(res.ok||res.err));
   };
+  typable(esp,document.getElementById('enemyspeedval'));
   document.getElementById('enemyspeed_ct').onchange=async(e)=>{
     const res=await j('/api/set',{method:'POST',body:JSON.stringify({key:'enemy_speed_ct',value:e.target.checked})});
     document.getElementById('enemyspeedctval').textContent=e.target.checked?'CT only':'all zones';
@@ -1799,6 +1833,7 @@ function bind(){
       if(res.cfg) rarityLoad(res.cfg); else rarityPaint();
       toast('monster rarity: '+document.getElementById('raritynote').textContent+' - '+(res.ok||res.err));
     };
+    typable(el,document.getElementById(key==='rarity_rare'?'rarityrareval':'rarityancval'));
   }
   document.getElementById('applyall').onclick=async()=>{
     const res=await j('/api/applyall',{method:'POST',body:'{}'});
