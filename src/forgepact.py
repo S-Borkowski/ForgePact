@@ -58,6 +58,21 @@ KEYS = [
     ("chaos", "Chaos + Crystal Keys", None),
     ("bifrost", "Bifrost Key", None),
     ("relic", "Relics", 41),
+    # Families below were live-tested 2026-09-06 (docs/drop-slider-static-analysis.md):
+    # x50 on ~100 kills gave 15 runes, 32 orbs, 449 scrolls, 658/447 fragments,
+    # 155 shards where vanilla gave none.  Gates from the 2026-08-27 type map.
+    ("rune", "Runes", None),
+    ("stone", "Gems (chipped to flawless)", None),
+    ("bossgem", "Boss Gems", None),
+    ("orb", "Orbs", 37),
+    ("scrollofra", "Scrolls of Ra", 34),
+    ("dimshard", "Dimensional Shards", 43),
+    ("battlefrag", "Battle Fragments", 25),
+    ("colosfrag", "Colosseum Fragments", 38),
+    # Not offered: Prime Evil parts share LoadDrops type 41 with Relics (opening
+    # it rains relics), and Satanic materials sit at base 100,000-50,000,000,
+    # which no division reaches.  Both stay usable from the plugin console.
+    ("ruby", "Ruby Keys", 18),
 ]
 
 DROPS = [
@@ -96,12 +111,6 @@ PERCENT_STATS = [
 #             Satanic and the normal rarity ladder all at once
 #   satanic : the Satanic tier is chosen by monster level, so we let low-level
 #             monsters count as higher level (capped at the game's own top row)
-RARE = [
-    ("angelic", "Angelic / Unholy", 10),
-    ("ceiling", "All Rare Tiers", 3),
-    ("satanic", "Satanic Tier", 5),
-]
-
 DEFAULTS = {
     "game_exe": DEFAULT_EXE,
     "density": 1,
@@ -111,6 +120,10 @@ DEFAULTS = {
     "headhunter": False,
     "tyrant": False,
     "beacon": False,
+    # Monster Rarity: the share of normal monsters raised to Rare and to Ancient
+    # (percent each, together at most 100; the rest stay normal).
+    "rarity_rare": 0,
+    "rarity_ancient": 0,
     # Enemy movement speed bonus in percent (0 = vanilla) and its scope.
     "enemy_speed": 0,
     "enemy_speed_ct": True,
@@ -119,7 +132,6 @@ DEFAULTS = {
     "keys": {k: 1 for k, *_ in KEYS},
     "stats": {k: 1 for k, *_ in STATS},
     "percent_stats": {k: 0 for k, *_ in PERCENT_STATS},
-    "rare": {k: 1 for k, *_ in RARE},
 }
 
 _lock = threading.Lock()
@@ -362,14 +374,22 @@ def build_key_cmds(settings: dict, include_resets: bool = False) -> list:
     values and an installed LoadDrops hook.
     """
     out = []
-    gated = [(drop_type, int(settings.get(k, 1))) for k, _l, drop_type in KEYS
+    gated = [(k, drop_type, int(settings.get(k, 1))) for k, _l, drop_type in KEYS
              if drop_type and int(settings.get(k, 1)) > 1]
     if include_resets:
         for _k, _l, drop_type in KEYS:
             if drop_type:
                 out.append(f"dungeonkey del {drop_type}")
-    for drop_type, multiplier in gated:
-        out.append(f"dungeonkey add {drop_type} {multiplier}")
+    for k, drop_type, multiplier in gated:
+        # The gate only decides whether the family's own die is rolled at all
+        # where the game would never roll it.  It opens at the monster's
+        # normal-key chance (x1); the slider scales the item's own vanilla roll
+        # below, so x2 is twice vanilla rather than (gate x2) * (roll x2) - the
+        # x50 flood of 2026-09-06 was that square.  Relic keeps its own squared
+        # curve (plugin g_DkTipOlcek): its vanilla rate away from the home zone
+        # is zero, so there is no "twice" to keep to.
+        gate = multiplier if k == "relic" else 1
+        out.append(f"dungeonkey add {drop_type} {gate}")
     if gated:
         out.append("dungeonkey chance auto")
         out.append("dungeonkey on")
@@ -380,6 +400,27 @@ def build_key_cmds(settings: dict, include_resets: bool = False) -> list:
         if value > 1 or include_resets:
             out.append(f"droprate group {k} {value}")
     return out
+
+
+def _pct(value, default=0) -> int:
+    try:
+        return max(0, min(100, int(round(float(value)))))
+    except (TypeError, ValueError):
+        return default
+
+
+def rarity_setting(cfg: dict):
+    """(rare, ancient) shares of the Monster Rarity sliders, in percent of the
+    normal monsters.  Ancient is honoured first; Rare is cut so the two never
+    exceed 100 together."""
+    ancient = _pct(cfg.get("rarity_ancient", 0))
+    rare = min(_pct(cfg.get("rarity_rare", 0)), 100 - ancient)
+    return rare, ancient
+
+
+def rarity_cmd(cfg: dict) -> str:
+    rare, ancient = rarity_setting(cfg)
+    return f"rarity {rare} {ancient}" if rare > 0 or ancient > 0 else "rarity off"
 
 
 ENEMY_SPEED_MAX = 300   # percent; x4 is where ranged sprinters stop being fair
@@ -429,6 +470,9 @@ def build_cmds(cfg: dict) -> list:
     if cfg.get("beacon", False):
         # Custom Forge Beacon amulet: every monster on the map hunts the player.
         out.append("beacon force")
+    rare, ancient = rarity_setting(cfg)
+    if rare > 0 or ancient > 0:
+        out.append(f"rarity {rare} {ancient}")
     if enemy_speed_pct(cfg.get("enemy_speed", 0)) > 0:
         # Enemies path-find toward you faster; "ct" keeps it to Chaos Tower.
         out.append(enemy_speed_cmd(cfg))
@@ -457,11 +501,6 @@ def build_cmds(cfg: dict) -> list:
             out.append(f"statadd {key} {bonus:g}")
         else:
             out.append(f"stat {key} {1.0 + bonus / 100.0:g}")
-    for key, _label, ceiling in RARE:
-        value = max(1, min(ceiling, int(cfg.get('rare', {}).get(key, 1))))
-        if value > 1:
-            out.append(f"raredrop {key} {value}")
-
     settings = cfg.get("keys", {})
     out.extend(build_key_cmds(settings, include_resets=False))
     return out
@@ -1134,7 +1173,6 @@ class H(BaseHTTPRequestHandler):
                         "drops": [[k, l, h] for k, l, h in DROPS],
                         "stats": [[k, l, mx, step] for k, l, mx, step in STATS],
                         "percentStats": [[k, l, mx, step, mode] for k, l, mx, step, mode in PERCENT_STATS],
-                        "rare": [[k, l, mx] for k, l, mx in RARE],
                         # Third field is the drop type: the panel's explanation text
                         # differs per family because they do not all mean the same thing.
                         "keys": [[k, l, t] for k, l, t in KEYS],
@@ -1162,9 +1200,6 @@ class H(BaseHTTPRequestHandler):
                     value = max(0.0, min(float(ceiling), float(val)))
                     value = round(value / step) * step
                     cfg.setdefault("percent_stats", {})[key] = int(value) if value.is_integer() else value
-                elif sec == "rare":
-                    ceiling = next((mx for k, _l, mx in RARE if k == key), 5)
-                    cfg.setdefault("rare", {})[key] = max(1, min(ceiling, int(val)))
                 elif sec == "drops":
                     cfg[sec][key] = max(1, min(100, int(val)))
                 elif sec == "spawners":
@@ -1183,6 +1218,12 @@ class H(BaseHTTPRequestHandler):
                     cfg["enemy_speed"] = enemy_speed_pct(val)
                 elif key == "enemy_speed_ct":
                     cfg["enemy_speed_ct"] = bool(val)
+                elif key in ("rarity_rare", "rarity_ancient"):
+                    cfg[key] = _pct(val)
+                    # the two shares never exceed 100 together; the one just
+                    # moved wins and the other gives way
+                    other = "rarity_ancient" if key == "rarity_rare" else "rarity_rare"
+                    cfg[other] = min(_pct(cfg.get(other, 0)), 100 - cfg[key])
                 elif key in ("density_on", "auto_apply", "map_reveal", "headhunter", "tyrant", "beacon"):
                     cfg[key] = bool(val)
                 save_cfg(cfg)
@@ -1201,8 +1242,6 @@ class H(BaseHTTPRequestHandler):
                         bonus = float(cfg["percent_stats"][key])
                         command = f"statadd {key} {bonus:g}" if mode == "add" else f"stat {key} {1.0 + bonus / 100.0:g}"
                         send_cmds([command], cfg)
-                    elif sec == "rare":
-                        send_cmds([f"raredrop {key} {int(val)}"], cfg)
                     elif sec == "spawners":
                         send_cmds([f"specialrate {key} {int(val)}"], cfg)
                     elif key in ("density", "density_on"):
@@ -1215,6 +1254,9 @@ class H(BaseHTTPRequestHandler):
                         send_cmds(["tyrant force" if cfg["tyrant"] else "tyrant off"], cfg)
                     elif key == "beacon":
                         send_cmds(["beacon force" if cfg["beacon"] else "beacon off"], cfg)
+                    elif key in ("rarity_rare", "rarity_ancient"):
+                        # Always explicit: "rarity off" returns a live hook to vanilla.
+                        send_cmds([rarity_cmd(cfg)], cfg)
                     elif key in ("enemy_speed", "enemy_speed_ct"):
                         # Always explicit: "enemyspeed 1 ct" turns a live hook back to vanilla.
                         send_cmds([enemy_speed_cmd(cfg)], cfg)
@@ -1428,8 +1470,10 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;heigh
   <div class="hint">All of these use the game's own dice - <b>nothing is forced</b>.
   <b>x5 means five times more likely than vanilla</b>; <b>off</b> (x1) leaves that drop completely untouched.
   Applies immediately, no zone reload needed.<br>
-  Keys and Relics additionally open the game's own roll for families it normally
-  skips outside their home zones.</div>
+  Every multiplier scales the item's own vanilla roll, so x2 is twice the vanilla rate.
+  Families the game never rolls outside their home zone (Dungeon and Angelic keys, Orbs,
+  Scrolls, Shards, Fragments) first get their roll opened at the monster's normal-key
+  chance; Relics use their own curve, explained on the row.</div>
   <div id="drops"></div>
   <div id="keys"></div>
 </div>
@@ -1461,22 +1505,20 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;heigh
   </div>
 </div>
 
-<div class="card tab-card" data-tab="loot">
-  <h2>&#11088; Rare Item Quality</h2>
-  <div class="hint">These do not make more items drop - they decide <b>how good</b> a drop
-  is allowed to be. Everything uses the game's own dice and its own tier tables; nothing is
-  forced and nothing is written into your save.<br>
-  <b>All Rare Tiers</b> is the master slider: it lifts every rarity ladder together, so use
-  it gently - the game reads it while a map loads, so it kicks in on the next map.
-  <b>x1</b> on any row means completely vanilla.<br>
-  Heroic has no slider: measured live, the game never reads its heroic chance during normal
-  monster kills (that path only runs for special chests), so a slider would be a lie.<br>
-  <b>Angelic / Unholy</b> works differently: offline the game never even rolls for these, so
-  <b>x2</b> simply lets it roll at its own rate. Unholy comes through the same path, so it
-  arrives with Angelic. This is the one setting that edits game code in memory rather than
-  just reading a value - the game file on disk is still never touched, and x1 puts the
-  original bytes straight back.</div>
-  <div id="rare"></div>
+<div class="card tab-card" data-tab="world">
+  <h2>&#128128; Monster Rarity</h2>
+  <div class="hint">Raises a share of the normal monsters to <b>Rare</b> (yellow) or <b>Ancient</b> (skull) as they spawn, through the game's own rarity setup: the monster gets that tier's stats, affixes and health bar exactly as if it had rolled that way. The two shares are separate and together stay at 100% or less - 25% Rare with 15% Ancient leaves 60% normal. Champions and the game's own rares are not touched. Stacks with Tyrant's Crown and Density.</div>
+  <div class="row" style="border:none">
+    <span class="lbl">Normal monsters raised to Rare</span>
+    <input type="range" min="0" max="100" step="5" id="rarity_rare" value="0">
+    <span class="val off" id="rarityrareval" style="width:64px">off</span>
+  </div>
+  <div class="row" style="border:none">
+    <span class="lbl">Normal monsters raised to Ancient</span>
+    <input type="range" min="0" max="100" step="5" id="rarity_ancient" value="0">
+    <span class="val off" id="rarityancval" style="width:64px">off</span>
+  </div>
+  <div class="note" id="raritynote">off</div>
 </div>
 
 <div class="card tab-card" data-tab="world">
@@ -1530,6 +1572,18 @@ function openTab(name,remember=true){
   if(remember){try{sessionStorage.setItem('forgepact_tab',name)}catch(e){}}
   window.scrollTo({top:0,behavior:'smooth'});
 }
+function rarityPaint(){
+  const r=+document.getElementById('rarity_rare').value, a=+document.getElementById('rarity_ancient').value;
+  const rv=document.getElementById('rarityrareval'), av=document.getElementById('rarityancval');
+  rv.textContent=r>0?r+'%':'off'; rv.className='val '+(r>0?'':'off');
+  av.textContent=a>0?a+'%':'off'; av.className='val '+(a>0?'':'off');
+  document.getElementById('raritynote').textContent=(r>0||a>0)?`of the normal monsters: ${a}% Ancient, ${r}% Rare, ${Math.max(0,100-r-a)}% stay normal`:'off - the game rolls rarity on its own';
+}
+function rarityLoad(c){
+  document.getElementById('rarity_rare').value=+(c.rarity_rare||0);
+  document.getElementById('rarity_ancient').value=+(c.rarity_ancient||0);
+  rarityPaint();
+}
 function sliderOff(sec,v){return sec==='percent_stats'?v<=0:v<=1}
 function sliderText(sec,v){return sliderOff(sec,v)?'off':(sec==='percent_stats'?'+'+v+'%':'x'+v)}
 function row(sec,key,label,val,tagHtml,max,note,step){
@@ -1581,13 +1635,14 @@ function rareNote(key,v){
 }
 function keyNote(key,dropType,v){
   if(v<=1) return 'off';
-  if(dropType===null||dropType===undefined) return `${v}x more likely than normal`;
+  if(key==='ruby') return `${v}x the key's own vanilla roll (base 1,500,000)`;
+  if(dropType===null||dropType===undefined) return `${v}x its vanilla drop rate`;
   if(key==='relic'){
     // Same curve as the plugin:  probability = 0.00025 * v^2  (clamped at 1.0)
     const p=Math.min(1,0.00025*v*v);
     return (p>=1)?'rolls on every kill':`rolls on about 1 kill in ${Math.round(1/p).toLocaleString()}`;
   }
-  return `${v}x the monster's key chance`;
+  return `${v}x its vanilla drop rate; where the game never rolls this family, the roll is opened at the normal-key chance first`;
 }
 async function boot(){
   ST=await j('/api/state');
@@ -1622,6 +1677,7 @@ async function boot(){
   document.getElementById('beacon').checked=be;
   document.getElementById('beval').textContent=be?'on':'off';
   document.getElementById('beval').className='val '+(be?'':'off');
+  rarityLoad(c);
   document.getElementById('hhval').className='val '+(hh?'':'off');
   document.getElementById('exepath').value=c.game_exe||'';
   document.getElementById('spawners').innerHTML=ST.spawners.map(([k,i,l,mx])=>row('spawners',k,l,c.spawners[k]||1,'',mx)).join('');
@@ -1642,10 +1698,6 @@ async function boot(){
   document.getElementById('offensivestats').innerHTML=percentRows(['damage','attackspeed','castrate']);
   document.getElementById('sustainstats').innerHTML=percentRows(['lifereplenish','manareplenish','defense']);
   document.getElementById('criticalstats').innerHTML=percentRows(['critdamage','critchance','spellcritdamage','spellcritchance']);
-  document.getElementById('rare').innerHTML=(ST.rare||[]).map(([k,l,mx])=>{
-    const v=(c.rare&&c.rare[k])||1;
-    return row('rare',k,l,v,'',mx,rareNote(k,v));
-  }).join('');
   bind(); status();
 }
 function status(){
@@ -1683,7 +1735,7 @@ function bind(){
       if(noteEl&&r.dataset.sec==='keys')noteEl.textContent=keyNote(r.dataset.key,tipOf(r.dataset.key),v);
       if(noteEl&&r.dataset.sec==='stats')noteEl.textContent=statNote(r.dataset.key,v);
       if(noteEl&&r.dataset.sec==='percent_stats')noteEl.textContent=percentStatNote(r.dataset.key,v);
-      if(noteEl&&r.dataset.sec==='rare')noteEl.textContent=rareNote(r.dataset.key,v);};
+    };
     r.onchange=async()=>{
       const res=await j('/api/set',{method:'POST',body:JSON.stringify({section:r.dataset.sec,key:r.dataset.key,value:+r.value})});
       toast((r.dataset.key)+' = '+sliderText(r.dataset.sec,+r.value)+' - '+(res.ok||res.err));
@@ -1738,6 +1790,16 @@ function bind(){
     document.getElementById('beval').className='val '+(e.target.checked?'':'off');
     toast('beacon '+(e.target.checked?'ON':'OFF')+' - '+(res.ok||res.err));
   };
+  for(const key of ['rarity_rare','rarity_ancient']){
+    const el=document.getElementById(key);
+    el.oninput=rarityPaint;
+    el.onchange=async()=>{
+      const res=await j('/api/set',{method:'POST',body:JSON.stringify({key,value:+el.value})});
+      // the server may have cut the other share so the two stay within 100
+      if(res.cfg) rarityLoad(res.cfg); else rarityPaint();
+      toast('monster rarity: '+document.getElementById('raritynote').textContent+' - '+(res.ok||res.err));
+    };
+  }
   document.getElementById('applyall').onclick=async()=>{
     const res=await j('/api/applyall',{method:'POST',body:'{}'});
     toast(res.ok||res.err); ST.lastApplied=new Date().toTimeString().slice(0,8); status();

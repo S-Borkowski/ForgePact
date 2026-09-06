@@ -69,6 +69,18 @@ zone vanilla; goblins and online client movement use their own movement code and
 touched. Command: `enemyspeed <multiplier> [ct|all]` (`enemyspeed 1.5 ct`), `enemyspeed` alone
 prints the status with path-start and applied counters.
 
+### Signature drops
+Tyrant's Crown (Great Helm) and Headhunter (Heavy Belt) drop from the game's own monsters:
+rare and champion kills 0.05 %, Ancient kills 0.5 %, and a pity counter guarantees a drop
+after 1500 rare-tier kills without one. They arrive as SS-tier Unholy items, fully set up,
+and the plugin recognises them on every load even without the Item Editor. Plugin commands:
+`sigdrop status`, `sigdrop <rare pct> [ancient pct] [pity kills]`, `sigdrop vanilla`, `sigdrop off`.
+
+### Tier (Custom Forge)
+A forged item can carry a Tier letter (`tier=1` C … `tier=5` SS in the runtime file; the Item
+Editor 2.15.3 offers it under Appearance). It is the letter the tooltip prints and the value loot
+filters use.
+
 ### Headhunter (Custom Forge mechanic)
 Forge any item in the Item Editor with **Mechanic: Headhunter** and switch on **World →
 Headhunter** in the panel. Killing a **rare or champion** monster then grants its affixes to

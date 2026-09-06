@@ -2498,6 +2498,9 @@ struct CustomForgeEntry
     // reads at draw time, so they can be overridden like a stat.
     std::string lore;
     int rarity = -1;
+    // Optional "tier=<n>" extra: itemInfoStruct["32"], the tooltip's Tier letter and the loot
+    // filter's tier: 1 C, 2 B, 3 A, 4 S, 5 SS (measured 2026-09-06 on 98 stash uniques).
+    int tier = -1;
     // Optional "mechanic=<name>" extra: a plugin-side behaviour bound to this
     // item (today only "headhunter").  The item struct is tagged with
     // fp_mechanic so the runtime can recognise it while it is equipped.
@@ -2585,6 +2588,10 @@ static bool ParseCustomForgeExtras(const std::string& text, CustomForgeEntry& en
             if (m.empty() || m.size() > 32) return false;
             for (char ch : m) if (!(std::isalnum((unsigned char)ch) || ch == '_')) return false;
             entry.mechanic = m;
+        } else if (key == "tier") {
+            double number = 0.0;
+            if (!ParseFiniteNumber(value, number) || number < 0.0 || number > 9.0) return false;
+            entry.tier = (int)number;
         } else {
             return false;
         }
@@ -2599,6 +2606,9 @@ static std::vector<CustomForgeEntry> g_CustomForgeEntries;
 // finished itemStatStruct of every item it builds.  Keyed by itemTimeStamp (the middle
 // part of the editor's item key "0-0-<timestamp>-<n>"), flushed to bp_ipc\itemstats.json.
 static std::unordered_map<std::string, std::string> g_ItemStatsDump;
+#ifndef FORGEPACT_RELEASE
+static std::unordered_map<std::string, std::string> g_ItemInfoDump;   // research: itemInfoStruct per item (tier / level / rarity research)
+#endif
 static std::atomic<bool> g_ItemStatsDirty{ false };
 static uint32_t g_ItemStatsLastFlush = 0;
 static void RecordItemStats(const RValue& item, const RValue& stats)
@@ -2616,6 +2626,16 @@ static void RecordItemStats(const RValue& item, const RValue& stats)
         if (it == g_ItemStatsDump.end() && g_ItemStatsDump.size() >= 6000) g_ItemStatsDump.clear();
         g_ItemStatsDump[key] = body;
         g_ItemStatsDirty = true;
+#ifndef FORGEPACT_RELEASE
+        try {
+            RValue info = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("itemInfoStruct") });
+            if (info.m_Kind == VALUE_OBJECT) {
+                RValue js2; g_Yytk->CallBuiltinEx(js2, "json_stringify", g, g, { info });
+                std::string ib = js2.ToString();
+                if (!ib.empty() && ib[0] == '{' && ib.size() <= 6000) g_ItemInfoDump[key] = ib;
+            }
+        } catch (...) {}
+#endif
     } catch (...) {}
 }
 static std::atomic<bool> g_ItemStatsWriting{ false };
@@ -2634,10 +2654,19 @@ static void FlushItemStats(uint32_t frame)
         bool first = true;
         for (const auto& kv : g_ItemStatsDump) { body += (first ? "" : ","); body += '"'; body += kv.first; body += "\":"; body += kv.second; first = false; }
         body += "}}";
+        std::string ibody;
+#ifndef FORGEPACT_RELEASE
+        ibody.reserve(g_ItemInfoDump.size() * 600 + 64);
+        ibody += "{\"schemaVersion\":1,\"items\":{";
+        { bool f1 = true; for (const auto& kv : g_ItemInfoDump) { ibody += (f1 ? "" : ","); ibody += '"'; ibody += kv.first; ibody += "\":"; ibody += kv.second; f1 = false; } }
+        ibody += "}}";
+#endif
+        const std::string ipath = IPC_DIR + "\\iteminfo_dump.json";
         const std::string path = IPC_DIR + "\\itemstats.json", tmp = path + ".tmp";
         g_ItemStatsWriting = true;
-        std::thread([path, tmp, body = std::move(body)]() {
+        std::thread([path, tmp, ipath, body = std::move(body), ibody = std::move(ibody)]() {
             try {
+                if (!ibody.empty()) { std::ofstream fi(ipath, std::ios::binary | std::ios::trunc); fi << ibody; }
                 { std::ofstream f(tmp, std::ios::binary | std::ios::trunc); f << body; }
                 std::error_code ec;
                 std::filesystem::rename(tmp, path, ec);
@@ -2735,11 +2764,50 @@ static void WriteCustomForgeStatus(const char* detail)
       << ",\"detail\":\"" << detail << "\"}\n";
 }
 
+// ---- built-in signature items ---------------------------------------------------------
+// The two ForgePact signature items exist as fixed Custom Forge entries inside the plugin
+// (reserved seeds), so a dropped or traded copy is recognised on every load even without
+// the Item Editor's runtime file.  A sidecar entry with the same selector wins.
+static const double kSigCrownSeed = 777001.0;   // Great Helm  (type 0, b 7)
+static const double kSigBeltSeed  = 777002.0;   // Heavy Belt  (type 8, b 2)
+static bool HasCustomForgeSelector(double t, double a, double b)
+{
+    for (const CustomForgeEntry& e : g_CustomForgeEntries) {
+        auto it = e.selector.find("t"), ia = e.selector.find("a"), ib = e.selector.find("b");
+        if (it != e.selector.end() && ia != e.selector.end() && ib != e.selector.end()
+            && it->second == t && ia->second == a && ib->second == b) return true;
+    }
+    return false;
+}
+static void AddBuiltInSignatureEntries()
+{
+    if (!HasCustomForgeSelector(0.0, kSigCrownSeed, 7.0)) {
+        CustomForgeEntry crown;
+        crown.selector = { {"t", 0.0}, {"a", kSigCrownSeed}, {"b", 7.0}, {"c", 0.0}, {"j", 0.0} };
+        crown.stats = { {20, 4}, {29, 130}, {51, 50}, {52, 250}, {55, 16}, {154, 200}, {173, 25}, {174, 3}, {198, 15}, {201, 3}, {282, 5}, {284, 50}, {288, 1} };
+        crown.keepNative = false; crown.rarity = 10; crown.tier = 5; crown.mechanic = "tyrant";
+        crown.name = "Tyrant's Crown";
+        crown.lore = "Every monster wants the throne. Let them die trying to take it.";
+        g_CustomForgeEntries.push_back(std::move(crown));
+    }
+    if (!HasCustomForgeSelector(8.0, kSigBeltSeed, 2.0)) {
+        CustomForgeEntry belt;
+        belt.selector = { {"t", 8.0}, {"a", kSigBeltSeed}, {"b", 2.0}, {"c", 0.0}, {"j", 0.0} };
+        belt.stats = { {25, 20}, {51, 75}, {69, 20}, {172, 1}, {173, 50}, {197, 20}, {198, 25}, {201, 10}, {284, 50} };
+        belt.keepNative = true; belt.rarity = 10; belt.tier = 5; belt.mechanic = "headhunter";
+        belt.name = "Headhunter";
+        belt.affix = "Steals the affixes of slain rare monsters for 20s";
+        belt.lore = "Whoever faces its wearer shall leave all hope behind. For they will never see tomorrow.";
+        g_CustomForgeEntries.push_back(std::move(belt));
+    }
+}
+
 static void LoadCustomForgeEntries()
 {
     g_CustomForgeEntries.clear();
     std::ifstream f(CustomForgeRuntimePath(), std::ios::binary);
     if (!f) {
+        AddBuiltInSignatureEntries();
         WriteCustomForgeStatus("no runtime file");
         return;
     }
@@ -2777,6 +2845,7 @@ static void LoadCustomForgeEntries()
         if (parts.size() == 5 && !ParseCustomForgeExtras(parts[4], entry)) { ++rejected; continue; }
         g_CustomForgeEntries.push_back(std::move(entry));
     }
+    AddBuiltInSignatureEntries();
     const std::string detail = headerSeen
         ? ("loaded " + std::to_string(g_CustomForgeEntries.size()) +
            ", rejected " + std::to_string(rejected))
@@ -2869,7 +2938,7 @@ static bool TryApplyCustomForge(RValue* candidate)
                     stats, RValue(std::to_string(stat.first)), RValue(stat.second)
                 });
             }
-            if (entry.rarity >= 0 || !entry.lore.empty() || !entry.name.empty()) {
+            if (entry.rarity >= 0 || entry.tier >= 0 || !entry.lore.empty() || !entry.name.empty()) {
                 RValue hasInfo = g_Yytk->CallBuiltin(
                     "variable_struct_exists", { *candidate, RValue("itemInfoStruct") });
                 RValue info = hasInfo.ToBoolean()
@@ -2878,6 +2947,8 @@ static bool TryApplyCustomForge(RValue* candidate)
                 if (info.m_Kind == VALUE_OBJECT) {
                     if (entry.rarity >= 0)
                         g_Yytk->CallBuiltin("variable_struct_set", { info, RValue("27"), RValue((double)entry.rarity) });
+                    if (entry.tier >= 0)
+                        g_Yytk->CallBuiltin("variable_struct_set", { info, RValue("32"), RValue((double)entry.tier) });
                     if (!entry.name.empty()) {
                         // ["28"] holds the finished display text once CreateItemNew
                         // returns (GenerateItemRandomStats still sees the CSV key);
@@ -3352,6 +3423,16 @@ static std::atomic<bool> g_TyForced{ false };
 static double g_TyRarePct = 30.0;      // chance a normal monster rises to rare (15 was too subtle to notice; 30 = 2-3 rares per pack)
 static double g_TyAffixPct = 100.0;    // chance a rare / champion carries one more affix
 static long g_TySeen = 0, g_TyUpgraded = 0, g_TyAffixed = 0;
+// Monster Rarity sliders: of the normal monsters, `g_RarAncientPct` percent are
+// raised to Ancient (4) and `g_RarRarePct` percent to Rare (3) at the same hook,
+// one die per monster so the shares are exclusive (25 rare + 15 ancient leaves
+// 60 normal).  The game itself builds ordinary monster objects at rarity 4
+// (traced 2026-09-05: Scorching_Legion_obj at enemyRarity 4 with 2-4 affixes),
+// so a raised monster is exactly a state the game produces on its own.
+static double g_RarRarePct = 0.0;
+static double g_RarAncientPct = 0.0;
+static long g_RarRaisedRare = 0, g_RarRaisedAncient = 0;
+static bool RarityFloorActive() { return g_RarRarePct > 0.0 || g_RarAncientPct > 0.0; }
 static bool g_TyHookInstalled = false, g_TyHookAttempted = false;
 static PFUNC_YYGMLScript g_Orig_EnemyRaritySettings = nullptr;
 // enemyAffix indices whose meaning is live-confirmed (see kHhAffixNames); 0 = champion marker.
@@ -3468,6 +3549,26 @@ static RValue& Hook_EnemyRaritySettings(CInstance* S, CInstance* O, RValue& R, i
     if (g_RarForceLeft > 0 && S) { --g_RarForceLeft; try { g_Yytk->CallBuiltin("variable_instance_set", { inst, RValue("forceRarity"), RValue(g_RarForceVal) }); Out("   -> forceRarity set to " + std::to_string((int)g_RarForceVal)); } catch (...) {} }
     if (g_RarPreLeft > 0 && S) { --g_RarPreLeft; try { g_Yytk->CallBuiltin("variable_instance_set", { inst, RValue("enemyRarity"), RValue(g_RarPreVal) }); Out("   -> enemyRarity pre-set to " + std::to_string((int)g_RarPreVal)); } catch (...) {} }
 #endif
+    if (S && RarityFloorActive()) {
+        try {
+            RValue rv = g_Yytk->CallBuiltin("variable_instance_get", { inst, RValue("enemyRarity") });
+            const double rar = (rv.m_Kind == VALUE_REAL || rv.m_Kind == VALUE_INT32 || rv.m_Kind == VALUE_INT64) ? rv.ToDouble() : -1.0;
+            if (rar == 1.0) {
+                const double roll = std::uniform_real_distribution<double>(0.0, 100.0)(TyRng());
+                int tier = 0;
+                if (roll < g_RarAncientPct) tier = 4;
+                else if (roll < g_RarAncientPct + g_RarRarePct) tier = 3;
+                if (tier) {
+                    g_Yytk->CallBuiltin("variable_instance_set", { inst, RValue("enemyRarity"), RValue((double)tier) });
+                    // the game's own ancients carry 2-4 affixes, its rares 1-2
+                    const int want = (tier == 4) ? 3 : 2;
+                    const int have = TyCountAffixes(inst);
+                    if (want > have) TyAddAffixes(inst, want - have);
+                    if (tier == 4) ++g_RarRaisedAncient; else ++g_RarRaisedRare;
+                }
+            }
+        } catch (...) {}
+    }
     if (S && TyrantActive()) {
         try {
             RValue rv = g_Yytk->CallBuiltin("variable_instance_get", { inst, RValue("enemyRarity") });
@@ -4117,9 +4218,86 @@ static void InstallEquipTraceHooks()
 // Live-verified 2026-09-04 (research probe, 5 real kills): EnemyDestroyKillProc runs with
 // self = the DYING ENEMY and argument 2 = the killing Player_obj (the earlier reading had
 // the roles swapped, which is why no kill ever showed enemy data).
+// ---- signature drops ----------------------------------------------------------------------
+// On a rare / champion / ancient kill roll g_SigDropPct; on a hit build the next signature item
+// through the game's own loader (InitItemFromJson(json, "region-account-timestamp-type")) and
+// drop it where the monster died (LootGroundCreateFromItem).  The forge hooks fire inside
+// InitItemFromJson -> CreateItemNew, so the built-in entry above dresses the item.
+// Vanilla rates (agreed 2026-09-06): rare/champion 0.05 pct, ancient 0.5 pct, and a pity
+// counter that guarantees a drop after 1500 rare-tier kills without one.  `sigdrop` tunes them.
+static double g_SigDropPct = 0.05;        // rare (2) and champion (3) kills
+static double g_SigDropAncientPct = 0.5;  // ancient (4) kills
+static long g_SigDropPity = 1500;         // 0 = no pity
+static long g_SigDropSinceLast = 0;
+static long g_SigDropRolls = 0, g_SigDropHits = 0, g_SigDropFails = 0;
+static int g_SigDropNext = 0;           // 0 = crown, 1 = belt (they alternate)
+static bool SpawnSignatureItem(int which, double x, double y, CInstance* ctx)
+{
+    const double seed = which == 0 ? kSigCrownSeed : kSigBeltSeed;
+    const int type = which == 0 ? 0 : 8;
+    const int b = which == 0 ? 7 : 2;
+    const char* label = which == 0 ? "Tyrant's Crown" : "Headhunter";
+    const char* stage = "start";
+    try {
+        const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        const std::string key = "0-0-" + std::to_string(ms) + "-" + std::to_string(type);
+        const std::string json = "{\"w\":1,\"a\":" + std::to_string((long long)seed) + ",\"j\":0,\"b\":" + std::to_string(b) + ",\"c\":0,\"o\":1}";
+        stage = "global";
+        CInstance* g = nullptr; g_Yytk->GetGlobalInstance(&g);
+        if (!g) { ++g_SigDropFails; Out("sigdrop: no global instance"); return false; }
+        stage = "json_parse";
+        RValue parsed; g_Yytk->CallBuiltinEx(parsed, "json_parse", g, g, { RValue(json) });
+        if (parsed.m_Kind != VALUE_OBJECT) { ++g_SigDropFails; Out(std::string("sigdrop: json_parse gave ") + Describe(parsed)); return false; }
+        stage = "InitItemFromJson";
+        RValue item; AurieStatus st = g_Yytk->CallGameScriptEx(item, "gml_Script_InitItemFromJson", g, g, { parsed, RValue(key) });
+        if (!AurieSuccess(st) || item.m_Kind != VALUE_OBJECT) {   // argument order not yet proven live: try the swap once
+            RValue item2; AurieStatus st2 = g_Yytk->CallGameScriptEx(item2, "gml_Script_InitItemFromJson", g, g, { RValue(key), parsed });
+            if (AurieSuccess(st2) && item2.m_Kind == VALUE_OBJECT) { item = item2; st = st2; }
+            else { ++g_SigDropFails; Out(std::string("sigdrop: InitItemFromJson gave ") + Describe(item) + " st=" + std::to_string((int)st) + " / swapped " + Describe(item2) + " st=" + std::to_string((int)st2) + " for " + label); return false; }
+        }
+        if (g_SigDropHits + g_SigDropFails < 3) {
+            try { RValue js; g_Yytk->CallBuiltinEx(js, "json_stringify", g, g, { item }); std::string s = js.ToString(); Out("sigdrop: item = " + s.substr(0, 420)); } catch (...) { Out("sigdrop: item stringify failed"); }
+        }
+        stage = "LootGroundCreateFromItem";
+        CInstance* self = ctx ? ctx : g;
+        RValue res; AurieStatus st3 = AURIE_SUCCESS;
+        try {
+            st3 = g_Yytk->CallGameScriptEx(res, "gml_Script_LootGroundCreateFromItem", self, self, { RValue(x), RValue(y), item });   // decompiled: (x, y, item)
+        } catch (const std::exception& e) { ++g_SigDropFails; Out(std::string("sigdrop: LootGroundCreateFromItem threw: ") + e.what()); return false; }
+        if (!AurieSuccess(st3)) { ++g_SigDropFails; Out(std::string("sigdrop: LootGroundCreateFromItem st=") + std::to_string((int)st3) + " for " + label); return false; }
+        stage = "after";
+        ++g_SigDropHits;
+        Out(std::string("sigdrop: ") + label + " dropped at " + std::to_string((int)x) + "," + std::to_string((int)y) + " kind=" + std::to_string((int)res.m_Kind));
+        return true;
+    } catch (...) { ++g_SigDropFails; Out(std::string("sigdrop: EXCEPTION at ") + stage + " while dropping " + label); return false; }
+}
+static void SignatureDropOnKill(CInstance* S)
+{
+    if (g_SigDropPct <= 0.0 || !S) return;
+    try {
+        RValue enemy = S->ToRValue();
+        const double rarity = HhReadNumber(enemy, "enemyRarity", -1.0);
+        if (rarity < 2.0) return;   // rares, champions, ancients only
+        ++g_SigDropRolls; ++g_SigDropSinceLast;
+        const double pct = rarity >= 4.0 ? g_SigDropAncientPct : g_SigDropPct;
+        const bool pity = g_SigDropPity > 0 && g_SigDropSinceLast >= g_SigDropPity;
+        if (!pity && !TyRoll(pct)) return;
+        const double x = HhReadNumber(enemy, "x", 0.0), y = HhReadNumber(enemy, "y", 0.0);
+        if (SpawnSignatureItem(g_SigDropNext, x, y, S)) { g_SigDropNext = 1 - g_SigDropNext; g_SigDropSinceLast = 0; }
+    } catch (...) {}
+}
+static std::string SigPct(double p) { char b[32]; sprintf_s(b, "%.3g", p); std::string s(b); return s + " pct"; }
+static void SigDropStatus()
+{
+    Out("sigdrop: rare " + (g_SigDropPct > 0.0 ? SigPct(g_SigDropPct) : std::string("off")) + ", ancient " + SigPct(g_SigDropAncientPct)
+        + ", pity " + std::to_string(g_SigDropPity) + " (since last " + std::to_string(g_SigDropSinceLast) + ") | rolls=" + std::to_string(g_SigDropRolls)
+        + " drops=" + std::to_string(g_SigDropHits) + " fails=" + std::to_string(g_SigDropFails) + " next=" + (g_SigDropNext == 0 ? "crown" : "belt"));
+}
+
 static RValue& Hook_EnemyDestroyKillProc(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
 {
     RValue& res = g_Orig_EnemyDestroyKillProc ? g_Orig_EnemyDestroyKillProc(S, O, R, argc, A) : R;
+    SignatureDropOnKill(S);
     if (g_HhEnabled.load() && S && argc >= 3 && A && A[2]) {
         try {
             CInstance* player = nullptr;
@@ -4493,6 +4671,10 @@ static RValue& Hook_DropKeys(CInstance* S, CInstance* O, RValue& R, int argc, RV
 #endif
 DROP_HOOK(DropChaosKey)
 DROP_HOOK(DropRubyKey)
+// Ores: DropOres runs from DropItem (the plain monster drop, its own tiered dice),
+// DropOreMaterials is a LoadDrops type.  Mining nodes are a different system.
+DROP_HOOK(DropOres)
+DROP_HOOK(DropOreMaterials)
 // Esyayi YERE koyan fonksiyon - "yaratildi" ile "dustu" farkini olcmek icin.
 DROP_HOOK(LootGroundCreate)
 // LootGroundCreate calisma aninda HIC cagrilmadi (olculdu: 0).
@@ -4656,6 +4838,8 @@ static void InstallDropMultHooks()
     HookOneScript("DropKeys",            "bp_dkeys",    (PVOID)Hook_DropKeys,            &g_Orig_DropKeys);
     HookOneScript("DropChaosKey",        "bp_dckey",    (PVOID)Hook_DropChaosKey,        &g_Orig_DropChaosKey);
     HookOneScript("DropRubyKey",         "bp_drkey",    (PVOID)Hook_DropRubyKey,         &g_Orig_DropRubyKey);
+    HookOneScript("DropOres",            "bp_dores",    (PVOID)Hook_DropOres,            &g_Orig_DropOres);
+    HookOneScript("DropOreMaterials",    "bp_doremat",  (PVOID)Hook_DropOreMaterials,    &g_Orig_DropOreMaterials);
 }
 
 // ===== Forged tooltip rows (Custom Forge `affix=` / Headhunter) ==================
@@ -4942,6 +5126,9 @@ static void DropStats()
         g_cnt_DropItemBoss, g_mult_DropItemBoss, g_cnt_DropItem, g_mult_DropItem,
         g_cnt_CreateItemDrop, g_mult_CreateItemDrop);
     Out(b);
+    sprintf_s(b, "          Ores c=%ld x%d | OreMaterials c=%ld x%d",
+        g_cnt_DropOres, g_mult_DropOres, g_cnt_DropOreMaterials, g_mult_DropOreMaterials);
+    Out(b);
     // Asil trafigin gectigi yollar - DropGold/DropDungeonKeys neredeyse hic
     // cagrilmiyor, gercek altin ve anahtarlar buradan geliyor.
     sprintf_s(b, "          MonsterGold c=%ld x%d | Keys c=%ld x%d | ChaosKey c=%ld x%d | RubyKey c=%ld x%d",
@@ -4975,7 +5162,8 @@ static void SetDropMult(const std::string& name, int n)
     else if (l == "angelic" || l == "angelicitem") { g_mult_DropItemAngelic = n; }
     else if (l == "angelickey") { g_mult_DropAngelicKey = n; }
     else if (l == "angeliccharm") { g_mult_DropAngelicCharm = n; }
-    else { Out("dropmult: unknown '" + name + "' (relic|gems|keys|runes|frags|shards|bifrost|gold|bossitem|item|createitem|angelic|angelickey|angeliccharm)"); return; }
+    else if (l == "ore" || l == "ores") { g_mult_DropOres = n; g_mult_DropOreMaterials = n; }
+    else { Out("dropmult: unknown '" + name + "' (relic|gems|keys|runes|frags|shards|bifrost|gold|bossitem|item|createitem|angelic|angelickey|angeliccharm|ore)"); return; }
     Out("dropmult " + name + " -> " + std::to_string(n));
 }
 
@@ -5456,6 +5644,7 @@ static void InstallHook()
     HeadhunterAutoArm();
     TyrantAutoArm();
     BeaconAutoArm();
+    if (g_SigDropPct > 0.0) InstallHeadhunterHook();   // kill hook carries the signature drops
 
     // Development builds install the complete research surface eagerly.
     // Player builds install only the functional hook group requested by a
@@ -7876,6 +8065,12 @@ static const DropGrup kDropGruplar[] = {
     { "battlefrag", 13, "battle_fragment",                                          25 },
     { "colosfrag",  13, "colosseum_fragment",                                       38 },
     { "satanic",    14, "material_satanic_",                                        39 },
+    // Ruby Key: LoadDrops type 18 (measured 2026-08-27); on normal monsters the
+    // gate is natively open at a tiny chance, the real wall is base 1,500,000.
+    { "ruby",       12, "keys_ruby_key",                                            18 },
+    // Plain gems (chipped/flawed/flawless + the plain stone): type 6, gate open.
+    // Perfect stones sit at base 50,000,000 and are not meant to drop.
+    { "stone",      15, "socketable_chipped_,socketable_flawed_,socketable_flawless_,socketable_amethyst,socketable_diamond,socketable_emerald,socketable_ruby,socketable_sapphire,socketable_skull,socketable_topaz", -1 },
 };
 
 static const DropGrup* DropGrupBul(const std::string& ad)
@@ -8764,6 +8959,53 @@ static bool HandleHeadhunterCommand(const std::string& lc, const std::string& re
                 }
             } catch (...) { Out(std::string("creatorprobe ") + nm + ": EXC"); }
         }
+    } else if (lc == "enemyvars") {
+        // Research: nearest monsters with rarity, affixes and the variables matching the filters.
+        try {
+            std::vector<std::string> filters;
+            { std::string f = Lower(TrimCopy(rest)); if (f.empty()) f = "resist,magic,spell,immun,arcane";
+              size_t p = 0; while (p <= f.size()) { size_t c = f.find(',', p); if (c == std::string::npos) c = f.size(); std::string t = TrimCopy(f.substr(p, c - p)); if (!t.empty()) filters.push_back(t); p = c + 1; } }
+            RValue player; double px = 0, py = 0;
+            if (HhResolveLocalPlayer(player)) { px = HhReadNumber(player, "x", 0.0); py = HhReadNumber(player, "y", 0.0); }
+            struct E { double d; RValue id; };
+            std::vector<E> list;
+            RValue eobj = g_Yytk->CallBuiltin("asset_get_index", { RValue("Enemy_Parent_obj") });
+            int total = (int)g_Yytk->CallBuiltin("instance_number", { eobj }).ToDouble();
+            for (int n = 0; n < total && n < 600; ++n) {
+                RValue id = g_Yytk->CallBuiltin("instance_find", { eobj, RValue((double)n) });
+                double ex = HhReadNumber(id, "x", 0.0), ey = HhReadNumber(id, "y", 0.0);
+                list.push_back({ std::sqrt((ex - px) * (ex - px) + (ey - py) * (ey - py)), id });
+            }
+            std::sort(list.begin(), list.end(), [](const E& a, const E& b) { return a.d < b.d; });
+            Out("enemyvars: " + std::to_string(total) + " monsters, showing nearest " + std::to_string(std::min<size_t>(list.size(), 12)));
+            for (size_t k = 0; k < list.size() && k < 12; ++k) {
+                const RValue& id = list[k].id;
+                std::string line = "  #" + std::to_string(k) + " " + TyInstName(id) + " dist=" + std::to_string((int)list[k].d) + " rarity=" + std::to_string((int)HhReadNumber(id, "enemyRarity", -1.0));
+                try {
+                    RValue flags = g_Yytk->CallBuiltin("variable_instance_get", { id, RValue("enemyAffix") });
+                    if (flags.m_Kind == VALUE_ARRAY) {
+                        int len = (int)g_Yytk->CallBuiltin("array_length", { flags }).ToDouble(); std::string af;
+                        for (int i = 0; i < len && i < 128; ++i) { RValue f = g_Yytk->CallBuiltin("array_get", { flags, RValue((double)i) }); if (f.ToDouble() != 0.0) af += (af.empty() ? "" : ",") + std::to_string(i) + ":" + HhAffixName(i); }
+                        line += " affixes=[" + af + "]";
+                    }
+                } catch (...) {}
+                try {
+                    RValue names = g_Yytk->CallBuiltin("variable_instance_get_names", { id });
+                    int n = (int)g_Yytk->CallBuiltin("array_length", { names }).ToDouble(); std::string vars;
+                    for (int i = 0; i < n; ++i) {
+                        RValue nm = g_Yytk->CallBuiltin("array_get", { names, RValue((double)i) });
+                        std::string s = nm.ToString(), ls = Lower(s); bool hit = false;
+                        for (const auto& f : filters) if (ls.find(f) != std::string::npos) { hit = true; break; }
+                        if (!hit) continue;
+                        RValue v = g_Yytk->CallBuiltin("variable_instance_get", { id, nm });
+                        std::string d = Describe(v); if (d.size() > 80) d = d.substr(0, 80) + "...";
+                        vars += " " + s + "=" + d;
+                    }
+                    line += " |" + (vars.empty() ? std::string(" (no matching vars)") : vars);
+                } catch (...) { line += " | (vars exc)"; }
+                Out(line);
+            }
+        } catch (...) { Out("enemyvars: EXC"); }
 #endif
     } else if (lc == "beaconwake") {
         std::string v = Lower(TrimCopy(rest));
@@ -8783,6 +9025,24 @@ static bool HandleHeadhunterCommand(const std::string& lc, const std::string& re
         std::string v = Lower(TrimCopy(rest));
         if (v == "rare") g_BeRareOnly = true; else if (v == "all") g_BeRareOnly = false;
         Out(std::string("beaconmode -> ") + (g_BeRareOnly ? "rare (rares and champions only)" : "all monsters"));
+    } else if (lc == "rarity") {
+        // rarity <rarePct> <ancientPct>  |  rarity off
+        std::string rareStr, ancStr; rareStr = FirstToken(rest, ancStr);
+        std::string r1 = Lower(TrimCopy(rareStr));
+        double rare = 0.0, anc = 0.0;
+        if (r1 != "off" && !r1.empty()) {
+            try { rare = std::stod(r1); } catch (...) { rare = 0.0; }
+            try { anc = std::stod(TrimCopy(ancStr)); } catch (...) { anc = 0.0; }
+        }
+        if (anc < 0.0) anc = 0.0; if (anc > 100.0) anc = 100.0;
+        if (rare < 0.0) rare = 0.0; if (rare > 100.0 - anc) rare = 100.0 - anc;
+        g_RarRarePct = rare; g_RarAncientPct = anc;
+        // The hook is shared with Tyrant's Crown; a vanilla setting installs nothing.
+        if (RarityFloorActive()) InstallTyrantHook();
+        Out(std::string("rarity -> ") + (RarityFloorActive()
+            ? ("rare " + std::to_string((int)rare) + " pct, ancient " + std::to_string((int)anc) + " pct" + (g_TyHookInstalled ? "" : " (hook failed)"))
+            : std::string("off"))
+            + " | raised so far: rare=" + std::to_string(g_RarRaisedRare) + " ancient=" + std::to_string(g_RarRaisedAncient));
     } else if (lc == "tyrantchance" || lc == "tyrantaffix") {
         try { double p = std::stod(TrimCopy(rest)); if (p >= 0.0 && p <= 100.0) { if (lc == "tyrantchance") g_TyRarePct = p; else g_TyAffixPct = p; } } catch (...) {}
         Out(lc + " -> " + std::to_string((int)(lc == "tyrantchance" ? g_TyRarePct : g_TyAffixPct)) + " percent");
@@ -8818,6 +9078,21 @@ static bool HandleHeadhunterCommand(const std::string& lc, const std::string& re
         }
         Out("  gui=" + num("display_get_gui_width", {}) + "x" + num("display_get_gui_height", {}) + " window=" + num("window_get_width", {}) + "x" + num("window_get_height", {}) + " room=" + num("variable_global_get", { RValue("room_width") }) + "x" + num("variable_global_get", { RValue("room_height") }) + " view_wport0=" + num("view_get_wport", { RValue(0.0) }) + " view_hport0=" + num("view_get_hport", { RValue(0.0) }) + " view_visible0=" + num("view_get_visible", { RValue(0.0) }));
         Out("  active labels=" + std::to_string(g_HhStolen.size()) + " lastErr=" + g_HhLabelLastErr);
+    } else if (lc == "sigdrop") {
+        std::string v = Lower(TrimCopy(rest));
+        if (v.empty() || v == "status") SigDropStatus();
+        else if (v == "off" || v == "0") { g_SigDropPct = 0.0; g_SigDropAncientPct = 0.0; g_SigDropPity = 0; SigDropStatus(); }
+        else if (v == "vanilla" || v == "default") { g_SigDropPct = 0.05; g_SigDropAncientPct = 0.5; g_SigDropPity = 1500; InstallHeadhunterHook(); SigDropStatus(); }
+        else {
+            // sigdrop <rare pct> [ancient pct] [pity kills]
+            try {
+                std::string a, restb; a = FirstToken(v, restb); std::string b2, restc; b2 = FirstToken(restb, restc);
+                double p = std::stod(a); if (p < 0.0) p = 0.0; if (p > 100.0) p = 100.0; g_SigDropPct = p;
+                if (!b2.empty()) { double q = std::stod(b2); if (q < 0.0) q = 0.0; if (q > 100.0) q = 100.0; g_SigDropAncientPct = q; }
+                std::string c2 = TrimCopy(restc); if (!c2.empty()) { long n = std::stol(c2); if (n < 0) n = 0; g_SigDropPity = n; }
+                InstallHeadhunterHook(); SigDropStatus();
+            } catch (...) { Out("sigdrop: usage -> sigdrop <rare pct> [ancient pct] [pity kills] | vanilla | off | status"); }
+        }
     } else if (lc == "hhlabelmax") {
         try { long v = std::stol(TrimCopy(rest)); if (v >= 1 && v <= 40) g_HhLabelMax = (size_t)v; } catch (...) {}
         while (g_HhStolen.size() > g_HhLabelMax) g_HhStolen.erase(g_HhStolen.begin());
@@ -8951,6 +9226,39 @@ static bool HandleHeadhunterCommand(const std::string& lc, const std::string& re
             }
             Out("hhscan: " + std::to_string(total) + " enemies (" + std::to_string(enemies.size()) + " rare/flagged), " + std::to_string(bars) + " bars, " + std::to_string(paired) + " named pairs");
         } catch (...) { Out("hhscan EXCEPTION"); }
+    } else if (lc == "icall") {
+        // icall <Script> <obj> <n> [args...] -- run gml_Script_<Script> with self = the n-th
+        // instance of <obj>, through YYTK's InvokeWithObject (a real `with` scope).
+        // GetInstanceObject cannot resolve menu-room instances, InvokeWithObject can.
+        std::string scr, r2; scr = FirstToken(rest, r2);
+        std::string obj, r3; obj = FirstToken(r2, r3);
+        std::string nStr, r4; nStr = FirstToken(r3, r4);
+        try {
+            int want = std::stoi(nStr);
+            RValue oi = g_Yytk->CallBuiltin("asset_get_index", { RValue(obj) });
+            if (oi.ToDouble() < 0) { Out("icall: unknown object " + obj); }
+            else {
+                std::vector<RValue> args; std::stringstream ss(r4); std::string tok;
+                while (ss >> tok) {
+                    if (tok == "true") { args.push_back(RValue(true)); continue; }
+                    if (tok == "false") { args.push_back(RValue(false)); continue; }
+                    bool numeric = false;
+                    try { size_t pos; double d = std::stod(tok, &pos); if (pos == tok.size()) { args.push_back(RValue(d)); numeric = true; } } catch (...) {}
+                    if (!numeric) args.push_back(RValue(tok));
+                }
+                int seen = 0; bool done = false; std::string report;
+                AurieStatus st = g_Yytk->InvokeWithObject(oi, [&](CInstance* self, CInstance* other) {
+                    if (done || seen++ != want) return;
+                    done = true;
+                    try {
+                        RValue res; AurieStatus cs = g_Yytk->CallGameScriptEx(res, "gml_Script_" + scr, self, other ? other : self, args);
+                        report = "icall " + scr + "(" + obj + "[" + nStr + "], " + std::to_string(args.size()) + " args) st=" + std::to_string((int)cs) + " -> " + Describe(res);
+                    } catch (...) { report = "icall EXCEPTION inside"; }
+                });
+                if (!done) Out("icall: no " + obj + "[" + nStr + "] (invoke st=" + std::to_string((int)st) + ", instances seen=" + std::to_string(seen) + ")");
+                else Out(report);
+            }
+        } catch (...) { Out("icall EXCEPTION"); }
     } else if (lc == "pcall") {
         // pcall <Script> [args...] -- call gml_Script_<Script> with self = first Player_obj.  Numeric tokens -> real,
         // true/false -> bool, else string.  Result is Describe'd and, for structs/arrays, json_stringify'd to bp_ipc\pcall.json.
@@ -9002,7 +9310,7 @@ static void RunCommand(const std::string& line)
         "ping", "density", "reveal", "specialrate", "dropmult",
         "stat", "statadd", "raredrop", "droprate", "dungeonkey",
         "headhunter", "hhdur", "hhmap", "hhdefault", "hhlabel", "tyrant", "beacon", "beaconrange", "beaconmode", "beaconwake", "beaconspawn", "beaconfarstep", "tyrantchance", "tyrantaffix", "hhlabelfont", "hhlabeloffset", "hhlabelmax",
-        "enemyspeed"
+        "enemyspeed", "rarity", "sigdrop"
     };
     if (kPlayerCommands.find(lc) == kPlayerCommands.end()) {
         Out("command unavailable in player build: " + cmd);
