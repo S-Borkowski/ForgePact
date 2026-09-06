@@ -2894,14 +2894,77 @@ static std::string ReadItemHash(const RValue& item)
     try { RValue h = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("itemDataHash") }); if (h.m_Kind == VALUE_STRING) return h.ToString(); } catch (...) {}
     return std::string();
 }
-static bool RefreshItemHash(const RValue& item)
+// GenerateItemHash is not a plain member of the item struct (variable_struct_get gives
+// undefined; live 2026-09-07): the constructor declares it static, and the game's own
+// lookup walks the static chain.  Walk it with static_get, rebind the method to the item
+// with method(), run it with script_execute.  Last resort: the routine itself with the
+// item as self.
+static RValue FindStructMethod(const RValue& item, const char* name, std::string& how)
 {
     try {
-        RValue fn = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("GenerateItemHash") });
-        if (fn.m_Kind == VALUE_UNDEFINED || fn.m_Kind == VALUE_UNSET) return false;
-        g_Yytk->CallBuiltin("script_execute", { fn });   // bound method: runs with the item as self
-        return true;
-    } catch (...) { return false; }
+        RValue fn = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue(name) });
+        if (fn.m_Kind != VALUE_UNDEFINED && fn.m_Kind != VALUE_UNSET) { how = "member"; return fn; }
+        RValue st = item;
+        for (int depth = 0; depth < 6; ++depth) {
+            st = g_Yytk->CallBuiltin("static_get", { st });
+            if (st.m_Kind != VALUE_OBJECT) break;
+            fn = g_Yytk->CallBuiltin("variable_struct_get", { st, RValue(name) });
+            if (fn.m_Kind != VALUE_UNDEFINED && fn.m_Kind != VALUE_UNSET) { how = "static" + std::to_string(depth + 1); return fn; }
+        }
+    } catch (...) { how = "lookup-exc"; return RValue(); }
+    how = "missing"; return RValue();
+}
+static bool RefreshItemHash(const RValue& item, std::string* howOut = nullptr)
+{
+    std::string how;
+    // Preferred: the game's own ItemCheckHash(item).  It calls item.GenerateItemHash() with
+    // the proper self and STORES the new itemDataHash before comparing, so one call after
+    // dressing leaves the item consistent (its bool result is irrelevant here; it never
+    // reports by itself - the callers do).  Plain script name, no method plumbing.
+    try {
+        CInstance* g = nullptr; g_Yytk->GetGlobalInstance(&g);
+        if (g) {
+            const std::string before = ReadItemHash(item);
+            RValue res; AurieStatus st = g_Yytk->CallGameScriptEx(res, "gml_Script_ItemCheckHash", g, g, { item });
+            if (AurieSuccess(st) && !ReadItemHash(item).empty()) { if (howOut) *howOut = "itemcheckhash"; return true; }
+            how = AurieSuccess(st) ? "itemcheckhash-nohash" : "itemcheckhash-fail";
+        }
+    } catch (...) { how = "itemcheckhash-exc"; }
+    try {
+        std::string how2;
+        RValue fn = FindStructMethod(item, "GenerateItemHash", how2);
+        how += "," + how2;
+        if (fn.m_Kind != VALUE_UNDEFINED && fn.m_Kind != VALUE_UNSET) {
+            RValue bound = g_Yytk->CallBuiltin("method", { item, fn });   // self = the item
+            g_Yytk->CallBuiltin("script_execute", { bound });
+            if (howOut) *howOut = how + "+method";
+            return true;
+        }
+    } catch (...) { how += "!exc"; }
+    try {
+        RValue res;
+        CInstance* self = (CInstance*)item.m_Object;
+        AurieStatus st = g_Yytk->CallGameScriptEx(res, "gml_Script_GenerateItemHash@anon@4638@s_ItemInstanceStruct@InventoryV2Funcs", self, self, {});
+        if (AurieSuccess(st)) { if (howOut) *howOut = how + "+direct"; return true; }
+        how += "+direct-fail";
+    } catch (...) { how += "+direct-exc"; }
+    // Last resort: the compiled routine behind the method, called like a hook trampoline
+    // with the item struct as self (the same resolution HookOneScript uses).
+    try {
+        PVOID p = nullptr;
+        if (AurieSuccess(g_Yytk->GetNamedRoutinePointer("gml_Script_GenerateItemHash@anon@4638@s_ItemInstanceStruct@InventoryV2Funcs", &p)) && p) {
+            CScript* sc = reinterpret_cast<CScript*>(p);
+            PFUNC_YYGMLScript fnp = (sc && sc->m_Functions) ? sc->m_Functions->m_ScriptFunction : nullptr;
+            if (fnp) {
+                RValue res; CInstance* self = (CInstance*)item.m_Object;
+                fnp(self, self, res, 0, nullptr);
+                if (!ReadItemHash(item).empty()) { if (howOut) *howOut = how + "+routine"; return true; }
+                how += "+routine-nohash";
+            } else how += "+routine-nofn";
+        } else how += "+routine-notfound";
+    } catch (...) { how += "+routine-exc"; }
+    if (howOut) *howOut = how;
+    return false;
 }
 
 static volatile LONG g_CustomForgeHashMisses = 0;
@@ -3014,12 +3077,13 @@ static bool TryApplyCustomForge(RValue* candidate)
             }
             {
                 const std::string before = ReadItemHash(*candidate);
-                const bool ok = RefreshItemHash(*candidate);
+                std::string how;
+                const bool ok = RefreshItemHash(*candidate, &how);
                 const std::string after = ReadItemHash(*candidate);
 #ifndef FORGEPACT_RELEASE
                 static LONG s_HashLogs = 0;
                 if (!ok || after.empty() || after == before || InterlockedIncrement(&s_HashLogs) <= 24)
-                    Out("forge hash: " + before.substr(0, 8) + " -> " + (after.empty() ? std::string("(none)") : after.substr(0, 8)) + (ok ? "" : " GenerateItemHash unavailable"));
+                    Out("forge hash: " + before.substr(0, 8) + " -> " + (after.empty() ? std::string("(none)") : after.substr(0, 8)) + " via " + how + (ok ? "" : " (FAILED)"));
 #endif
                 if (!ok) InterlockedIncrement(&g_CustomForgeHashMisses);
             }
@@ -9020,6 +9084,14 @@ static bool HandleHeadhunterCommand(const std::string& lc, const std::string& re
                 }
             } catch (...) { Out(std::string("creatorprobe ") + nm + ": EXC"); }
         }
+    } else if (lc == "hashprobe") {
+        // Research: refresh itemDataHash on every remembered forged item and report the path used.
+        int n = 0;
+        for (const RValue& it : g_ForgedItems) {
+            std::string how; const std::string b = ReadItemHash(it); const bool ok = RefreshItemHash(it, &how); const std::string a = ReadItemHash(it);
+            Out("hashprobe #" + std::to_string(n++) + ": " + b.substr(0, 8) + " -> " + (a.empty() ? std::string("(none)") : a.substr(0, 8)) + " via " + how + (ok ? "" : " FAILED"));
+        }
+        if (!n) Out("hashprobe: no forged items remembered yet");
     } else if (lc == "enemyvars") {
         // Research: nearest monsters with rarity, affixes and the variables matching the filters.
         try {
