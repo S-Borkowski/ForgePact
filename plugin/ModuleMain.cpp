@@ -8824,7 +8824,6 @@ static bool HandleHeadhunterCommand(const std::string& lc, const std::string& re
             } catch (...) { Out("hhdefault: usage hhdefault <buffId> [v0] [v1] | off"); }
         }
 #ifndef FORGEPACT_RELEASE
-#ifndef FORGEPACT_RELEASE
     } else if (lc == "spawnforce") {
         // spawnforce <alarm> <count>: perform Alarm <alarm> on the <count> nearest awake
         // Enemy_Creator_obj spawners (real `with`-style self via InvokeWithObject) and report
@@ -9117,7 +9116,6 @@ static bool HandleHeadhunterCommand(const std::string& lc, const std::string& re
         }
         Out("fonts:" + out);
         try { RValue cur = g_Yytk->CallBuiltin("draw_get_font", {}); Out("current draw font index=" + std::to_string((int)cur.ToDouble())); } catch (...) {}
-#endif
     } else if (lc == "hhtrace") {
         g_HhTrace = (Lower(TrimCopy(rest)) != "off"); g_HhLastShape.clear(); Out(std::string("hhtrace -> ") + (g_HhTrace ? "ON" : "off"));
         if (g_HhTrace) InstallEquipTraceHooks();
