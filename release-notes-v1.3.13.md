@@ -14,10 +14,11 @@ Works together with Hero Siege Item Editor 2.15.3.
   create new monsters when they die or make copies of themselves (Fallen Angel, Fractal,
   Haunted, Possessed). Each new monster was raised again, so the more you killed, the
   more there were. Those four affixes are no longer handed out by the raise.
-- **Forged items can be socketed and upgraded again.** The game checks an item's
-  fingerprint before it accepts a gem or a star upgrade; a forged item failed that
-  check once per game session. ForgePact now refreshes the fingerprint after it dresses
-  an item.
+- **Gems work in forged items again.** Two things were wrong: the game checks an item's
+  fingerprint before it accepts a gem, and a forged item failed that check; and when a gem
+  did go in, its bonus was lost because ForgePact rewrote the item's stats after the game
+  had added the gem. ForgePact now dresses the item before the gem step and refreshes the
+  fingerprint afterwards, so gems can be inserted and their bonus counts.
 
 ## New
 

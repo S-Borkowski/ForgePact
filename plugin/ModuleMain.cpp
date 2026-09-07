@@ -2967,6 +2967,58 @@ static bool RefreshItemHash(const RValue& item, std::string* howOut = nullptr)
     return false;
 }
 
+static bool RepoStruct(int kategori, int indeks, RValue& out);   // defined with the drop groups below
+
+// ---- socket share ----------------------------------------------------------------------
+// Socket bonuses reach itemStatStruct only through GenerateItemSpecialStats(item, def),
+// which CreateItemNew runs BEFORE this post-process: it AddStat()s the def's damage-type
+// table, the rolled random stats and every filled socket's share (def.itemBaseSocketStatStruct
+// keyed by the gem's type, rolled from the gem seed).  keep=0 wiped that share, keep=1
+// overwrote it on the forged keys ("Skill Haste gem did nothing", 2026-09-07).  Run the
+// game's function once more on a scratch stat struct that carries only the socket count,
+// with a scratch def that carries only the socket table, and add back what comes out.
+// ---- dressing order vs sockets --------------------------------------------------------
+// Inside CreateItemNew the order is CreateItemInit -> GenerateItemRandomStats -> runewords ->
+// GenerateItemSpecialStats -> the socket loop (GetSocketKey, adds every gem's share to
+// itemStatStruct) -> return.  Dressing only at the end wiped (keep=0) or overwrote (keep=1)
+// that share: "Skill Haste gem did nothing" (2026-09-07).  The authoritative dressing now
+// happens right after GenerateItemSpecialStats, before the socket loop, and the end-of-
+// CreateItemNew pass only refreshes the item hash for items dressed that way.
+static bool TryApplyCustomForge(RValue* candidate);
+static bool RefreshItemHash(const RValue& item, std::string* howOut);
+static PFUNC_YYGMLScript g_Orig_GenerateItemSpecialStats = nullptr;
+static std::unordered_set<YYObjectBase*> g_DressedAfterSpecial;
+static volatile LONG g_DressedAtSpecial = 0, g_SocketPassSkips = 0;
+static RValue& Hook_GenerateItemSpecialStats(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
+{
+    RValue& r = g_Orig_GenerateItemSpecialStats ? g_Orig_GenerateItemSpecialStats(S, O, R, argc, A) : R;
+    try {
+        RValue* itemP = (argc >= 1 && A && A[0] && A[0]->m_Kind == VALUE_OBJECT) ? A[0] : nullptr;
+        if (itemP && TryApplyCustomForge(itemP)) {
+            if (g_DressedAfterSpecial.size() > 4096) g_DressedAfterSpecial.clear();
+            g_DressedAfterSpecial.insert(itemP->m_Object);
+            InterlockedIncrement(&g_DressedAtSpecial);
+        }
+    } catch (...) {}
+    return r;
+}
+// End-of-creation passes: an item dressed after GenerateItemSpecialStats keeps its stats (the
+// socket loop has added the gem shares since); only the hash is brought up to date.
+static bool SkipIfDressedAfterSpecial(RValue* candidate)
+{
+    if (!candidate || candidate->m_Kind != VALUE_OBJECT) return false;
+    auto it = g_DressedAfterSpecial.find(candidate->m_Object);
+    if (it == g_DressedAfterSpecial.end()) return false;
+    g_DressedAfterSpecial.erase(it);
+    InterlockedIncrement(&g_SocketPassSkips);
+    std::string how; RefreshItemHash(*candidate, &how);
+#ifndef FORGEPACT_RELEASE
+    static int s_Logs = 0;
+    if (s_Logs < 12) { ++s_Logs; Out("forge: kept the socket pass, hash via " + how); }
+#endif
+    return true;
+}
+
 static volatile LONG g_CustomForgeHashMisses = 0;
 static bool TryApplyCustomForge(RValue* candidate)
 {
@@ -3102,6 +3154,8 @@ static bool TryApplyCustomForge(RValue* candidate)
 
 static void CustomForgePostProcess(RValue& result, int argc, RValue** args)
 {
+    if (SkipIfDressedAfterSpecial(&result)) return;
+    for (int i = 0; args && i < argc; ++i) if (SkipIfDressedAfterSpecial(args[i])) return;
     if (TryApplyCustomForge(&result)) return;
     // Some constructors mutate an argument and return undefined. Scan only a
     // small, bounded prefix; TryApply requires all three canonical item fields.
@@ -5200,6 +5254,7 @@ static void InstallCustomForgeItemHooks()
         HookOneScript("CreateItemInit", "fp_customforge_init",
                       (PVOID)Hook_CreateItemInit, &g_Orig_CreateItemInit);
     if (!g_Orig_GenerateItemRandomStats)
+        HookOneScript("GenerateItemSpecialStats", "fp_specialstats", (PVOID)Hook_GenerateItemSpecialStats, &g_Orig_GenerateItemSpecialStats);
         HookOneScript("GenerateItemRandomStats", "fp_customforge_stats",
                       (PVOID)Hook_GenerateItemRandomStats, &g_Orig_GenerateItemRandomStats);
     g_CustomForgeHooksActive = g_Orig_CreateItemNew || g_Orig_CreateItemInit ||
@@ -9084,6 +9139,16 @@ static bool HandleHeadhunterCommand(const std::string& lc, const std::string& re
                 }
             } catch (...) { Out(std::string("creatorprobe ") + nm + ": EXC"); }
         }
+    } else if (lc == "forgeddump") {
+        // Research: json of every remembered forged item -> bp_ipcorged_dump.json
+        std::string body = "["; int n = 0;
+        CInstance* g = nullptr; g_Yytk->GetGlobalInstance(&g);
+        for (const RValue& it : g_ForgedItems) {
+            try { RValue js; g_Yytk->CallBuiltinEx(js, "json_stringify", g, g, { it }); body += (n ? "," : "") + js.ToString(); ++n; } catch (...) {}
+        }
+        body += "]";
+        { std::ofstream f(IPC_DIR + "\forged_dump.json", std::ios::binary | std::ios::trunc); f << body; }
+        Out("forgeddump: " + std::to_string(n) + " items -> forged_dump.json");
     } else if (lc == "hashprobe") {
         // Research: refresh itemDataHash on every remembered forged item and report the path used.
         int n = 0;
