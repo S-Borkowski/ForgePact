@@ -16,11 +16,12 @@ Works together with Hero Siege Item Editor 2.15.3.
   spawns is now left alone by the raise, and Monster Density does not multiply it either.
   The raise also no longer hands out the four affixes that create monsters on death
   (Fallen Angel, Fractal, Haunted, Possessed).
-- **Gems work in forged items again.** Two things were wrong: the game checks an item's
-  fingerprint before it accepts a gem, and a forged item failed that check; and when a gem
-  did go in, its bonus was lost because ForgePact rewrote the item's stats after the game
-  had added the gem. ForgePact now dresses the item before the gem step and refreshes the
-  fingerprint afterwards, so gems can be inserted and their bonus counts.
+- **Gems, jewels and runes work in forged items again.** Two things were wrong: the game
+  checks an item's fingerprint before it accepts a socketable, and a forged item failed that
+  check; and when something did go in, its bonus was lost because ForgePact rewrote the
+  item's stats after the game had added it. ForgePact now measures what the player put into
+  the item (rune, runeword, gem and jewel stats) and adds it back after dressing, then
+  refreshes the fingerprint. Custom names such as Tyrant's Crown stay in place.
 
 ## New
 

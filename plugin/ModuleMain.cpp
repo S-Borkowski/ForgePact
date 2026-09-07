@@ -3032,50 +3032,105 @@ static bool RepoStruct(int kategori, int indeks, RValue& out);   // defined with
 // overwrote it on the forged keys ("Skill Haste gem did nothing", 2026-09-07).  Run the
 // game's function once more on a scratch stat struct that carries only the socket count,
 // with a scratch def that carries only the socket table, and add back what comes out.
-// ---- dressing order vs sockets --------------------------------------------------------
-// Inside CreateItemNew the order is CreateItemInit -> GenerateItemRandomStats -> runewords ->
-// GenerateItemSpecialStats -> the socket loop (GetSocketKey, adds every gem's share to
-// itemStatStruct) -> return.  Dressing only at the end wiped (keep=0) or overwrote (keep=1)
-// that share: "Skill Haste gem did nothing" (2026-09-07).  The authoritative dressing now
-// happens right after GenerateItemSpecialStats, before the socket loop, and the end-of-
-// CreateItemNew pass only refreshes the item hash for items dressed that way.
-static bool TryApplyCustomForge(RValue* candidate);
-static bool RefreshItemHash(const RValue& item, std::string* howOut);
-static PFUNC_YYGMLScript g_Orig_GenerateItemSpecialStats = nullptr;
-static std::unordered_set<YYObjectBase*> g_DressedAfterSpecial;
-static volatile LONG g_DressedAtSpecial = 0, g_SocketPassSkips = 0;
+// ---- player additions vs dressing (delta accounting) ----------------------------------
+// Inside CreateItemNew: CreateItemInit -> GenerateItemRandomStats -> GetRuneword (rune and
+// runeword stats) -> GenerateItemSpecialStats (damage types, special tables) -> the socket
+// loop (gems, jewels) -> display name -> return.  Dressing therefore runs at the very end
+// (the name is written there too), and what the player put into the item is measured on
+// the way and added back afterwards: the GetRuneword delta plus everything added after
+// GenerateItemSpecialStats.  GenerateItemSpecialStats' own additions belong to the base
+// item, so keep=0 drops them like any other native stat.  (Dressing right after
+// GenerateItemSpecialStats, tried 2026-09-07, kept gems but lost runes and the custom name.)
+struct ForgeDeltas
+{
+    std::map<std::string, double> rune;          // GetRuneword: after - before
+    std::map<std::string, double> afterSpecial;  // snapshot right after GenerateItemSpecialStats
+    bool haveAfterSpecial = false;
+};
+static std::unordered_map<YYObjectBase*, ForgeDeltas> g_ForgeDeltas;
+static volatile LONG g_ForgeAdditionsAdded = 0;
+static bool FdIsNumber(const RValue& v) { return v.m_Kind == VALUE_REAL || v.m_Kind == VALUE_INT32 || v.m_Kind == VALUE_INT64; }
+static std::map<std::string, double> StructNumbers(const RValue& st)
+{
+    std::map<std::string, double> out;
+    try {
+        if (st.m_Kind != VALUE_OBJECT) return out;
+        RValue names = g_Yytk->CallBuiltin("variable_struct_get_names", { st });
+        if (names.m_Kind != VALUE_ARRAY) return out;
+        const int count = (int)g_Yytk->CallBuiltin("array_length", { names }).ToDouble();
+        for (int i = 0; i < count; ++i) {
+            RValue name = g_Yytk->CallBuiltin("array_get", { names, RValue((double)i) });
+            RValue v = g_Yytk->CallBuiltin("variable_struct_get", { st, name });
+            if (FdIsNumber(v)) out[name.ToString()] = v.ToDouble();
+        }
+    } catch (...) {}
+    return out;
+}
+static RValue ItemStatsOf(const RValue& item)
+{
+    try { return g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("itemStatStruct") }); } catch (...) { return RValue(); }
+}
+static PFUNC_YYGMLScript g_Orig_GenerateItemSpecialStats = nullptr, g_Orig_GetRuneword = nullptr;
 static RValue& Hook_GenerateItemSpecialStats(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
 {
     RValue& r = g_Orig_GenerateItemSpecialStats ? g_Orig_GenerateItemSpecialStats(S, O, R, argc, A) : R;
     try {
-        RValue* itemP = (argc >= 1 && A && A[0] && A[0]->m_Kind == VALUE_OBJECT) ? A[0] : nullptr;
-        if (itemP && TryApplyCustomForge(itemP)) {
-            if (g_DressedAfterSpecial.size() > 4096) g_DressedAfterSpecial.clear();
-            g_DressedAfterSpecial.insert(itemP->m_Object);
-            InterlockedIncrement(&g_DressedAtSpecial);
+        if (argc >= 1 && A && A[0] && A[0]->m_Kind == VALUE_OBJECT) {
+            RValue st = ItemStatsOf(*A[0]);
+            if (st.m_Kind == VALUE_OBJECT) {
+                if (g_ForgeDeltas.size() > 4096) g_ForgeDeltas.clear();
+                ForgeDeltas& d = g_ForgeDeltas[A[0]->m_Object];
+                d.afterSpecial = StructNumbers(st);
+                d.haveAfterSpecial = true;
+            }
         }
     } catch (...) {}
     return r;
 }
-// End-of-creation passes: an item dressed after GenerateItemSpecialStats keeps its stats (the
-// socket loop has added the gem shares since); only the hash is brought up to date.
-static bool SkipIfDressedAfterSpecial(RValue* candidate)
+static RValue& Hook_GetRuneword(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
 {
-    if (!candidate || candidate->m_Kind != VALUE_OBJECT) return false;
-    auto it = g_DressedAfterSpecial.find(candidate->m_Object);
-    if (it == g_DressedAfterSpecial.end()) return false;
-    g_DressedAfterSpecial.erase(it);
-    InterlockedIncrement(&g_SocketPassSkips);
-    std::string how; RefreshItemHash(*candidate, &how);
-#ifndef FORGEPACT_RELEASE
-    static int s_Logs = 0;
-    if (s_Logs < 12) { ++s_Logs; Out("forge: kept the socket pass, hash via " + how); }
-#endif
-    return true;
+    RValue* itemP = (argc >= 1 && A && A[0] && A[0]->m_Kind == VALUE_OBJECT) ? A[0] : nullptr;
+    std::map<std::string, double> before; bool track = false;
+    if (itemP) { try { RValue st = ItemStatsOf(*itemP); if (st.m_Kind == VALUE_OBJECT) { before = StructNumbers(st); track = true; } } catch (...) { track = false; } }
+    RValue& r = g_Orig_GetRuneword ? g_Orig_GetRuneword(S, O, R, argc, A) : R;
+    if (track) {
+        try {
+            std::map<std::string, double> after = StructNumbers(ItemStatsOf(*itemP));
+            if (g_ForgeDeltas.size() > 4096) g_ForgeDeltas.clear();
+            ForgeDeltas& d = g_ForgeDeltas[itemP->m_Object];
+            for (const auto& kv : after) {
+                auto b = before.find(kv.first);
+                const double dd = kv.second - (b == before.end() ? 0.0 : b->second);
+                if (std::fabs(dd) > 1e-9) d.rune[kv.first] += dd;
+            }
+        } catch (...) {}
+    }
+    return r;
+}
+// The final dressing pass takes everything the player added (runes, and whatever came
+// after GenerateItemSpecialStats: gems, jewels) to put it back on top of the forged stats.
+static std::map<std::string, double> TakeForgeAdditions(const RValue& item, const std::map<std::string, double>& atEntry, size_t* runeKeys, size_t* socketKeys)
+{
+    std::map<std::string, double> add;
+    auto it = g_ForgeDeltas.find(item.m_Object);
+    if (it == g_ForgeDeltas.end()) return add;
+    add = it->second.rune;
+    if (runeKeys) *runeKeys = add.size();
+    size_t sk = 0;
+    if (it->second.haveAfterSpecial) {
+        for (const auto& kv : atEntry) {
+            auto b = it->second.afterSpecial.find(kv.first);
+            const double dd = kv.second - (b == it->second.afterSpecial.end() ? 0.0 : b->second);
+            if (std::fabs(dd) > 1e-9) { add[kv.first] += dd; ++sk; }
+        }
+    }
+    if (socketKeys) *socketKeys = sk;
+    g_ForgeDeltas.erase(it);
+    return add;
 }
 
 static volatile LONG g_CustomForgeHashMisses = 0;
-static bool TryApplyCustomForge(RValue* candidate)
+static bool TryApplyCustomForge(RValue* candidate, bool finalPass = false)
 {
     if (!candidate || candidate->m_Kind != VALUE_OBJECT || g_CustomForgeEntries.empty())
         return false;
@@ -3090,6 +3145,8 @@ static bool TryApplyCustomForge(RValue* candidate)
         RValue stats = g_Yytk->CallBuiltin(
             "variable_struct_get", { *candidate, RValue("itemStatStruct") });
         if (definition.m_Kind != VALUE_OBJECT || stats.m_Kind != VALUE_OBJECT) return false;
+        std::map<std::string, double> statsAtEntry;
+        if (finalPass) statsAtEntry = StructNumbers(stats);
         {   // record the stat struct once, before any forge entry touches it: the editor wants the item's own values
             RValue recorded = g_Yytk->CallBuiltin("variable_struct_exists", { *candidate, RValue("fp_recorded") });
             if (!recorded.ToBoolean()) { RecordItemStats(*candidate, stats); g_Yytk->CallBuiltin("variable_struct_set", { *candidate, RValue("fp_recorded"), RValue(true) }); }
@@ -3182,6 +3239,23 @@ static bool TryApplyCustomForge(RValue* candidate)
                 if (entry.mechanic == "tyrant") g_TyItemTagged = true;
                 if (entry.mechanic == "beacon") g_BeItemTagged = true;
             }
+            if (finalPass) {
+                size_t rk = 0, sk = 0;
+                std::map<std::string, double> add = TakeForgeAdditions(*candidate, statsAtEntry, &rk, &sk);
+                int applied = 0;
+                for (const auto& kv : add) {
+                    int key = -1; try { key = std::stoi(kv.first); } catch (...) { continue; }
+                    if (entry.keepNative && !entry.stats.count(key)) continue;   // native keys still carry it
+                    double cur = 0.0; TryStructNumber(stats, kv.first.c_str(), cur);
+                    g_Yytk->CallBuiltin("variable_struct_set", { stats, RValue(kv.first), RValue(cur + kv.second) });
+                    ++applied;
+                }
+                InterlockedExchangeAdd(&g_ForgeAdditionsAdded, applied);
+#ifndef FORGEPACT_RELEASE
+                static int s_AddLogs = 0;
+                if ((rk || sk) && s_AddLogs < 20) { ++s_AddLogs; Out("forge additions: rune keys " + std::to_string(rk) + ", socket keys " + std::to_string(sk) + ", applied " + std::to_string(applied)); }
+#endif
+            }
             {
                 const std::string before = ReadItemHash(*candidate);
                 std::string how;
@@ -3207,15 +3281,13 @@ static bool TryApplyCustomForge(RValue* candidate)
     return false;
 }
 
-static void CustomForgePostProcess(RValue& result, int argc, RValue** args)
+static void CustomForgePostProcess(RValue& result, int argc, RValue** args, bool finalPass)
 {
-    if (SkipIfDressedAfterSpecial(&result)) return;
-    for (int i = 0; args && i < argc; ++i) if (SkipIfDressedAfterSpecial(args[i])) return;
-    if (TryApplyCustomForge(&result)) return;
+    if (TryApplyCustomForge(&result, finalPass)) return;
     // Some constructors mutate an argument and return undefined. Scan only a
     // small, bounded prefix; TryApply requires all three canonical item fields.
     for (int i = 0; i < argc && i < 8; ++i)
-        if (args && TryApplyCustomForge(args[i])) return;
+        if (args && TryApplyCustomForge(args[i], finalPass)) return;
 }
 
 
@@ -4596,7 +4668,7 @@ static void HeadhunterStatus()
         BP_DIAG_INCREMENT(g_cnt_##NAME); \
         HH_CREATE_TRACE(NAME); \
         RValue& _res = g_Orig_##NAME ? g_Orig_##NAME(S, O, R, argc, A) : R; \
-        CustomForgePostProcess(_res, argc, A); \
+        CustomForgePostProcess(_res, argc, A, strcmp(#NAME, "CreateItemNew") == 0); \
         BP_LOGDROP(#NAME, _res, argc, A); \
         return _res; \
     }
@@ -5317,6 +5389,7 @@ static void InstallCustomForgeItemHooks()
                       (PVOID)Hook_CreateItemInit, &g_Orig_CreateItemInit);
     if (!g_Orig_GenerateItemRandomStats)
         HookOneScript("GenerateItemSpecialStats", "fp_specialstats", (PVOID)Hook_GenerateItemSpecialStats, &g_Orig_GenerateItemSpecialStats);
+        HookOneScript("GetRuneword", "fp_runeword", (PVOID)Hook_GetRuneword, &g_Orig_GetRuneword);
         HookOneScript("GenerateItemRandomStats", "fp_customforge_stats",
                       (PVOID)Hook_GenerateItemRandomStats, &g_Orig_GenerateItemRandomStats);
     g_CustomForgeHooksActive = g_Orig_CreateItemNew || g_Orig_CreateItemInit ||
