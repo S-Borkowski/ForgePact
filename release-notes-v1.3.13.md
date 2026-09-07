@@ -24,6 +24,9 @@ Works together with Hero Siege Item Editor 2.15.3.
 
 ## New
 
+- **Rare Item Quality is back.** The Loot tab again has the Angelic / Unholy, All Rare
+  Tiers and Satanic Tier sliders that 1.3.10 lost. Offline the game never rolls for Angelic
+  or Unholy items; x2 lets it roll at its own rate, higher settings multiply it.
 - **Type a value.** Click the number next to any slider to type the exact value you
   want. Enter applies it, Escape cancels. Handy where a slider skips numbers.
 
