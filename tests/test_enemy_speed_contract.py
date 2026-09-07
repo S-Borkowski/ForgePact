@@ -104,7 +104,9 @@ class EnemySpeedPanelContractTests(unittest.TestCase):
         pct = self.panel.enemy_speed_pct
         self.assertEqual(pct(-20), 0)
         self.assertEqual(pct(999), 300)
-        self.assertEqual(pct(52), 50)
+        # A typed value is kept as typed (whole percent); only the slider moves in 5 % steps.
+        self.assertEqual(pct(52), 52)
+        self.assertEqual(pct(52.4), 52)
         self.assertEqual(pct("abc"), 0)
         self.assertEqual(pct(float("nan")), 0)
         # A live reset must be explicit so an installed hook returns to vanilla.

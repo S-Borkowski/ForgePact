@@ -440,7 +440,7 @@ def enemy_speed_pct(value) -> int:
     if pct != pct:  # NaN
         return 0
     pct = max(0.0, min(float(ENEMY_SPEED_MAX), pct))
-    return int(round(pct / ENEMY_SPEED_STEP) * ENEMY_SPEED_STEP)
+    return int(round(pct))   # whole percent; the slider itself moves in 5 % steps
 
 
 def enemy_speed_cmd(cfg: dict) -> str:
@@ -1195,14 +1195,13 @@ class H(BaseHTTPRequestHandler):
                 if sec == "keys":
                     cfg[sec][key] = max(1, min(100, int(val)))
                 elif sec == "stats":
-                    ceiling, step = next(((mx, st) for k, _l, mx, st in STATS if k == key), (100, 1))
-                    value = max(1.0, min(float(ceiling), float(val)))
-                    value = round(value / step) * step
-                    cfg.setdefault("stats", {})[key] = int(value) if step == 1 else value
+                    # The slider moves in steps; a typed value is kept as typed (2 decimals).
+                    ceiling = next((mx for k, _l, mx, _st in STATS if k == key), 100)
+                    value = round(max(1.0, min(float(ceiling), float(val))), 2)
+                    cfg.setdefault("stats", {})[key] = int(value) if value.is_integer() else value
                 elif sec == "percent_stats":
-                    ceiling, step = next(((mx, st) for k, _l, mx, st, _mode in PERCENT_STATS if k == key), (1000, 5))
-                    value = max(0.0, min(float(ceiling), float(val)))
-                    value = round(value / step) * step
+                    ceiling = next((mx for k, _l, mx, _st, _mode in PERCENT_STATS if k == key), 1000)
+                    value = round(max(0.0, min(float(ceiling), float(val))), 2)
                     cfg.setdefault("percent_stats", {})[key] = int(value) if value.is_integer() else value
                 elif sec == "drops":
                     cfg[sec][key] = max(1, min(100, int(val)))
@@ -1216,8 +1215,8 @@ class H(BaseHTTPRequestHandler):
                 elif key == "density":
                     # 0.5 steps: 1, 1.5, 2 ...  Whole numbers are stored as
                     # float("3") -> 3.0; the plugin prints with %g so it shows as "x3".
-                    d = max(1.0, min(5.0, float(val)))
-                    cfg["density"] = round(d * 2) / 2
+                    d = round(max(1.0, min(5.0, float(val))), 2)   # slider steps 0.5, typed values stay
+                    cfg["density"] = int(d) if float(d).is_integer() else d
                 elif key == "enemy_speed":
                     cfg["enemy_speed"] = enemy_speed_pct(val)
                 elif key == "enemy_speed_ct":
@@ -1579,7 +1578,7 @@ function openTab(name,remember=true){
   window.scrollTo({top:0,behavior:'smooth'});
 }
 function rarityPaint(){
-  const r=+document.getElementById('rarity_rare').value, a=+document.getElementById('rarity_ancient').value;
+  const r=sliderVal(document.getElementById('rarity_rare')), a=sliderVal(document.getElementById('rarity_ancient'));
   const rv=document.getElementById('rarityrareval'), av=document.getElementById('rarityancval');
   rv.textContent=r>0?r+'%':'off'; rv.className='val '+(r>0?'':'off');
   av.textContent=a>0?a+'%':'off'; av.className='val '+(a>0?'':'off');
@@ -1602,22 +1601,34 @@ function row(sec,key,label,val,tagHtml,max,note,step){
 // Click the value next to a slider to type it.  Sliders with 100-200 steps on a
 // 200 px track skip values (80, 85, 95 ...); typing lands exactly.  Enter or
 // leaving the box applies through the slider's own handlers, Escape cancels.
+// A slider's value once the user is done with it: a typed value is taken as is; a dragged
+// value snaps to the slider's own step (the range keeps step="any" after typing so the
+// browser does not round the typed number away).
+function sliderVal(r){
+  let v=parseFloat(r.value); if(!isFinite(v))v=0;
+  if(r.dataset.typed==='1')return v;
+  const st=parseFloat(r.dataset.step0||r.step)||0;
+  if(r.step==='any'&&st>0){v=Math.round(v/st)*st;v=+v.toFixed(3);r.value=v;}
+  return v;
+}
 function typable(r,valEl){
   if(!r||!valEl||valEl.dataset.typable)return;
   valEl.dataset.typable='1'; valEl.style.cursor='text'; valEl.title='Click to type a value';
   valEl.onclick=()=>{
     if(valEl.querySelector('input'))return;
     const inp=document.createElement('input');
-    inp.type='number'; inp.className='numedit'; inp.min=r.min; inp.max=r.max; inp.step=r.step||1; inp.value=r.value;
+    inp.type='number'; inp.className='numedit'; inp.min=r.min; inp.max=r.max; inp.step='any'; inp.value=r.value;
     valEl.textContent=''; valEl.appendChild(inp); inp.focus(); inp.select();
     let finished=false;
     const done=async(apply)=>{
       if(finished)return; finished=true;
       let v=parseFloat(inp.value);
       if(apply&&isFinite(v)){
-        const st=parseFloat(r.step)||1, mn=parseFloat(r.min), mx=parseFloat(r.max);
-        v=Math.min(mx,Math.max(mn,v)); v=Math.round(v/st)*st; v=+v.toFixed(3);
-        r.value=v; if(r.oninput)r.oninput(); if(r.onchange)await r.onchange();
+        const mn=parseFloat(r.min), mx=parseFloat(r.max);
+        v=Math.min(mx,Math.max(mn,v)); v=+v.toFixed(2);
+        if(!r.dataset.step0)r.dataset.step0=r.step||'1';
+        r.step='any'; r.value=v; r.dataset.typed='1';
+        try{ if(r.oninput)r.oninput(); if(r.onchange)await r.onchange(); } finally { delete r.dataset.typed; }
       } else { if(r.oninput)r.oninput(); else valEl.textContent=r.value; }
     };
     inp.onkeydown=(e)=>{ if(e.key==='Enter'){e.preventDefault();done(true);} else if(e.key==='Escape'){e.preventDefault();done(false);} };
@@ -1762,20 +1773,21 @@ function bind(){
     const valEl=r.parentElement.querySelector('.val');
     const noteEl=r.parentElement.parentElement.querySelector(`.note[data-note="${r.dataset.key}"]`);
     const tipOf=(k)=>{const e=(ST.keys||[]).find(x=>x[0]===k);return e?e[2]:undefined;};
-    r.oninput=()=>{const v=+r.value;valEl.textContent=sliderText(r.dataset.sec,v);valEl.className='val '+(sliderOff(r.dataset.sec,v)?'off':'');
+    r.oninput=()=>{const v=sliderVal(r);valEl.textContent=sliderText(r.dataset.sec,v);valEl.className='val '+(sliderOff(r.dataset.sec,v)?'off':'');
       if(noteEl&&r.dataset.sec==='keys')noteEl.textContent=keyNote(r.dataset.key,tipOf(r.dataset.key),v);
       if(noteEl&&r.dataset.sec==='stats')noteEl.textContent=statNote(r.dataset.key,v);
       if(noteEl&&r.dataset.sec==='percent_stats')noteEl.textContent=percentStatNote(r.dataset.key,v);
     };
     r.onchange=async()=>{
-      const res=await j('/api/set',{method:'POST',body:JSON.stringify({section:r.dataset.sec,key:r.dataset.key,value:+r.value})});
-      toast((r.dataset.key)+' = '+sliderText(r.dataset.sec,+r.value)+' - '+(res.ok||res.err));
+      const v=sliderVal(r);
+      const res=await j('/api/set',{method:'POST',body:JSON.stringify({section:r.dataset.sec,key:r.dataset.key,value:v})});
+      toast((r.dataset.key)+' = '+sliderText(r.dataset.sec,v)+' - '+(res.ok||res.err));
     };
     typable(r,valEl);
   });
   const den=document.getElementById('den');
-  den.oninput=()=>{document.getElementById('denval').textContent='x'+den.value};
-  den.onchange=async()=>{const res=await j('/api/set',{method:'POST',body:JSON.stringify({key:'density',value:+den.value})});toast('density x'+den.value+' - '+(res.ok||res.err))};
+  den.oninput=()=>{document.getElementById('denval').textContent='x'+sliderVal(den)};
+  den.onchange=async()=>{const v=sliderVal(den);const res=await j('/api/set',{method:'POST',body:JSON.stringify({key:'density',value:v})});toast('density x'+v+' - '+(res.ok||res.err))};
   typable(den,document.getElementById('denval'));
   document.getElementById('den_on').onchange=async(e)=>{
     const res=await j('/api/set',{method:'POST',body:JSON.stringify({key:'density_on',value:e.target.checked})});
@@ -1789,10 +1801,11 @@ function bind(){
   };
   const esp=document.getElementById('enemyspeed');
   const espText=(v)=>v>0?'+'+v+'%':'off';
-  esp.oninput=()=>{const v=+esp.value;document.getElementById('enemyspeedval').textContent=espText(v);document.getElementById('enemyspeedval').className='val '+(v>0?'':'off');};
+  esp.oninput=()=>{const v=sliderVal(esp);document.getElementById('enemyspeedval').textContent=espText(v);document.getElementById('enemyspeedval').className='val '+(v>0?'':'off');};
   esp.onchange=async()=>{
-    const res=await j('/api/set',{method:'POST',body:JSON.stringify({key:'enemy_speed',value:+esp.value})});
-    toast('enemy speed '+espText(+esp.value)+' - '+(res.ok||res.err));
+    const v=sliderVal(esp);
+    const res=await j('/api/set',{method:'POST',body:JSON.stringify({key:'enemy_speed',value:v})});
+    toast('enemy speed '+espText(v)+' - '+(res.ok||res.err));
   };
   typable(esp,document.getElementById('enemyspeedval'));
   document.getElementById('enemyspeed_ct').onchange=async(e)=>{
@@ -1828,7 +1841,7 @@ function bind(){
     const el=document.getElementById(key);
     el.oninput=rarityPaint;
     el.onchange=async()=>{
-      const res=await j('/api/set',{method:'POST',body:JSON.stringify({key,value:+el.value})});
+      const res=await j('/api/set',{method:'POST',body:JSON.stringify({key,value:sliderVal(el)})});
       // the server may have cut the other share so the two stay within 100
       if(res.cfg) rarityLoad(res.cfg); else rarityPaint();
       toast('monster rarity: '+document.getElementById('raritynote').textContent+' - '+(res.ok||res.err));

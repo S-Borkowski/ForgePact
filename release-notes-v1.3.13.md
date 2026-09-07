@@ -25,7 +25,8 @@ Works together with Hero Siege Item Editor 2.15.3.
 ## New
 
 - **Type a value.** Click the number next to any slider to type the exact value you
-  want. Enter applies it, Escape cancels. Handy where a slider skips numbers.
+  want. Enter applies it, Escape cancels. What you type is what you get: 23 stays 23,
+  the slider's steps only apply when you drag it.
 
 ## How to update
 
