@@ -4560,6 +4560,175 @@ static bool SpawnSignatureItem(int which, double x, double y, CInstance* ctx)
         return true;
     } catch (...) { ++g_SigDropFails; Out(std::string("sigdrop: EXCEPTION at ") + stage + " while dropping " + label); return false; }
 }
+// ---- Angelic drops on our own die ----------------------------------------------------------
+// The game's own angelic roll (DropItemAngelicChance: irandom(item drop rate) < chance, chance
+// 2-3k in ordinary zones) practically never fires offline, and its guaranteed maker
+// (DropItemAngelic) loops forever when the zone's unique loot list has no angelic candidate.
+// So: one die per kill, and on a hit an Angelic/Unholy unique from the table below, built
+// through the same path as the signature drops (definition json -> InitItemFromJson ->
+// LootGroundCreateFromItem) with c=1 (unique repo).  Each row is validated once against the
+// game's unique repo: the name key must match and the base's info flag 40 (hidden / dev item,
+// which the game's own picker skips) must NOT be set - live 2026-09-07: exactly the nine dev
+// and joke items carry it (Dev Charm, DEVELOPRE BOOT, Elemelon...), the 49 real ones do not.
+struct AngelicBase { int type, sub, b; const char* key; const char* name; bool angelic; };
+static const AngelicBase kAngelicBases[] = {
+    { 0, 0, 85, "helmet_lucifers_crown", "Lucifer's Crown", true },
+    { 0, 0, 86, "helmet_mask_of_celestial", "Mask of the Celestial", true },
+    { 1, 0, 2, "armors_tayrels_chestplate", "Tayrel's Chestplate", true },
+    { 1, 0, 33, "armors_st_judas_hauberk", "St. Jupe's Plate of Command", true },
+    { 1, 0, 95, "armors_grand_archwizards_mantle", "Grand Arch Wizard's Mantle", false },
+    { 2, 0, 62, "boots_marchers_of_hatred", "Marcher's of Hatred", false },
+    { 2, 0, 65, "boots_developer_boots", "DEVELOPRE BOOT", false },
+    { 2, 0, 79, "boots_peg_leg", "Peg Leg", false },
+    { 3, 1, 15, "w_melee_st_gabriels_retribution", "St. Gabriel's Retribution", true },
+    { 3, 1, 24, "w_melee_st_mikas_zweihander", "St. Mika's Zweih?nder", true },
+    { 3, 1, 35, "w_melee_stofflix_cooking_cleaver", "Stofflix Cooking Cleaver", false },
+    { 3, 3, 18, "w_melee_dawn_bringer", "The Dawn Bringer", true },
+    { 3, 3, 21, "w_melee_stormslayer", "Stormslayer", false },
+    { 3, 4, 5, "w_melee_st_rexis_sundering_axe", "St. Rexis Sundering Axe", true },
+    { 3, 4, 9, "w_melee_aurelion_fury", "Aurelion Fury", true },
+    { 3, 5, 0, "w_claw_storm_fury", "Storm Fury", true },
+    { 3, 6, 9, "w_polearm_st_draxis_pigstick", "St. Draxis' Pigstick", true },
+    { 3, 7, 5, "w_chainsaw_st_meeses_longsaw", "St. Draxis Longsaw", true },
+    { 3, 9, 4, "w_spell_nimosLightbringer", "St. Nimo's Lightbringer", true },
+    { 3, 10, 3, "w_spell_st_houdeaniis_tiny_fire_rod", "St. HouDeanii's Tiny Fire Rod", true },
+    { 3, 13, 6, "w_bow_st_soloyolos_holy_bow", "St. Soloyolo's Holy Bow", true },
+    { 3, 13, 13, "w_bow_st_amithiels_truth", "St. Amitiel's Truth", true },
+    { 3, 14, 8, "w_gun_st_brooks_elementium_pistol", "Commander's Sentry Blaster", true },
+    { 3, 14, 16, "w_gun_glock22", "Glock 22", false },
+    { 3, 16, 6, "w_throwing_st_neris_rainbow_lance", "St. Neri's Rainbow Lance", true },
+    { 4, 0, 30, "gloves_ahtos_diamond_hands", "St. Ahto's Diamond Hands", true },
+    { 4, 0, 49, "gloves_demonfire_accelerators", "Demonfire Accelerators", false },
+    { 5, 0, 62, "amulets_liliths_scorn", "Lilith's Scorn", false },
+    { 6, 0, 26, "shields_tomis_vibrant_aura", "St. Tomi's Vibrant Aura", true },
+    { 6, 0, 30, "shields_hallgars_blood_forged", "St. Hallgar's Bloodforged Aegis", true },
+    { 7, 0, 9, "rings_devlins_eternal_grace", "St. Aaron's Eternal Rage", true },
+    { 7, 0, 14, "rings_fury_of_tarethiel", "Fury of Tarethiel", true },
+    { 7, 0, 57, "rings_absolute_zero", "Absolute Zero", false },
+    { 8, 0, 44, "belts_majories_belt", "Majorie's Belt", true },
+    { 8, 0, 51, "belts_liquor_holster", "Liquor Holster", true },
+    { 8, 0, 53, "belts_el_patrons_madness", "El Patr?n's Madness", false },
+    { 10, 0, 32, "charms_annihilus", "Annihilator", false },
+    { 10, 0, 47, "charms_water_melon", "Water Melon", true },
+    { 10, 0, 48, "charms_earth_melon", "Earth Melon", true },
+    { 10, 0, 49, "charms_fire_melon", "Fire Melon", true },
+    { 10, 0, 50, "charms_air_melon", "Air Melon", true },
+    { 10, 0, 51, "charms_supreme_elemelon", "Supreme Elemelon", true },
+    { 10, 0, 53, "charms_arcane_pumpkin", "Arcane Pumpkin", false },
+    { 10, 0, 54, "charms_rotten_pumpkin", "Rotten Pumpkin", false },
+    { 10, 0, 56, "charms_liliths_wrath", "Lilith's Wrath", false },
+    { 10, 0, 57, "charms_divine_crack_pipe", "Divine Crackpipe", true },
+    { 10, 0, 65, "charms_forking_bolts", "Forking Bolts", false },
+    { 10, 0, 66, "charms_reverse_card", "Reverse Card", true },
+    { 10, 0, 74, "charms_almighty_nugget", "The Almighty Nugget", true },
+    { 10, 0, 78, "charms_dev_charm_small", "Dev Charm Small", true },
+    { 10, 0, 79, "charms_dev_charm_small", "Dev Charm Small", true },
+    { 10, 0, 80, "charms_dev_charm_small", "Dev Charm Small", true },
+    { 10, 0, 89, "charms_overloaded_dice", "Overloaded Dice", false },
+    { 10, 0, 90, "charms_devils_pact", "Devil's Pact", false },
+    { 10, 0, 91, "charms_soul_collector", "Soul Collector", false },
+    { 10, 0, 98, "charms_goburins_head", "Goburin's Head", false },
+    { 18, 0, 5, "consumable_elixir_of_unworldly_cognition", "Elixir of Unworldly Cognition", false },
+    { 18, 0, 8, "consumable_gold_inlaid_mysterious_potion", "Gold Inlaid Mysterious Potion", true },
+};
+struct AngelicCandidate { int type, sub, b; std::string name; bool angelic; };
+static std::vector<AngelicCandidate> g_AngelicPool;
+static bool g_AngelicPoolBuilt = false;
+static double g_AngelicDropOneIn = 0.0;   // 0 = off; N = one angelic drop per N kills on average
+static volatile long g_AngelicDropRolls = 0, g_AngelicDropHits = 0, g_AngelicDropFails = 0;
+static std::string StructKey(const RValue& st, const char* field)
+{
+    try { RValue v = g_Yytk->CallBuiltin("variable_struct_get", { st, RValue(field) }); if (v.m_Kind == VALUE_STRING) return v.ToString(); } catch (...) {}
+    return std::string();
+}
+static void BuildAngelicPool(bool verbose)
+{
+    if (g_AngelicPoolBuilt) return;
+    g_AngelicPoolBuilt = true;
+    g_AngelicPool.clear();
+    int rejected = 0;
+    for (const AngelicBase& base : kAngelicBases) {
+        std::string why;
+        if (base.type == 18) why = "potion";
+        else try {
+            RValue def = g_Yytk->CallGameScript("gml_Script_GetUniqueRepoStruct",
+                                                { RValue((double)base.type), RValue((double)base.sub), RValue((double)base.b) });
+            if (def.m_Kind != VALUE_OBJECT) why = "no def";
+            else {
+                RValue info = g_Yytk->CallBuiltin("variable_struct_get", { def, RValue("itemBaseInfoStruct") });
+                const std::string key = info.m_Kind == VALUE_OBJECT ? StructKey(info, "28") : std::string();
+                if (key != base.key) why = "key mismatch: " + key;
+                else {
+                    RValue f40 = g_Yytk->CallBuiltin("variable_struct_get", { info, RValue("40") });
+                    bool flag = false;
+                    try { flag = f40.m_Kind != VALUE_UNDEFINED && f40.m_Kind != VALUE_UNSET && f40.ToBoolean(); } catch (...) { flag = false; }
+                    if (flag) why = "hidden/dev item (info flag 40 set)";   // the game's picker skips these
+                }
+            }
+            if (why.empty()) {   // build one (not dropped) and keep it only if the game calls it Angelic or Unholy
+                const std::string json = "{\"w\":1,\"a\":123456789,\"j\":" + std::to_string(base.sub) + ",\"b\":" + std::to_string(base.b) + ",\"c\":1}";
+                CInstance* g = nullptr; g_Yytk->GetGlobalInstance(&g);
+                RValue parsed; if (g) g_Yytk->CallBuiltinEx(parsed, "json_parse", g, g, { RValue(json) });
+                RValue item; if (g && parsed.m_Kind == VALUE_OBJECT) g_Yytk->CallGameScriptEx(item, "gml_Script_InitItemFromJson", g, g, { parsed, RValue(std::string("0-0-1-") + std::to_string(base.type)) });
+                double rar = -1.0;
+                if (item.m_Kind == VALUE_OBJECT) { RValue info = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("itemInfoStruct") }); if (info.m_Kind == VALUE_OBJECT) TryStructNumber(info, "27", rar); }
+                if (rar != 7.0 && rar != 10.0) why = "game makes it rarity " + std::to_string((int)rar);
+            }
+        } catch (...) { why = "exception"; }
+        if (why.empty()) g_AngelicPool.push_back({ base.type, base.sub, base.b, base.name, base.angelic });
+        else ++rejected;
+        if (verbose) Out(std::string("angeliclist: ") + base.name + " (" + std::to_string(base.type) + "/" + std::to_string(base.sub) + "/" + std::to_string(base.b) + ") -> " + (why.empty() ? "ok" : why));
+    }
+    Out("angelic pool: " + std::to_string(g_AngelicPool.size()) + " candidates, " + std::to_string(rejected) + " rejected");
+}
+static bool SpawnAngelicItem(const AngelicCandidate& c, double x, double y, CInstance* ctx)
+{
+    try {
+        const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        const long long seed = 100000000LL + (long long)(std::uniform_real_distribution<double>(0.0, 899999999.0)(TyRng()));
+        const std::string key = "0-0-" + std::to_string(ms) + "-" + std::to_string(c.type);
+        const std::string json = "{\"w\":1,\"a\":" + std::to_string(seed) + ",\"j\":" + std::to_string(c.sub) + ",\"b\":" + std::to_string(c.b) + ",\"c\":1}";
+        CInstance* g = nullptr; g_Yytk->GetGlobalInstance(&g);
+        if (!g) { Out("angelicdrop: no global instance"); return false; }
+        RValue parsed; g_Yytk->CallBuiltinEx(parsed, "json_parse", g, g, { RValue(json) });
+        if (parsed.m_Kind != VALUE_OBJECT) { Out("angelicdrop: json_parse failed"); return false; }
+        RValue item; AurieStatus st = g_Yytk->CallGameScriptEx(item, "gml_Script_InitItemFromJson", g, g, { parsed, RValue(key) });
+        if (!AurieSuccess(st) || item.m_Kind != VALUE_OBJECT) { Out("angelicdrop: InitItemFromJson failed st=" + std::to_string((int)st)); return false; }
+        std::string made;
+        try {
+            RValue info = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("itemInfoStruct") });
+            if (info.m_Kind == VALUE_OBJECT) { double rar = -1; TryStructNumber(info, "27", rar); made = StructKey(info, "28") + " rarity " + std::to_string((int)rar); }
+        } catch (...) {}
+        CInstance* self = ctx ? ctx : g;
+        RValue res; AurieStatus st3 = g_Yytk->CallGameScriptEx(res, "gml_Script_LootGroundCreateFromItem", self, self, { RValue(x), RValue(y), item });
+        if (!AurieSuccess(st3)) { Out("angelicdrop: LootGroundCreateFromItem st=" + std::to_string((int)st3)); return false; }
+        Out("angelicdrop: " + c.name + " -> " + made + " at " + std::to_string((int)x) + "," + std::to_string((int)y));
+        return true;
+    } catch (...) { Out("angelicdrop: EXCEPTION while spawning " + c.name); return false; }
+}
+static void AngelicDropOnKill(CInstance* S)
+{
+    if (g_AngelicDropOneIn <= 0.0 || !S) return;
+    try {
+        RValue enemy = S->ToRValue();
+        const double rarity = HhReadNumber(enemy, "enemyRarity", -1.0);
+        if (rarity < 1.0) return;   // not a monster
+        InterlockedIncrement(&g_AngelicDropRolls);
+        if (std::uniform_real_distribution<double>(0.0, g_AngelicDropOneIn)(TyRng()) >= 1.0) return;
+        BuildAngelicPool(false);
+        if (g_AngelicPool.empty()) { InterlockedIncrement(&g_AngelicDropFails); return; }
+        const size_t pick = (size_t)std::uniform_int_distribution<int>(0, (int)g_AngelicPool.size() - 1)(TyRng());
+        const double x = HhReadNumber(enemy, "x", 0.0), y = HhReadNumber(enemy, "y", 0.0);
+        if (SpawnAngelicItem(g_AngelicPool[pick], x, y, S)) InterlockedIncrement(&g_AngelicDropHits); else InterlockedIncrement(&g_AngelicDropFails);
+    } catch (...) { InterlockedIncrement(&g_AngelicDropFails); Out("angelicdrop: EXCEPTION"); }
+}
+static void AngelicDropStatus()
+{
+    Out("angelicdrop: " + (g_AngelicDropOneIn > 0.0 ? "1 in " + std::to_string((long long)g_AngelicDropOneIn) + " kills" : std::string("off"))
+        + " | rolls=" + std::to_string(g_AngelicDropRolls) + " drops=" + std::to_string(g_AngelicDropHits) + " fails=" + std::to_string(g_AngelicDropFails)
+        + " | pool " + (g_AngelicPoolBuilt ? std::to_string(g_AngelicPool.size()) + " candidates" : std::string("not built yet")));
+}
+
 static void SignatureDropOnKill(CInstance* S)
 {
     if (g_SigDropPct <= 0.0 || !S) return;
@@ -4587,6 +4756,7 @@ static RValue& Hook_EnemyDestroyKillProc(CInstance* S, CInstance* O, RValue& R, 
 {
     RValue& res = g_Orig_EnemyDestroyKillProc ? g_Orig_EnemyDestroyKillProc(S, O, R, argc, A) : R;
     SignatureDropOnKill(S);
+    AngelicDropOnKill(S);
     if (g_HhEnabled.load() && S && argc >= 3 && A && A[2]) {
         try {
             CInstance* player = nullptr;
@@ -5935,7 +6105,7 @@ static void InstallHook()
     HeadhunterAutoArm();
     TyrantAutoArm();
     BeaconAutoArm();
-    if (g_SigDropPct > 0.0) InstallHeadhunterHook();   // kill hook carries the signature drops
+    if (g_SigDropPct > 0.0 || g_AngelicDropOneIn > 0.0) InstallHeadhunterHook();   // kill hook carries the signature and angelic drops
 
     // Development builds install the complete research surface eagerly.
     // Player builds install only the functional hook group requested by a
@@ -6252,7 +6422,8 @@ static double g_SatanicMult = 1.0;   // 1 = vanilla monster level
 // slider: x1 = off, x2 = gate open at the game's own rate,
 //         x3..x5 = gate open and the internal roll ceiling divided by (mult-1).
 static double g_AngelicMult     = 1.0;   // what the panel asked for
-static double g_AngelicRateMult = 1.0;   // 1 = the game's own rate
+static double g_AngelicRateMult = 1.0;   // rolls per kill once the gate is open: 1 = the game's own single roll
+static bool g_InAngelicExtra = false;
 
 static volatile long g_RateCeilHits = 0;
 static volatile long g_RateHeroHits = 0;
@@ -6572,24 +6743,18 @@ static RValue& HookAngelicChance(CInstance* S, CInstance* O, RValue& R, int argc
         } catch (...) {}
     }
 #endif
-    if (g_AngelicRateMult > 1.0 && argc >= 3 && A && A[2] && A[2]->m_Kind == VALUE_REAL) {
-        try {
-            double c = A[2]->ToDouble();
-            if (std::isfinite(c) && c > 0.0) {
-                *A[2] = RValue(c * g_AngelicRateMult);
-#ifndef FORGEPACT_RELEASE
-                long hits = InterlockedIncrement(&g_AngRateHits);
-                if (hits <= 5) {
-                    char b[192];
-                    sprintf_s(b, "angelic: chance %g -> %g in place (x%.2f)",
-                              c, c * g_AngelicRateMult, g_AngelicRateMult);
-                    Out(b);
-                }
-#endif
-            }
-        } catch (...) {}
+    // Multiplying the chance argument in place broke the game's own check (x99 -> zero
+    // drops, 2026-09-05).  Since 1.3.13 the multiplier is a number of ROLLS: every extra roll
+    // is the game's own function with the game's own chance, so x2 really is two 1-in-N dice.
+    RValue& r = g_OrigAngChance ? g_OrigAngChance(S, O, R, argc, A) : R;
+    const int extra = (int)std::lround(g_AngelicRateMult) - 1;   // rate x1 = the game's roll only
+    if (!g_InAngelicExtra && extra > 0 && g_OrigAngChance) {
+        g_InAngelicExtra = true;
+        for (int i = 0; i < extra && i < 9; ++i) { RValue t; try { g_OrigAngChance(S, O, t, argc, A); } catch (...) {} }
+        g_InAngelicExtra = false;
+        InterlockedIncrement(&g_AngRateHits);
     }
-    return g_OrigAngChance ? g_OrigAngChance(S, O, R, argc, A) : R;
+    return r;
 }
 
 // raredrop heroic|ceiling|satanic|angelic <multiplier>   |   raredrop list
@@ -6885,13 +7050,9 @@ static void RareDropCmd(const std::string& rest)
         // Measured live: x9 scaling works (26% per roll), x99 produces ZERO drops -
         // an oversized chance value breaks the game's own check.  Hard cap at x9.
         if (g_AngelicRateMult > 9.0) g_AngelicRateMult = 9.0;
-        if (g_AngelicRateMult > 1.0) {
-            if (ResolveRateKeys() && !g_OrigGpvRate)
-                HookOneScript("GPV", "fp_gpvrate", (PVOID)HookGpvRate, &g_OrigGpvRate);
-        }
         char b[176];
-        sprintf_s(b, "raredrop angelic: x%.2f -> gate open, rate x%.2f (x2 = the game's own rate)",
-                  mult, g_AngelicRateMult);
+        sprintf_s(b, "raredrop angelic: x%.2f -> gate open, %d roll(s) per kill at the game's own chance (x2 = one roll)",
+                  mult, (int)std::lround(g_AngelicRateMult));
         Out(b);
         return;
     }
@@ -9412,6 +9573,16 @@ static bool HandleHeadhunterCommand(const std::string& lc, const std::string& re
         }
         Out("  gui=" + num("display_get_gui_width", {}) + "x" + num("display_get_gui_height", {}) + " window=" + num("window_get_width", {}) + "x" + num("window_get_height", {}) + " room=" + num("variable_global_get", { RValue("room_width") }) + "x" + num("variable_global_get", { RValue("room_height") }) + " view_wport0=" + num("view_get_wport", { RValue(0.0) }) + " view_hport0=" + num("view_get_hport", { RValue(0.0) }) + " view_visible0=" + num("view_get_visible", { RValue(0.0) }));
         Out("  active labels=" + std::to_string(g_HhStolen.size()) + " lastErr=" + g_HhLabelLastErr);
+    } else if (lc == "angeliclist") {
+        g_AngelicPoolBuilt = false; BuildAngelicPool(true);
+    } else if (lc == "angelicdrop") {
+        std::string v = Lower(TrimCopy(rest));
+        if (v.empty() || v == "status") AngelicDropStatus();
+        else if (v == "off" || v == "0") { g_AngelicDropOneIn = 0.0; AngelicDropStatus(); }
+        else {
+            try { double n = std::stod(v); if (n < 1.0) n = 1.0; if (n > 10000000.0) n = 10000000.0; BuildAngelicPool(false); g_AngelicDropOneIn = g_AngelicPool.empty() ? 0.0 : n; InstallHeadhunterHook(); AngelicDropStatus(); }
+            catch (...) { Out("angelicdrop: usage -> angelicdrop <one in N kills> | off | status"); }
+        }
     } else if (lc == "sigdrop") {
         std::string v = Lower(TrimCopy(rest));
         if (v.empty() || v == "status") SigDropStatus();
@@ -9643,7 +9814,7 @@ static void RunCommand(const std::string& line)
         "ping", "density", "reveal", "specialrate", "dropmult",
         "stat", "statadd", "raredrop", "droprate", "dungeonkey",
         "headhunter", "hhdur", "hhmap", "hhdefault", "hhlabel", "tyrant", "beacon", "beaconrange", "beaconmode", "beaconwake", "beaconspawn", "beaconfarstep", "tyrantchance", "tyrantaffix", "hhlabelfont", "hhlabeloffset", "hhlabelmax",
-        "enemyspeed", "rarity", "sigdrop"
+        "enemyspeed", "rarity", "sigdrop", "angelicdrop"
     };
     if (kPlayerCommands.find(lc) == kPlayerCommands.end()) {
         Out("command unavailable in player build: " + cmd);

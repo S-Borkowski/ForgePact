@@ -128,6 +128,9 @@ DEFAULTS = {
     # (percent each, together at most 100; the rest stay normal).
     "rarity_rare": 0,
     "rarity_ancient": 0,
+    # Angelic / Unholy drops: 1 = off, 2 = one die per kill at the Angelic Key's own
+    # rate (1 in 7,500), every step above adds a die.
+    "angelic_items": 1,
     # Enemy movement speed bonus in percent (0 = vanilla) and its scope.
     "enemy_speed": 0,
     "enemy_speed_ct": True,
@@ -413,6 +416,30 @@ def _pct(value, default=0) -> int:
         return default
 
 
+ANGELIC_BASE_ONE_IN = 7500   # the Angelic Key's own drop rate, one die per kill at x2
+ANGELIC_MAX = 100
+
+
+def angelic_mult(value) -> int:
+    """Clamp the Angelic / Unholy slider to 1 (off) .. ANGELIC_MAX."""
+    try:
+        v = int(round(float(value)))
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(ANGELIC_MAX, v))
+
+
+def angelic_one_in(mult: int) -> int:
+    """x2 = 1 in 7,500 kills, x3 = 1 in 3,750 ... (mult - 1 dice per kill)."""
+    dice = max(0, angelic_mult(mult) - 1)
+    return 0 if dice == 0 else max(1, int(round(ANGELIC_BASE_ONE_IN / dice)))
+
+
+def angelic_cmd(cfg: dict) -> str:
+    one_in = angelic_one_in(cfg.get("angelic_items", 1))
+    return f"angelicdrop {one_in}" if one_in > 0 else "angelicdrop off"
+
+
 def rarity_setting(cfg: dict):
     """(rare, ancient) shares of the Monster Rarity sliders, in percent of the
     normal monsters.  Ancient is honoured first; Rare is cut so the two never
@@ -477,6 +504,8 @@ def build_cmds(cfg: dict) -> list:
     rare, ancient = rarity_setting(cfg)
     if rare > 0 or ancient > 0:
         out.append(f"rarity {rare} {ancient}")
+    if angelic_one_in(cfg.get("angelic_items", 1)) > 0:
+        out.append(angelic_cmd(cfg))
     if enemy_speed_pct(cfg.get("enemy_speed", 0)) > 0:
         # Enemies path-find toward you faster; "ct" keeps it to Chaos Tower.
         out.append(enemy_speed_cmd(cfg))
@@ -1217,6 +1246,8 @@ class H(BaseHTTPRequestHandler):
                     # float("3") -> 3.0; the plugin prints with %g so it shows as "x3".
                     d = round(max(1.0, min(5.0, float(val))), 2)   # slider steps 0.5, typed values stay
                     cfg["density"] = int(d) if float(d).is_integer() else d
+                elif key == "angelic_items":
+                    cfg["angelic_items"] = angelic_mult(val)
                 elif key == "enemy_speed":
                     cfg["enemy_speed"] = enemy_speed_pct(val)
                 elif key == "enemy_speed_ct":
@@ -1260,6 +1291,8 @@ class H(BaseHTTPRequestHandler):
                     elif key in ("rarity_rare", "rarity_ancient"):
                         # Always explicit: "rarity off" returns a live hook to vanilla.
                         send_cmds([rarity_cmd(cfg)], cfg)
+                    elif key == "angelic_items":
+                        send_cmds([angelic_cmd(cfg)], cfg)
                     elif key in ("enemy_speed", "enemy_speed_ct"):
                         # Always explicit: "enemyspeed 1 ct" turns a live hook back to vanilla.
                         send_cmds([enemy_speed_cmd(cfg)], cfg)
@@ -1483,6 +1516,21 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;heigh
   <div id="keys"></div>
 </div>
 
+<div class="card tab-card" data-tab="loot">
+  <h2>&#128081; Angelic / Unholy Drops</h2>
+  <div class="hint">Offline the game never rolls for Angelic or Unholy items, so this is ForgePact's own
+  die: on every monster kill it rolls, and on a hit the game itself builds one of its 49 real Angelic /
+  Unholy uniques (no developer or event pieces) and drops it where the monster died.<br>
+  <b>x2</b> is one die per kill at the Angelic Key's own rate (1 in 7,500), every step above adds a die.
+  Click the value to type an exact number. <b>x1</b> is off.</div>
+  <div class="row">
+    <span class="lbl">Angelic / Unholy items</span>
+    <input type="range" id="angelic_items" min="1" max="100" step="1" value="1">
+    <span class="val off" id="angelicval" style="width:64px">off</span>
+  </div>
+  <div class="note" id="angelicnote">off</div>
+</div>
+
 <div class="card modifier-card tab-card" data-tab="modifiers">
   <div class="section-title">
     <div><h2>&#9876; Combat &amp; Character Modifiers</h2>
@@ -1577,6 +1625,12 @@ function openTab(name,remember=true){
   if(remember){try{sessionStorage.setItem('forgepact_tab',name)}catch(e){}}
   window.scrollTo({top:0,behavior:'smooth'});
 }
+function angelicPaint(){
+  const el=document.getElementById('angelic_items'); const v=sliderVal(el);
+  const dice=Math.max(0,Math.round(v)-1); const oneIn=dice>0?Math.max(1,Math.round(7500/dice)):0;
+  const val=document.getElementById('angelicval'); val.textContent=v>1?'x'+v:'off'; val.className='val '+(v>1?'':'off');
+  document.getElementById('angelicnote').textContent=oneIn>0?`about 1 Angelic or Unholy item in ${oneIn.toLocaleString()} kills (${dice} ${dice>1?'dice':'die'} per kill at 1 in 7,500)`:'off - vanilla offline: never';
+}
 function rarityPaint(){
   const r=sliderVal(document.getElementById('rarity_rare')), a=sliderVal(document.getElementById('rarity_ancient'));
   const rv=document.getElementById('rarityrareval'), av=document.getElementById('rarityancval');
@@ -1585,6 +1639,7 @@ function rarityPaint(){
   document.getElementById('raritynote').textContent=(r>0||a>0)?`of the normal monsters: ${a}% Ancient, ${r}% Rare, ${Math.max(0,100-r-a)}% stay normal`:'off - the game rolls rarity on its own';
 }
 function rarityLoad(c){
+  document.getElementById('angelic_items').value=+(c.angelic_items||1); angelicPaint();
   document.getElementById('rarity_rare').value=+(c.rarity_rare||0);
   document.getElementById('rarity_ancient').value=+(c.rarity_ancient||0);
   rarityPaint();
@@ -1837,6 +1892,10 @@ function bind(){
     document.getElementById('beval').className='val '+(e.target.checked?'':'off');
     toast('beacon '+(e.target.checked?'ON':'OFF')+' - '+(res.ok||res.err));
   };
+  { const el=document.getElementById('angelic_items');
+    el.oninput=angelicPaint;
+    el.onchange=async()=>{ const v=sliderVal(el); const res=await j('/api/set',{method:'POST',body:JSON.stringify({key:'angelic_items',value:v})}); angelicPaint(); toast('angelic drops '+(v>1?'x'+v:'off')+' - '+(res.ok||res.err)); };
+    typable(el,document.getElementById('angelicval')); }
   for(const key of ['rarity_rare','rarity_ancient']){
     const el=document.getElementById(key);
     el.oninput=rarityPaint;
