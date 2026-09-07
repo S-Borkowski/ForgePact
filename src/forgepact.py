@@ -109,21 +109,7 @@ PERCENT_STATS = [
 ]
 
 # Rare item quality.  These do not add drops - they change how good a drop is
-# allowed to be.  Third field is the slider ceiling.  (Card restored in 1.3.13:
-# the 1.3.10 panel rewrite dropped it while the plugin kept `raredrop`.)
-#   angelic : offline the game never rolls for Angelic/Unholy at all; x2 opens
-#             that roll at the game's own rate, x3..x10 multiplies it (measured:
-#             x10 works, more breaks the game's own check)
-#   ceiling : the shared roll every rare ladder uses; raising it lifts Heroic,
-#             Satanic and the normal rarity ladder all at once
-#   satanic : the Satanic tier is chosen by monster level, so we let low-level
-#             monsters count as higher level (capped at the game's own top row)
-RARE = [
-    ("angelic", "Angelic / Unholy", 10),
-    ("ceiling", "All Rare Tiers", 3),
-    ("satanic", "Satanic Tier", 5),
-]
-
+# allowed to be.  Third field is the slider ceiling.
 #   heroic  : the game's own Heroic chance (vanilla 28% per drop)
 #   ceiling : the shared roll every rare ladder uses; raising it lifts Heroic,
 #             Satanic and the normal rarity ladder all at once
@@ -150,7 +136,6 @@ DEFAULTS = {
     "keys": {k: 1 for k, *_ in KEYS},
     "stats": {k: 1 for k, *_ in STATS},
     "percent_stats": {k: 0 for k, *_ in PERCENT_STATS},
-    "rare": {k: 1 for k, *_ in RARE},
 }
 
 _lock = threading.Lock()
@@ -520,10 +505,6 @@ def build_cmds(cfg: dict) -> list:
             out.append(f"statadd {key} {bonus:g}")
         else:
             out.append(f"stat {key} {1.0 + bonus / 100.0:g}")
-    for key, _label, ceiling in RARE:
-        value = max(1, min(ceiling, int(cfg.get("rare", {}).get(key, 1))))
-        if value > 1:
-            out.append(f"raredrop {key} {value}")
     settings = cfg.get("keys", {})
     out.extend(build_key_cmds(settings, include_resets=False))
     return out
@@ -1196,7 +1177,6 @@ class H(BaseHTTPRequestHandler):
                         "drops": [[k, l, h] for k, l, h in DROPS],
                         "stats": [[k, l, mx, step] for k, l, mx, step in STATS],
                         "percentStats": [[k, l, mx, step, mode] for k, l, mx, step, mode in PERCENT_STATS],
-                        "rare": [[k, l, mx] for k, l, mx in RARE],
                         # Third field is the drop type: the panel's explanation text
                         # differs per family because they do not all mean the same thing.
                         "keys": [[k, l, t] for k, l, t in KEYS],
@@ -1224,9 +1204,6 @@ class H(BaseHTTPRequestHandler):
                     value = max(0.0, min(float(ceiling), float(val)))
                     value = round(value / step) * step
                     cfg.setdefault("percent_stats", {})[key] = int(value) if value.is_integer() else value
-                elif sec == "rare":
-                    ceiling = next((mx for k, _l, mx in RARE if k == key), 5)
-                    cfg.setdefault("rare", {})[key] = max(1, min(ceiling, int(val)))
                 elif sec == "drops":
                     cfg[sec][key] = max(1, min(100, int(val)))
                 elif sec == "spawners":
@@ -1269,8 +1246,6 @@ class H(BaseHTTPRequestHandler):
                         bonus = float(cfg["percent_stats"][key])
                         command = f"statadd {key} {bonus:g}" if mode == "add" else f"stat {key} {1.0 + bonus / 100.0:g}"
                         send_cmds([command], cfg)
-                    elif sec == "rare":
-                        send_cmds([f"raredrop {key} {int(val)}"], cfg)
                     elif sec == "spawners":
                         send_cmds([f"specialrate {key} {int(val)}"], cfg)
                     elif key in ("density", "density_on"):
@@ -1509,22 +1484,6 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;heigh
   <div id="keys"></div>
 </div>
 
-<div class="card tab-card" data-tab="loot">
-  <h2>&#11088; Rare Item Quality</h2>
-  <div class="hint">These do not make more items drop - they decide <b>how good</b> a drop
-  is allowed to be. Everything uses the game's own dice and its own tier tables; nothing is
-  forced and nothing is written into your save.<br>
-  <b>Angelic / Unholy</b>: offline the game never even rolls for these, so <b>x2</b> simply lets
-  it roll at its own rate and x3 and up multiply that rate. Unholy comes through the same path,
-  so it arrives with Angelic. This is the one setting that edits game code in memory rather
-  than just reading a value - the game file on disk is never touched, and x1 puts the original
-  bytes straight back.<br>
-  <b>All Rare Tiers</b> is the master slider: it lifts every rarity ladder together, so use it
-  gently - the game reads it while a map loads, so it kicks in on the next map.<br>
-  <b>x1</b> on any row means completely vanilla.</div>
-  <div id="rare"></div>
-</div>
-
 <div class="card modifier-card tab-card" data-tab="modifiers">
   <div class="section-title">
     <div><h2>&#9876; Combat &amp; Character Modifiers</h2>
@@ -1705,16 +1664,6 @@ function rareNote(key,v){
   }
   return `${v}x`;
 }
-function rareNote(key,v){
-  if(v<=1) return 'off';
-  if(key==='angelic'){
-    if(v===2) return "the game's own angelic rate - it never rolls at all without this";
-    return `the game's own angelic rate, multiplied ${v-1}x (measured: x10 works, higher breaks the game's check)`;
-  }
-  if(key==='ceiling') return `${v}x on every rare tier at once - takes effect when the NEXT map loads`;
-  if(key==='satanic') return `monsters count as ${v}x their level for the Satanic tier roll (capped at level 200)`;
-  return `${v}x`;
-}
 function keyNote(key,dropType,v){
   if(v<=1) return 'off';
   if(key==='ruby') return `${v}x the key's own vanilla roll (base 1,500,000)`;
@@ -1763,10 +1712,6 @@ async function boot(){
   document.getElementById('hhval').className='val '+(hh?'':'off');
   document.getElementById('exepath').value=c.game_exe||'';
   document.getElementById('spawners').innerHTML=ST.spawners.map(([k,i,l,mx])=>row('spawners',k,l,c.spawners[k]||1,'',mx)).join('');
-  document.getElementById('rare').innerHTML=(ST.rare||[]).map(([k,l,mx])=>{
-    const v=(c.rare&&c.rare[k])||1;
-    return row('rare',k,l,v,'',mx,rareNote(k,v));
-  }).join('');
   document.getElementById('keys').innerHTML=ST.keys.map(([k,l,t])=>{
     const v=(c.keys&&c.keys[k])||1;
     return row('keys',k,l,v,'',100,keyNote(k,t,v));
@@ -1819,7 +1764,6 @@ function bind(){
     const tipOf=(k)=>{const e=(ST.keys||[]).find(x=>x[0]===k);return e?e[2]:undefined;};
     r.oninput=()=>{const v=+r.value;valEl.textContent=sliderText(r.dataset.sec,v);valEl.className='val '+(sliderOff(r.dataset.sec,v)?'off':'');
       if(noteEl&&r.dataset.sec==='keys')noteEl.textContent=keyNote(r.dataset.key,tipOf(r.dataset.key),v);
-      if(noteEl&&r.dataset.sec==='rare')noteEl.textContent=rareNote(r.dataset.key,v);
       if(noteEl&&r.dataset.sec==='stats')noteEl.textContent=statNote(r.dataset.key,v);
       if(noteEl&&r.dataset.sec==='percent_stats')noteEl.textContent=percentStatNote(r.dataset.key,v);
     };
