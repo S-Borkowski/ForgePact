@@ -4,26 +4,24 @@ Works together with Hero Siege Item Editor 2.15.3.
 
 ## Fixed
 
-- **Tyrant's Crown and Monster Rarity did nothing in 1.3.14.** The protection added for
-  monsters that split when they die was far too wide: it also covered every monster the
-  game's own spawners create, which is nearly all of them, so no monster was ever raised.
-  Measured before the fix: 3370 monsters, 0 raised. After: 790 monsters, 63 raised to rare
-  and 106 given an extra affix. The protection now only covers monsters that another
-  monster spawned, which is what it was meant to do.
+- **Tyrant's Crown and Monster Rarity did nothing in 1.3.14.** The crown never made monsters
+  rarer and the Monster Rarity sliders had no effect at all. A protection added in the last
+  version was far too wide and switched both off. Counted in a real game: 3370 monsters, none
+  raised. After the fix, in the same conditions: 790 monsters, 63 raised to rare and 106 given
+  an extra affix.
+- **Headhunter did nothing for some players.** The belt only worked when the game told
+  ForgePact who landed the killing blow. On some setups the game does not say, and the belt
+  stayed silent while everything looked correctly installed. The kill now counts either way,
+  and a monster's own death effect works as a second way to notice it.
 
-## Also
-
-- **Headhunter is less picky about how a monster dies.** It used to need the game to name the
-  killer; when the game did not, the belt did nothing. Now the kill counts either way, and a
-  monster's own death effect works as a second trigger.
-- The Headhunter status line reports how often the game's kill event reached ForgePact, so a
-  report of "the belt does nothing" can be answered from the log instead of guesswork.
+If Tyrant's Crown or Headhunter looked broken for you, this is the version that fixes it.
+Turn them on in the World tab as before, wear the item, and kill rare or champion monsters.
 
 Nothing else changed since 1.3.14.
 
 ## How to update
 
-Download the zip, unzip it, run ForgePact and press **Install** once. Start the game
-after that; a game that was already open keeps the old plugin until it is restarted.
+Download the zip, unzip it, run ForgePact and press **Install** once. Start the game after
+that; a game that was already open keeps the old plugin until it is restarted.
 
 Use ForgePact only with an offline / EAC-disabled copy of Hero Siege.
