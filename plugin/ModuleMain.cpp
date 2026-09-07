@@ -580,6 +580,8 @@ static std::string g_WatchCallers;           // distinct caller RVAs of the watc
 static int  g_EnemyParentIdx = -1;           // asset index of Enemy_Parent_obj
 static int  g_EnemyMultAll = 1;              // multiplier applied to ALL enemy descendants (direct)
 static double g_CreatorMult = 1.0;          // ALL Enemy_Creator* spawners (density).  Kesirli olabilir: 1.5, 2.5 ...
+static bool g_CallerIsEnemy = false;                 // set while a monster's own instance_create runs (see EnemyBornScope)
+static volatile LONG g_DensitySkippedEnemyBorn = 0;
 static double g_CreatorFrac = 0.0;          // kesir birikimi - 1.5x'te her ikinci ureticiye bir fazla kopya
 static std::unordered_map<int, bool> g_IsEnemyCache;   // object index -> is enemy descendant
 static std::unordered_map<int, bool> g_IsCreatorCache; // object index -> name starts with "Enemy_Creator"
@@ -952,7 +954,8 @@ static void DoMultiCreate(TRoutine orig, RValue& Result, CInstance* S, CInstance
     }
     if (isCreator && !specialChild) NoteDensityCreator();
     // density: multiply all Enemy_Creator* spawners (produces fully-configured enemies)
-    if (g_CreatorMult > 1.0 && isCreator && !specialChild
+    if (g_CallerIsEnemy && isCreator) InterlockedIncrement(&g_DensitySkippedEnemyBorn);
+    if (g_CreatorMult > 1.0 && isCreator && !specialChild && !g_CallerIsEnemy
         && !densityAlreadyApplied
         && (knownCreator || DensityWindowActive())) {
         // Tam kisim herkese; kesir kismi birikime yayilir ve 1'e ulasinca
@@ -1149,8 +1152,59 @@ static void WatchLog(void* ret, int objIdx)
             g_WatchCallers += rb;
     }
 }
+// ---- enemy-born creations ----------------------------------------------------------------
+// Worms, spiders and similar split into new monsters when they die, and a dying monster
+// can also spawn a legion creator.  Anything a monster itself creates is remembered here:
+// the rarity raise and Tyrant's Crown leave those alone (a re-raised split child splits
+// again - "the pack grows forever", tester report 2026-09-07) and Monster Density does
+// not multiply a creator a monster spawned.  Cheap: the caller is only inspected when a
+// raise or density is active and the created object is a monster or a known creator.
+static bool RarityFloorActive();
+static bool TyrantActive();
+static bool g_CreatingFromEnemy = false;             // true while a monster runs instance_create
+static std::unordered_set<int> g_EnemyBornIds;       // monsters created by a monster, by instance id
+static volatile LONG g_EnemyBornSeen = 0, g_RarSkippedEnemyBorn = 0;
+static bool CallerIsEnemyInstance(CInstance* S)
+{
+    if (!S) return false;
+    try {
+        RValue oi = g_Yytk->CallBuiltin("variable_instance_get", { RValue(S), RValue("object_index") });
+        return IsEnemyObject((int)oi.ToDouble());
+    } catch (...) { return false; }
+}
+// Scoped guard placed first in HookICD / HookICL: when a monster instance itself creates
+// a monster or a known creator, the flags are raised for the duration of the original
+// call and the new instance id is remembered afterwards.  Costs two bool reads when no
+// raise and no density is active, so the release fast path below stays as it was.
+struct EnemyBornScope
+{
+    RValue& result; int objIdx = -1; bool active = false; bool prevCreating = false, prevCaller = false;
+    EnemyBornScope(RValue& r, CInstance* S, int argc, RValue* Args) : result(r)
+    {
+        try { if (argc >= 4) objIdx = (int)Args[3].ToDouble(); } catch (...) {}
+        if (!(RarityFloorActive() || TyrantActive() || g_CreatorMult > 1.0)) return;
+        if (!(IsEnemyObject(objIdx) || IsCachedCreatorObject(objIdx))) return;
+        if (!CallerIsEnemyInstance(S)) return;
+        active = true; prevCreating = g_CreatingFromEnemy; prevCaller = g_CallerIsEnemy;
+        g_CreatingFromEnemy = g_CreatingFromEnemy || IsEnemyObject(objIdx);
+        g_CallerIsEnemy = true;
+    }
+    ~EnemyBornScope()
+    {
+        if (!active) return;
+        g_CreatingFromEnemy = prevCreating; g_CallerIsEnemy = prevCaller;
+        try {
+            if (IsEnemyObject(objIdx) && (result.m_Kind == VALUE_REAL || result.m_Kind == VALUE_INT32 || result.m_Kind == VALUE_INT64 || result.m_Kind == VALUE_REF)) {
+                if (g_EnemyBornIds.size() > 5000) g_EnemyBornIds.clear();
+                g_EnemyBornIds.insert((int)result.ToDouble());
+                InterlockedIncrement(&g_EnemyBornSeen);
+            }
+        } catch (...) {}
+    }
+};
 static void HookICD(RValue& Result, CInstance* S, CInstance* O, int argc, RValue* Args)
 {
+    EnemyBornScope _born(Result, S, argc, Args);
 #ifdef FORGEPACT_RELEASE
     // A hook installed earlier in this process cannot be removed safely while
     // the game is running.  With every related feature Off, take a true native
@@ -1184,6 +1238,7 @@ static void HookICD(RValue& Result, CInstance* S, CInstance* O, int argc, RValue
 }
 static void HookICL(RValue& Result, CInstance* S, CInstance* O, int argc, RValue* Args)
 {
+    EnemyBornScope _born(Result, S, argc, Args);
 #ifdef FORGEPACT_RELEASE
     if (g_CreatorMult <= 1.0 && g_EnemyMultAll <= 1 && g_ObjMult.empty()) {
         if (g_OrigICL) g_OrigICL(Result, S, O, argc, Args);
@@ -3703,7 +3758,12 @@ static RValue& Hook_EnemyRaritySettings(CInstance* S, CInstance* O, RValue& R, i
     if (g_RarForceLeft > 0 && S) { --g_RarForceLeft; try { g_Yytk->CallBuiltin("variable_instance_set", { inst, RValue("forceRarity"), RValue(g_RarForceVal) }); Out("   -> forceRarity set to " + std::to_string((int)g_RarForceVal)); } catch (...) {} }
     if (g_RarPreLeft > 0 && S) { --g_RarPreLeft; try { g_Yytk->CallBuiltin("variable_instance_set", { inst, RValue("enemyRarity"), RValue(g_RarPreVal) }); Out("   -> enemyRarity pre-set to " + std::to_string((int)g_RarPreVal)); } catch (...) {} }
 #endif
-    if (S && RarityFloorActive()) {
+    bool enemyBorn = g_CreatingFromEnemy;
+    if (!enemyBorn && S && (RarityFloorActive() || TyrantActive())) {
+        try { const double id = HhReadNumber(inst, "id", -1.0); if (id >= 0.0 && g_EnemyBornIds.erase((int)id)) enemyBorn = true; } catch (...) {}
+    }
+    if (enemyBorn && S && (RarityFloorActive() || TyrantActive())) InterlockedIncrement(&g_RarSkippedEnemyBorn);
+    if (S && !enemyBorn && RarityFloorActive()) {
         try {
             RValue rv = g_Yytk->CallBuiltin("variable_instance_get", { inst, RValue("enemyRarity") });
             const double rar = (rv.m_Kind == VALUE_REAL || rv.m_Kind == VALUE_INT32 || rv.m_Kind == VALUE_INT64) ? rv.ToDouble() : -1.0;
@@ -3723,7 +3783,7 @@ static RValue& Hook_EnemyRaritySettings(CInstance* S, CInstance* O, RValue& R, i
             }
         } catch (...) {}
     }
-    if (S && TyrantActive()) {
+    if (S && !enemyBorn && TyrantActive()) {
         try {
             RValue rv = g_Yytk->CallBuiltin("variable_instance_get", { inst, RValue("enemyRarity") });
             const double rar = (rv.m_Kind == VALUE_REAL || rv.m_Kind == VALUE_INT32 || rv.m_Kind == VALUE_INT64) ? rv.ToDouble() : -1.0;
@@ -3743,11 +3803,13 @@ static RValue& Hook_EnemyRaritySettings(CInstance* S, CInstance* O, RValue& R, i
 #endif
     return r;
 }
+static void InstallCreateHooks();
 static void InstallTyrantHook()
 {
     if (g_TyHookAttempted) return;
     g_TyHookAttempted = true;
     g_TyHookInstalled = HookOneScript("EnemyRaritySettings", "fp_tyrant_rarity", (PVOID)Hook_EnemyRaritySettings, &g_Orig_EnemyRaritySettings);
+    InstallCreateHooks();   // enemy-born tracking rides the instance_create hooks
 }
 static void TyrantAutoArm()
 {
@@ -9240,7 +9302,8 @@ static bool HandleHeadhunterCommand(const std::string& lc, const std::string& re
         Out(std::string("rarity -> ") + (RarityFloorActive()
             ? ("rare " + std::to_string((int)rare) + " pct, ancient " + std::to_string((int)anc) + " pct" + (g_TyHookInstalled ? "" : " (hook failed)"))
             : std::string("off"))
-            + " | raised so far: rare=" + std::to_string(g_RarRaisedRare) + " ancient=" + std::to_string(g_RarRaisedAncient));
+            + " | raised so far: rare=" + std::to_string(g_RarRaisedRare) + " ancient=" + std::to_string(g_RarRaisedAncient)
+            + " | enemy-born left alone: " + std::to_string(g_RarSkippedEnemyBorn) + " (seen " + std::to_string(g_EnemyBornSeen) + ")");
     } else if (lc == "tyrantchance" || lc == "tyrantaffix") {
         try { double p = std::stod(TrimCopy(rest)); if (p >= 0.0 && p <= 100.0) { if (lc == "tyrantchance") g_TyRarePct = p; else g_TyAffixPct = p; } } catch (...) {}
         Out(lc + " -> " + std::to_string((int)(lc == "tyrantchance" ? g_TyRarePct : g_TyAffixPct)) + " percent");

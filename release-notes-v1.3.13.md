@@ -10,10 +10,12 @@ Works together with Hero Siege Item Editor 2.15.3.
   and scrolls rained everywhere. Now a slider only multiplies the drop where the game
   already drops it. The Relic slider no longer lets Prime Evil parts (Soul of Anguish,
   Despair, Corruption) through with the relics.
-- **Monster Rarity no longer snowballs.** Raised monsters could receive affixes that
-  create new monsters when they die or make copies of themselves (Fallen Angel, Fractal,
-  Haunted, Possessed). Each new monster was raised again, so the more you killed, the
-  more there were. Those four affixes are no longer handed out by the raise.
+- **Monster Rarity and Tyrant's Crown no longer snowball.** Monsters that split when
+  they die (worms, spiders and the like) or spawn a legion on death had their offspring
+  raised again, and those split again, so the pack never ended. Anything a monster itself
+  spawns is now left alone by the raise, and Monster Density does not multiply it either.
+  The raise also no longer hands out the four affixes that create monsters on death
+  (Fallen Angel, Fractal, Haunted, Possessed).
 - **Gems work in forged items again.** Two things were wrong: the game checks an item's
   fingerprint before it accepts a gem, and a forged item failed that check; and when a gem
   did go in, its bonus was lost because ForgePact rewrote the item's stats after the game
