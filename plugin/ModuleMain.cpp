@@ -579,6 +579,51 @@ static int  g_WatchObj = -1;                 // when this object is created, log
 static std::string g_WatchCallers;           // distinct caller RVAs of the watched object's creation
 static int  g_EnemyParentIdx = -1;           // asset index of Enemy_Parent_obj
 static int  g_EnemyMultAll = 1;              // multiplier applied to ALL enemy descendants (direct)
+// ---- research profiler ----------------------------------------------------------------
+// Time spent inside ForgePact's own hooks versus the game's frame interval, so "does the
+// plugin cost frames at density x3" is a measurement, not a guess.  Compiled out of the
+// player build; the PERF_SCOPE macro is empty there.
+#ifndef FORGEPACT_RELEASE
+struct PerfBucket { const char* name; long long ns = 0; long calls = 0; };
+static PerfBucket g_PerfICD{ "instance_create hooks" }, g_PerfForge{ "item create post-process" },
+                  g_PerfDeltas{ "rune/special snapshots" }, g_PerfRarity{ "EnemyRaritySettings hook" },
+                  g_PerfKill{ "kill hook" }, g_PerfHud{ "DrawHudBuffs hook" }, g_PerfPoll{ "PollCommands" },
+                  g_PerfFrame{ "FrameCallback body" };
+static PerfBucket* const g_PerfAll[] = { &g_PerfICD, &g_PerfForge, &g_PerfDeltas, &g_PerfRarity, &g_PerfKill, &g_PerfHud, &g_PerfPoll, &g_PerfFrame };
+static long long PerfFreq() { static long long f = 0; if (!f) { LARGE_INTEGER q; QueryPerformanceFrequency(&q); f = q.QuadPart; } return f; }
+struct PerfScope {
+    PerfBucket& b; long long t0;
+    explicit PerfScope(PerfBucket& bb) : b(bb) { LARGE_INTEGER q; QueryPerformanceCounter(&q); t0 = q.QuadPart; }
+    ~PerfScope() { LARGE_INTEGER q; QueryPerformanceCounter(&q); b.ns += (q.QuadPart - t0) * 1000000000LL / PerfFreq(); ++b.calls; }
+};
+#define PERF_SCOPE(bucket) PerfScope _perfScope_##__LINE__(bucket)
+static long long g_PerfFrameLast = 0, g_PerfFrameSumNs = 0, g_PerfFrameMaxNs = 0; static long g_PerfFrames = 0;
+static void PerfFrameTick()
+{
+    LARGE_INTEGER q; QueryPerformanceCounter(&q);
+    if (g_PerfFrameLast) { long long d = (q.QuadPart - g_PerfFrameLast) * 1000000000LL / PerfFreq(); g_PerfFrameSumNs += d; if (d > g_PerfFrameMaxNs) g_PerfFrameMaxNs = d; ++g_PerfFrames; }
+    g_PerfFrameLast = q.QuadPart;
+}
+static void PerfReset() { for (PerfBucket* b : g_PerfAll) { b->ns = 0; b->calls = 0; } g_PerfFrameSumNs = 0; g_PerfFrameMaxNs = 0; g_PerfFrames = 0; g_PerfFrameLast = 0; }
+static void PerfReport()
+{
+    const double frameMs = g_PerfFrames ? g_PerfFrameSumNs / 1e6 : 0.0;
+    char b[200];
+    sprintf_s(b, "perf: %ld frames, avg %.2f ms, max %.1f ms (game frame interval)", g_PerfFrames, g_PerfFrames ? frameMs / g_PerfFrames : 0.0, g_PerfFrameMaxNs / 1e6);
+    Out(b);
+    long long total = 0;
+    for (PerfBucket* pb : g_PerfAll) {
+        total += pb->ns;
+        sprintf_s(b, "  %-26s calls=%-7ld total=%8.2f ms  avg=%7.1f us  share of frames=%.3f%%", pb->name, pb->calls, pb->ns / 1e6, pb->calls ? pb->ns / 1e3 / pb->calls : 0.0, frameMs > 0 ? pb->ns / 1e6 / frameMs * 100.0 : 0.0);
+        Out(b);
+    }
+    sprintf_s(b, "  plugin total %.2f ms of %.2f ms = %.3f%% of the game's frame time", total / 1e6, frameMs, frameMs > 0 ? total / 1e6 / frameMs * 100.0 : 0.0);
+    Out(b);
+}
+#else
+#define PERF_SCOPE(bucket)
+#endif
+
 static double g_CreatorMult = 1.0;          // ALL Enemy_Creator* spawners (density).  Kesirli olabilir: 1.5, 2.5 ...
 static bool g_CallerIsEnemy = false;                 // set while a monster's own instance_create runs (see EnemyBornScope)
 static volatile LONG g_DensitySkippedEnemyBorn = 0;
@@ -924,6 +969,7 @@ static void KuyrukIsle()
     g_KuyruktanYaratim = false;
 }
 
+static int CallerObjectIndex(CInstance* S);   // defined with the enemy-born guard below
 static void DoMultiCreate(TRoutine orig, RValue& Result, CInstance* S, CInstance* O, int argc, RValue* Args, int objIdx, bool katman)
 {
 #ifndef FORGEPACT_RELEASE
@@ -955,6 +1001,16 @@ static void DoMultiCreate(TRoutine orig, RValue& Result, CInstance* S, CInstance
     if (isCreator && !specialChild) NoteDensityCreator();
     // density: multiply all Enemy_Creator* spawners (produces fully-configured enemies)
     if (g_CallerIsEnemy && isCreator) InterlockedIncrement(&g_DensitySkippedEnemyBorn);
+#ifndef FORGEPACT_RELEASE
+    if (g_CreatorMult > 1.0 && isCreator && !specialChild && !g_CallerIsEnemy && !densityAlreadyApplied && knownCreator && !DensityWindowActive()) {
+        static long s_LateLogs = 0;
+        if (++s_LateLogs <= 60) {
+            std::string who = "?"; try { RValue n = g_Yytk->CallBuiltin("object_get_name", { RValue((double)CallerObjectIndex(S)) }); who = n.ToString(); } catch (...) {}
+            std::string what = "?"; try { RValue n = g_Yytk->CallBuiltin("object_get_name", { RValue((double)objIdx) }); what = n.ToString(); } catch (...) {}
+            Out("density: late spawner multiplied: " + what + " created by " + who + " at frame " + std::to_string((long long)g_RuntimeFrame));
+        }
+    }
+#endif
     if (g_CreatorMult > 1.0 && isCreator && !specialChild && !g_CallerIsEnemy
         && !densityAlreadyApplied
         && (knownCreator || DensityWindowActive())) {
@@ -1164,13 +1220,24 @@ static bool TyrantActive();
 static bool g_CreatingFromEnemy = false;             // true while a monster runs instance_create
 static std::unordered_set<int> g_EnemyBornIds;       // monsters created by a monster, by instance id
 static volatile LONG g_EnemyBornSeen = 0, g_RarSkippedEnemyBorn = 0;
-static bool CallerIsEnemyInstance(CInstance* S)
+static int CallerObjectIndex(CInstance* S)
 {
-    if (!S) return false;
-    try {
-        RValue oi = g_Yytk->CallBuiltin("variable_instance_get", { RValue(S), RValue("object_index") });
-        return IsEnemyObject((int)oi.ToDouble());
-    } catch (...) { return false; }
+    if (!S) return -1;
+    try { RValue oi = g_Yytk->CallBuiltin("variable_instance_get", { RValue(S), RValue("object_index") }); return (int)oi.ToDouble(); } catch (...) { return -1; }
+}
+static bool CallerIsEnemyInstance(CInstance* S) { return IsEnemyObject(CallerObjectIndex(S)); }
+// The built-in `id` is not a struct member: variable_struct_get gives undefined for it (the
+// enemy-born match was silently dead, 2026-09-07: 1261 births recorded, 0 matched).
+static double InstanceIdOf(const RValue& inst)
+{
+    try { RValue v = g_Yytk->CallBuiltin("variable_instance_get", { inst, RValue("id") }); return v.ToDouble(); } catch (...) { return -1.0; }
+}
+// A spawner created by a monster OR by another spawner is a runtime chain link, not part of
+// the zone's layout: density leaves it alone, otherwise every generation multiplies again.
+static bool CallerIsEnemyOrCreator(CInstance* S)
+{
+    const int idx = CallerObjectIndex(S);
+    return idx >= 0 && (IsEnemyObject(idx) || IsCachedCreatorObject(idx) || IsCreatorObject(idx));
 }
 // Scoped guard placed first in HookICD / HookICL: when a monster instance itself creates
 // a monster or a known creator, the flags are raised for the duration of the original
@@ -1184,9 +1251,11 @@ struct EnemyBornScope
         try { if (argc >= 4) objIdx = (int)Args[3].ToDouble(); } catch (...) {}
         if (!(RarityFloorActive() || TyrantActive() || g_CreatorMult > 1.0)) return;
         if (!(IsEnemyObject(objIdx) || IsCachedCreatorObject(objIdx))) return;
-        if (!CallerIsEnemyInstance(S)) return;
+        const bool enemyCaller = CallerIsEnemyInstance(S);
+        const bool chainCaller = enemyCaller || CallerIsEnemyOrCreator(S);
+        if (!chainCaller) return;
         active = true; prevCreating = g_CreatingFromEnemy; prevCaller = g_CallerIsEnemy;
-        g_CreatingFromEnemy = g_CreatingFromEnemy || IsEnemyObject(objIdx);
+        g_CreatingFromEnemy = g_CreatingFromEnemy || (enemyCaller && IsEnemyObject(objIdx));
         g_CallerIsEnemy = true;
     }
     ~EnemyBornScope()
@@ -1204,6 +1273,7 @@ struct EnemyBornScope
 };
 static void HookICD(RValue& Result, CInstance* S, CInstance* O, int argc, RValue* Args)
 {
+    PERF_SCOPE(g_PerfICD);
     EnemyBornScope _born(Result, S, argc, Args);
 #ifdef FORGEPACT_RELEASE
     // A hook installed earlier in this process cannot be removed safely while
@@ -1238,6 +1308,7 @@ static void HookICD(RValue& Result, CInstance* S, CInstance* O, int argc, RValue
 }
 static void HookICL(RValue& Result, CInstance* S, CInstance* O, int argc, RValue* Args)
 {
+    PERF_SCOPE(g_PerfICD);
     EnemyBornScope _born(Result, S, argc, Args);
 #ifdef FORGEPACT_RELEASE
     if (g_CreatorMult <= 1.0 && g_EnemyMultAll <= 1 && g_ObjMult.empty()) {
@@ -2857,12 +2928,14 @@ static void AddBuiltInSignatureEntries()
     }
 }
 
+static void RebuildForgeSelectorIndex();   // defined with the forge delta hooks below
 static void LoadCustomForgeEntries()
 {
     g_CustomForgeEntries.clear();
     std::ifstream f(CustomForgeRuntimePath(), std::ios::binary);
     if (!f) {
         AddBuiltInSignatureEntries();
+        RebuildForgeSelectorIndex();
         WriteCustomForgeStatus("no runtime file");
         return;
     }
@@ -2901,6 +2974,7 @@ static void LoadCustomForgeEntries()
         g_CustomForgeEntries.push_back(std::move(entry));
     }
     AddBuiltInSignatureEntries();
+    RebuildForgeSelectorIndex();
     const std::string detail = headerSeen
         ? ("loaded " + std::to_string(g_CustomForgeEntries.size()) +
            ", rejected " + std::to_string(rejected))
@@ -3048,6 +3122,31 @@ struct ForgeDeltas
     bool haveAfterSpecial = false;
 };
 static std::unordered_map<YYObjectBase*, ForgeDeltas> g_ForgeDeltas;
+// Selector index of the loaded forge entries ("t|a|b"): an item whose type / seed / base is
+// not in it cannot be dressed, so its runeword / special-stat snapshots are skipped.
+static std::unordered_set<std::string> g_ForgeSelectorKeys;
+static bool g_ForgeSelectorIndexLoose = true;   // an entry without t/a/b -> check everything
+static void RebuildForgeSelectorIndex()
+{
+    g_ForgeSelectorKeys.clear(); g_ForgeSelectorIndexLoose = false;
+    for (const CustomForgeEntry& e : g_CustomForgeEntries) {
+        auto it = e.selector.find("t"), ia = e.selector.find("a"), ib = e.selector.find("b");
+        if (it == e.selector.end() || ia == e.selector.end() || ib == e.selector.end()) { g_ForgeSelectorIndexLoose = true; continue; }
+        g_ForgeSelectorKeys.insert(std::to_string((long long)it->second) + "|" + std::to_string((long long)ia->second) + "|" + std::to_string((long long)ib->second));
+    }
+}
+static bool ForgeCouldMatch(const RValue& item)
+{
+    if (g_ForgeSelectorIndexLoose) return true;
+    if (g_ForgeSelectorKeys.empty()) return false;
+    try {
+        double t = 0, a = 0, b = 0;
+        if (!TryStructNumber(item, "itemType", t)) return false;
+        RValue def = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("itemDefinitionStruct") });
+        if (def.m_Kind != VALUE_OBJECT || !TryStructNumber(def, "a", a) || !TryStructNumber(def, "b", b)) return false;
+        return g_ForgeSelectorKeys.count(std::to_string((long long)t) + "|" + std::to_string((long long)a) + "|" + std::to_string((long long)b)) > 0;
+    } catch (...) { return true; }
+}
 static volatile LONG g_ForgeAdditionsAdded = 0;
 static bool FdIsNumber(const RValue& v) { return v.m_Kind == VALUE_REAL || v.m_Kind == VALUE_INT32 || v.m_Kind == VALUE_INT64; }
 static std::map<std::string, double> StructNumbers(const RValue& st)
@@ -3074,8 +3173,9 @@ static PFUNC_YYGMLScript g_Orig_GenerateItemSpecialStats = nullptr, g_Orig_GetRu
 static RValue& Hook_GenerateItemSpecialStats(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
 {
     RValue& r = g_Orig_GenerateItemSpecialStats ? g_Orig_GenerateItemSpecialStats(S, O, R, argc, A) : R;
+    PERF_SCOPE(g_PerfDeltas);
     try {
-        if (argc >= 1 && A && A[0] && A[0]->m_Kind == VALUE_OBJECT) {
+        if (argc >= 1 && A && A[0] && A[0]->m_Kind == VALUE_OBJECT && ForgeCouldMatch(*A[0])) {
             RValue st = ItemStatsOf(*A[0]);
             if (st.m_Kind == VALUE_OBJECT) {
                 if (g_ForgeDeltas.size() > 4096) g_ForgeDeltas.clear();
@@ -3089,7 +3189,8 @@ static RValue& Hook_GenerateItemSpecialStats(CInstance* S, CInstance* O, RValue&
 }
 static RValue& Hook_GetRuneword(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
 {
-    RValue* itemP = (argc >= 1 && A && A[0] && A[0]->m_Kind == VALUE_OBJECT) ? A[0] : nullptr;
+    RValue* itemP = (argc >= 1 && A && A[0] && A[0]->m_Kind == VALUE_OBJECT && ForgeCouldMatch(*A[0])) ? A[0] : nullptr;
+    PERF_SCOPE(g_PerfDeltas);
     std::map<std::string, double> before; bool track = false;
     if (itemP) { try { RValue st = ItemStatsOf(*itemP); if (st.m_Kind == VALUE_OBJECT) { before = StructNumbers(st); track = true; } } catch (...) { track = false; } }
     RValue& r = g_Orig_GetRuneword ? g_Orig_GetRuneword(S, O, R, argc, A) : R;
@@ -3283,6 +3384,7 @@ static bool TryApplyCustomForge(RValue* candidate, bool finalPass = false)
 
 static void CustomForgePostProcess(RValue& result, int argc, RValue** args, bool finalPass)
 {
+    PERF_SCOPE(g_PerfForge);
     if (TryApplyCustomForge(&result, finalPass)) return;
     // Some constructors mutate an argument and return undefined. Scan only a
     // small, bounded prefix; TryApply requires all three canonical item fields.
@@ -3675,6 +3777,7 @@ static void HhDrawHeadLabels()
 static PFUNC_YYGMLScript g_Orig_DrawHudBuffs = nullptr;
 static RValue& Hook_DrawHudBuffs(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
 {
+    PERF_SCOPE(g_PerfHud);
     RValue& r = g_Orig_DrawHudBuffs ? g_Orig_DrawHudBuffs(S, O, R, argc, A) : R;
     ++g_HhHudCalls;
     HhDrawHeadLabels();
@@ -3822,6 +3925,7 @@ static std::string RarState(const RValue& inst)
 #endif
 static RValue& Hook_EnemyRaritySettings(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
 {
+    PERF_SCOPE(g_PerfRarity);
     ++g_TySeen;
     RValue inst; try { if (S) inst = S->ToRValue(); } catch (...) { S = nullptr; }
 #ifndef FORGEPACT_RELEASE
@@ -3832,7 +3936,7 @@ static RValue& Hook_EnemyRaritySettings(CInstance* S, CInstance* O, RValue& R, i
 #endif
     bool enemyBorn = g_CreatingFromEnemy;
     if (!enemyBorn && S && (RarityFloorActive() || TyrantActive())) {
-        try { const double id = HhReadNumber(inst, "id", -1.0); if (id >= 0.0 && g_EnemyBornIds.erase((int)id)) enemyBorn = true; } catch (...) {}
+        try { const double id = InstanceIdOf(inst); if (id >= 0.0 && g_EnemyBornIds.erase((int)id)) enemyBorn = true; } catch (...) {}
     }
     if (enemyBorn && S && (RarityFloorActive() || TyrantActive())) InterlockedIncrement(&g_RarSkippedEnemyBorn);
     if (S && !enemyBorn && RarityFloorActive()) {
@@ -4706,8 +4810,10 @@ static bool SpawnAngelicItem(const AngelicCandidate& c, double x, double y, CIns
         return true;
     } catch (...) { Out("angelicdrop: EXCEPTION while spawning " + c.name); return false; }
 }
+static volatile long g_KillsSeen = 0;
 static void AngelicDropOnKill(CInstance* S)
 {
+    InterlockedIncrement(&g_KillsSeen);
     if (g_AngelicDropOneIn <= 0.0 || !S) return;
     try {
         RValue enemy = S->ToRValue();
@@ -4754,6 +4860,7 @@ static void SigDropStatus()
 
 static RValue& Hook_EnemyDestroyKillProc(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
 {
+    PERF_SCOPE(g_PerfKill);
     RValue& res = g_Orig_EnemyDestroyKillProc ? g_Orig_EnemyDestroyKillProc(S, O, R, argc, A) : R;
     SignatureDropOnKill(S);
     AngelicDropOnKill(S);
@@ -6734,7 +6841,9 @@ static RValue& HookAngelicChance(CInstance* S, CInstance* O, RValue& R, int argc
                 g_AngLastChance = chance;
                 if (n <= 15 || (n % 100) == 0) {
                     char b[256];
-                    sprintf_s(b, "angelic: roll #%ld  chance=%g", n, chance);
+                    std::string who;
+                    try { if (S) { RValue inst = S->ToRValue(); who = TyInstName(inst) + " rarity " + std::to_string((int)HhReadNumber(inst, "enemyRarity", -1.0)); } } catch (...) { who = "?"; }
+                    sprintf_s(b, "angelic: roll #%ld  chance=%g  by %s", n, chance, who.substr(0, 60).c_str());
                     Out(b);
                 }
             } else if (n <= 5) {
@@ -8408,8 +8517,9 @@ static void CensusTick(unsigned long long fc)
     try {
         // GML'de `all` = -3
         RValue all = g_Yytk->CallBuiltin("instance_number", { RValue(-3.0) });
+        double monsters = -1; try { if (g_EnemyParentIdx >= 0) monsters = g_Yytk->CallBuiltin("instance_number", { RValue((double)g_EnemyParentIdx) }).ToDouble(); } catch (...) {}
         std::ofstream f(IPC_DIR + "\\census.txt", std::ios::app);
-        f << "kare=" << fc << "  TOPLAM=" << (long long)all.ToDouble();
+        f << "kare=" << fc << "  TOPLAM=" << (long long)all.ToDouble() << "  CANAVAR=" << (long long)monsters;
         for (const auto& e : kSpecial) {
             RValue idx = g_Yytk->CallBuiltin("asset_get_index", { RValue(e.obj) });
             int oi = (int)idx.ToDouble();
@@ -9573,6 +9683,10 @@ static bool HandleHeadhunterCommand(const std::string& lc, const std::string& re
         }
         Out("  gui=" + num("display_get_gui_width", {}) + "x" + num("display_get_gui_height", {}) + " window=" + num("window_get_width", {}) + "x" + num("window_get_height", {}) + " room=" + num("variable_global_get", { RValue("room_width") }) + "x" + num("variable_global_get", { RValue("room_height") }) + " view_wport0=" + num("view_get_wport", { RValue(0.0) }) + " view_hport0=" + num("view_get_hport", { RValue(0.0) }) + " view_visible0=" + num("view_get_visible", { RValue(0.0) }));
         Out("  active labels=" + std::to_string(g_HhStolen.size()) + " lastErr=" + g_HhLabelLastErr);
+#ifndef FORGEPACT_RELEASE
+    } else if (lc == "perf") {
+        if (Lower(TrimCopy(rest)) == "reset") { PerfReset(); Out("perf: counters reset"); } else PerfReport();
+#endif
     } else if (lc == "angeliclist") {
         g_AngelicPoolBuilt = false; BuildAngelicPool(true);
     } else if (lc == "angelicdrop") {
@@ -10190,6 +10304,17 @@ static void RunCommand(const std::string& line)
         StatCmd(rest);
     } else if (lc == "statadd") {
         StatAddCmd(rest);
+    } else if (lc == "angelicwatch") {
+        // Research: observe the game's own angelic rolls without touching the gate.
+        std::string v = Lower(TrimCopy(rest));
+        if (v == "on" || v.empty()) {
+            if (!g_OrigAngChance) HookOneScript("DropItemAngelicChance", "fp_angch", (PVOID)HookAngelicChance, &g_OrigAngChance);
+            g_AngelicRateMult = 1.0;
+            InstallHeadhunterHook();
+            g_AngChanceCalls = 0; g_KillsSeen = 0;
+            Out("angelicwatch: on - counting kills and the game's own angelic rolls (gate untouched)");
+        } else if (v == "off") { Out("angelicwatch: hook stays, counting stops being reset"); }
+        else Out("angelicwatch: kills=" + std::to_string(g_KillsSeen) + " gameRolls=" + std::to_string(g_AngChanceCalls) + " lastChance=" + std::to_string((long long)g_AngLastChance));
     } else if (lc == "raredrop") {
         RareDropCmd(rest);
 #ifndef FORGEPACT_RELEASE
@@ -10359,6 +10484,10 @@ void FrameCallback(FWFrame& FrameContext)
     UNREFERENCED_PARAMETER(FrameContext);
     static uint32_t fc = 0;
     g_RuntimeFrame = fc;
+#ifndef FORGEPACT_RELEASE
+    PerfFrameTick();
+#endif
+    PERF_SCOPE(g_PerfFrame);
     FlushItemStats(fc);
     if (fc == 1) Trace("0-framecallback-running");
 
@@ -10480,7 +10609,7 @@ void FrameCallback(FWFrame& FrameContext)
     // Two IPC checks per second are enough for a settings panel and avoid five
     // filesystem probes per second during gameplay.
     if (((fc++) % 30) == 0 && g_Setup) {
-        try { PollCommands(); } catch (...) {}
+        if ((g_RuntimeFrame % 6) == 0) { PERF_SCOPE(g_PerfPoll); try { PollCommands(); } catch (...) {} }
     }
 }
 

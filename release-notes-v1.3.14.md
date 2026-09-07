@@ -11,7 +11,14 @@ Works together with Hero Siege Item Editor 2.15.3.
   die per kill at the Angelic Key's own rate (1 in 7,500); every step above adds a die,
   and you can click the value to type an exact number. x1 is off.
 
-Nothing else changed since 1.3.13.
+## Fixed
+
+- **Monsters that split on death no longer multiply forever.** The 1.3.13 protection for
+  monster-born monsters was not matching them; Tyrant's Crown and Monster Rarity kept
+  raising split spiders and worms, and every raised one split again. Fixed and confirmed in
+  Corrupted Cave (4-3). Monster Density also leaves spawners spawned by other spawners alone.
+- Small clean-ups: the panel's command file is read six times a second instead of every
+  frame, and item measurements only run for forged items.
 
 ## How to update
 
