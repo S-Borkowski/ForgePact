@@ -1517,10 +1517,11 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;heigh
 </div>
 
 <div class="card tab-card" data-tab="loot">
-  <h2>&#128081; Angelic / Unholy Drops</h2>
-  <div class="hint">Offline the game never rolls for Angelic or Unholy items, so this is ForgePact's own
-  die: on every monster kill it rolls, and on a hit the game itself builds one of its 49 real Angelic /
-  Unholy uniques (no developer or event pieces) and drops it where the monster died.<br>
+  <h2>&#128081; Angelic / Unholy Drops (Experimental)</h2>
+  <div class="hint">The game only rolls for Angelic or Unholy items while an "Angelic item drop chance"
+  effect (a Blood Pact or dungeon modifier) is active, so this is ForgePact's own die: on every monster
+  kill it rolls, and on a hit the game itself builds one of its 49 real Angelic / Unholy uniques (no
+  developer or event pieces) and drops it where the monster died.<br>
   <b>x2</b> is one die per kill at the Angelic Key's own rate (1 in 7,500), every step above adds a die.
   Click the value to type an exact number. <b>x1</b> is off.</div>
   <div class="row">
@@ -1629,7 +1630,7 @@ function angelicPaint(){
   const el=document.getElementById('angelic_items'); const v=sliderVal(el);
   const dice=Math.max(0,Math.round(v)-1); const oneIn=dice>0?Math.max(1,Math.round(7500/dice)):0;
   const val=document.getElementById('angelicval'); val.textContent=v>1?'x'+v:'off'; val.className='val '+(v>1?'':'off');
-  document.getElementById('angelicnote').textContent=oneIn>0?`about 1 Angelic or Unholy item in ${oneIn.toLocaleString()} kills (${dice} ${dice>1?'dice':'die'} per kill at 1 in 7,500)`:'off - vanilla offline: never';
+  document.getElementById('angelicnote').textContent=oneIn>0?`about 1 Angelic or Unholy item in ${oneIn.toLocaleString()} kills (${dice} ${dice>1?'dice':'die'} per kill at 1 in 7,500)`:'off - the game rolls only with an Angelic drop-chance effect';
 }
 function rarityPaint(){
   const r=sliderVal(document.getElementById('rarity_rare')), a=sliderVal(document.getElementById('rarity_ancient'));

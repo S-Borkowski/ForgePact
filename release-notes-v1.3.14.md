@@ -4,8 +4,9 @@ Works together with Hero Siege Item Editor 2.15.3.
 
 ## New
 
-- **Angelic / Unholy drops.** Offline the game never rolls for Angelic or Unholy items.
-  The Loot tab now has an Angelic / Unholy slider: on every monster kill ForgePact rolls
+- **Angelic / Unholy drops (experimental).** The game only rolls for Angelic or Unholy
+  items while an "Angelic item drop chance" effect from a Blood Pact or dungeon modifier is
+  active. The Loot tab now has an Angelic / Unholy slider: on every monster kill ForgePact rolls
   its own die, and on a hit the game itself builds one of its 49 real Angelic and Unholy
   uniques (no developer or event pieces) and drops it where the monster died. x2 is one
   die per kill at the Angelic Key's own rate (1 in 7,500); every step above adds a die,
