@@ -1271,10 +1271,13 @@ struct EnemyBornScope
         } catch (...) {}
     }
 };
+static void HhDeathEffectTrigger(CInstance* S, int objIdx);   // defined with the Headhunter module below
+static bool HeadhunterRunning();                              // same
 static void HookICD(RValue& Result, CInstance* S, CInstance* O, int argc, RValue* Args)
 {
     PERF_SCOPE(g_PerfICD);
     EnemyBornScope _born(Result, S, argc, Args);
+    if (argc >= 4 && HeadhunterRunning()) { try { HhDeathEffectTrigger(S, (int)Args[3].ToDouble()); } catch (...) {} }
 #ifdef FORGEPACT_RELEASE
     // A hook installed earlier in this process cannot be removed safely while
     // the game is running.  With every related feature Off, take a true native
@@ -1310,6 +1313,7 @@ static void HookICL(RValue& Result, CInstance* S, CInstance* O, int argc, RValue
 {
     PERF_SCOPE(g_PerfICD);
     EnemyBornScope _born(Result, S, argc, Args);
+    if (argc >= 4 && HeadhunterRunning()) { try { HhDeathEffectTrigger(S, (int)Args[3].ToDouble()); } catch (...) {} }
 #ifdef FORGEPACT_RELEASE
     if (g_CreatorMult <= 1.0 && g_EnemyMultAll <= 1 && g_ObjMult.empty()) {
         if (g_OrigICL) g_OrigICL(Result, S, O, argc, Args);
@@ -4930,6 +4934,7 @@ static void SigDropStatus()
         + " drops=" + std::to_string(g_SigDropHits) + " fails=" + std::to_string(g_SigDropFails) + " next=" + (g_SigDropNext == 0 ? "crown" : "belt"));
 }
 
+static void HhSteal(CInstance* enemyInst, CInstance* killerHint, CInstance* other);   // defined with the Headhunter module below
 static RValue& Hook_EnemyDestroyKillProc(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
 {
     PERF_SCOPE(g_PerfKill);
@@ -4937,20 +4942,76 @@ static RValue& Hook_EnemyDestroyKillProc(CInstance* S, CInstance* O, RValue& R, 
     InterlockedIncrement(&g_HhHookCalls); InterlockedExchange(&g_HhLastArgc, (long)argc);
     SignatureDropOnKill(S);
     AngelicDropOnKill(S);
-    if (g_HhEnabled.load() && S && argc >= 3 && A && A[2]) {
-        try {
-            CInstance* player = nullptr;
+    if (g_HhEnabled.load() && S) {
+        // The third argument is the killer when the game passes one; it is only a hint, so a
+        // call shape with fewer arguments no longer silences the mechanic.
+        CInstance* killer = nullptr;
+        if (argc >= 3 && A && A[2]) {
             try {
                 RValue pid = g_Yytk->CallBuiltin("variable_instance_get", { *A[2], RValue("id") });
                 if (pid.m_Kind == VALUE_REAL || pid.m_Kind == VALUE_INT32 || pid.m_Kind == VALUE_INT64)
-                    g_Yytk->GetInstanceObject((int32_t)pid.ToDouble(), player);
-            } catch (...) { player = nullptr; }
-            if (!player) player = O;
-            RValue enemy = S->ToRValue();
-            if (player) HhOnKill(player, enemy);
-        } catch (...) {}
+                    g_Yytk->GetInstanceObject((int32_t)pid.ToDouble(), killer);
+            } catch (...) { killer = nullptr; }
+        }
+        HhSteal(S, killer, O);
     }
     return res;
+}
+
+// Every monster death reaches the steal through here, whichever trigger noticed it.
+// A monster is handled once: the primary hook and the death-effect fallback can both fire.
+static std::deque<int> g_HhHandledOrder;
+static std::set<int> g_HhHandledIds;
+static volatile long g_HhAltTrigger = 0;
+static bool HeadhunterRunning() { return g_HhEnabled.load(); }
+static bool HhTakeOnce(int id)
+{
+    if (id < 0) return true;   // no id to key on: let it through
+    if (!g_HhHandledIds.insert(id).second) return false;
+    g_HhHandledOrder.push_back(id);
+    while (g_HhHandledOrder.size() > 256) { g_HhHandledIds.erase(g_HhHandledOrder.front()); g_HhHandledOrder.pop_front(); }
+    return true;
+}
+static void HhSteal(CInstance* enemyInst, CInstance* killerHint, CInstance* other)
+{
+    if (!g_HhEnabled.load() || !enemyInst) return;
+    try {
+        RValue enemy = enemyInst->ToRValue();
+        double id = -1.0;
+        try { id = g_Yytk->CallBuiltin("variable_instance_get", { enemy, RValue("id") }).ToDouble(); } catch (...) {}
+        if (!HhTakeOnce((int)id)) return;
+        CInstance* player = killerHint;
+        if (!player) player = other;
+        if (!player) {
+            RValue p;
+            if (HhResolveLocalPlayer(p, nullptr)) {
+                try { g_Yytk->GetInstanceObject((int32_t)p.ToDouble(), player); } catch (...) { player = nullptr; }
+            }
+        }
+        if (player) HhOnKill(player, enemy);
+    } catch (...) {}
+}
+// Fallback trigger: the dying monster creates its own death effect.  Resolved lazily so a
+// game update that renames the object simply turns the fallback off instead of breaking.
+static int g_HhDeathEffectIdx = -2;
+static bool HhIsDeathEffect(int objIdx)
+{
+    if (objIdx < 0) return false;
+    if (g_HhDeathEffectIdx == -2) {
+        g_HhDeathEffectIdx = -1;
+        try { RValue r = g_Yytk->CallBuiltin("asset_get_index", { RValue("Enemy_Death_Effect_obj") }); g_HhDeathEffectIdx = (int)r.ToDouble(); } catch (...) {}
+    }
+    return g_HhDeathEffectIdx >= 0 && objIdx == g_HhDeathEffectIdx;
+}
+// Second trigger, so a single broken hook cannot silence the mechanic: the dying monster
+// creates its own death effect (measured: about one kill in six; the kill hook covers the
+// rest).  DropMonsterGold was tried as a third and does not run with the monster as self.
+static void HhDeathEffectTrigger(CInstance* S, int objIdx)
+{
+    if (!g_HhEnabled.load() || !S || !HhIsDeathEffect(objIdx)) return;
+    if (!CallerIsEnemyInstance(S)) return;
+    InterlockedIncrement(&g_HhAltTrigger);
+    HhSteal(S, nullptr, nullptr);
 }
 
 static void InstallHeadhunterHook()
@@ -4984,6 +5045,7 @@ static void HeadhunterStatus()
         + " rarityFlag=" + std::to_string(g_HhRarityKills) + " withAffixData=" + std::to_string(g_HhAffixKills)
         + " buffs=" + std::to_string(g_HhBuffsApplied) + " skippedNoBelt=" + std::to_string(g_HhSkippedNotEquipped)
         + " killHook=" + std::to_string(g_HhHookCalls) + " argc=" + std::to_string(g_HhLastArgc)
+        + " deathEffect=" + std::to_string(g_HhAltTrigger)
         + " default=" + (g_HhDefaultOn ? std::to_string((long long)g_HhDefault.id) : std::string("off"))
         + " map=[" + m + "]");
 }

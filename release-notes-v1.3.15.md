@@ -13,8 +13,11 @@ Works together with Hero Siege Item Editor 2.15.3.
 
 ## Also
 
-- The Headhunter status line now reports how often the game's kill event reached ForgePact,
-  so a report of "the belt does nothing" can be answered from the log instead of guesswork.
+- **Headhunter is less picky about how a monster dies.** It used to need the game to name the
+  killer; when the game did not, the belt did nothing. Now the kill counts either way, and a
+  monster's own death effect works as a second trigger.
+- The Headhunter status line reports how often the game's kill event reached ForgePact, so a
+  report of "the belt does nothing" can be answered from the log instead of guesswork.
 
 Nothing else changed since 1.3.14.
 
