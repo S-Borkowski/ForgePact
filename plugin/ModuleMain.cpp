@@ -1239,10 +1239,12 @@ static bool CallerIsEnemyOrCreator(CInstance* S)
     const int idx = CallerObjectIndex(S);
     return idx >= 0 && (IsEnemyObject(idx) || IsCachedCreatorObject(idx) || IsCreatorObject(idx));
 }
-// Scoped guard placed first in HookICD / HookICL: when a monster instance itself creates
-// a monster or a known creator, the flags are raised for the duration of the original
-// call and the new instance id is remembered afterwards.  Costs two bool reads when no
-// raise and no density is active, so the release fast path below stays as it was.
+// Scoped guard placed first in HookICD / HookICL: when a MONSTER instance itself creates a
+// monster or a spawner, the flags are raised for the duration of the original call and the
+// new monster's id is remembered afterwards, so the rarity raise leaves split children alone.
+// enemyCaller only: a spawner (Enemy_Creator*) creating a monster is the game's ordinary
+// zone population - counting that as "monster-born" silenced Tyrant's Crown and Monster
+// Rarity completely (3370 monsters seen, 0 raised - user log 2026-09-08).
 struct EnemyBornScope
 {
     RValue& result; int objIdx = -1; bool active = false; bool prevCreating = false, prevCaller = false;
@@ -1251,11 +1253,9 @@ struct EnemyBornScope
         try { if (argc >= 4) objIdx = (int)Args[3].ToDouble(); } catch (...) {}
         if (!(RarityFloorActive() || TyrantActive() || g_CreatorMult > 1.0)) return;
         if (!(IsEnemyObject(objIdx) || IsCachedCreatorObject(objIdx))) return;
-        const bool enemyCaller = CallerIsEnemyInstance(S);
-        const bool chainCaller = enemyCaller || CallerIsEnemyOrCreator(S);
-        if (!chainCaller) return;
+        if (!CallerIsEnemyInstance(S)) return;   // only a real monster starts a chain
         active = true; prevCreating = g_CreatingFromEnemy; prevCaller = g_CallerIsEnemy;
-        g_CreatingFromEnemy = g_CreatingFromEnemy || (enemyCaller && IsEnemyObject(objIdx));
+        g_CreatingFromEnemy = g_CreatingFromEnemy || IsEnemyObject(objIdx);
         g_CallerIsEnemy = true;
     }
     ~EnemyBornScope()
@@ -2815,11 +2815,33 @@ static std::atomic<bool> g_BeItemTagged{ false };   // same, for mechanic=beacon
 // item struct on load, so the registry is refreshed by TryApplyCustomForge and
 // entries whose struct pointer reappears are replaced, never duplicated.
 static std::vector<RValue> g_ForgedItems;
+// Game-owned registry of forged items: a global struct keyed by itemTimeStamp keeps the
+// structs alive for the GC, so reading them later (worn state) is safe.
+static RValue ForgeRegistryStruct(bool create)
+{
+    try {
+        RValue reg = g_Yytk->CallBuiltin("variable_global_get", { RValue("fp_forged_items") });
+        if (reg.m_Kind == VALUE_OBJECT) return reg;
+        if (!create) return RValue();
+        CInstance* g = nullptr; g_Yytk->GetGlobalInstance(&g);
+        RValue fresh; if (g) g_Yytk->CallBuiltinEx(fresh, "json_parse", g, g, { RValue("{}") });
+        if (fresh.m_Kind == VALUE_OBJECT) g_Yytk->CallBuiltin("variable_global_set", { RValue("fp_forged_items"), fresh });
+        return fresh;
+    } catch (...) { return RValue(); }
+}
 static void RememberForgedItem(const RValue& item)
 {
-    for (auto& e : g_ForgedItems) if (e.m_Object == item.m_Object) { e = item; return; }
+    for (auto& e : g_ForgedItems) if (e.m_Object == item.m_Object) { e = item; break; }
     if (g_ForgedItems.size() >= 64) g_ForgedItems.erase(g_ForgedItems.begin());
     g_ForgedItems.push_back(item);
+    try {
+        RValue reg = ForgeRegistryStruct(true);
+        if (reg.m_Kind != VALUE_OBJECT) return;
+        RValue ts = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("itemTimeStamp") });
+        std::string key = ts.ToString();
+        if (key.empty() || key == "undefined") return;
+        g_Yytk->CallBuiltin("variable_struct_set", { reg, RValue(key), item });
+    } catch (...) {}
 }
 
 static std::string CustomForgeRuntimePath()
@@ -3488,6 +3510,9 @@ static std::map<std::string, HhBuff> g_HhMap = {
 static bool g_HhDefaultOn = true;                       // unmapped affix -> default buff
 static HhBuff g_HhDefault{ 44, 25.0, 25.0 };          // id 44 = the game's Burst of Speed buff (visible test buff)
 static volatile long g_HhKills = 0, g_HhRareKills = 0, g_HhBuffsApplied = 0, g_HhSkippedNotEquipped = 0;
+// Diagnostics for "the mechanic does nothing" reports: how often the game's kill script ran
+// and with how many arguments (HhOnKill needs three, the third being the killer).
+static volatile long g_HhHookCalls = 0; static volatile long g_HhLastArgc = -1;
 static volatile long g_HhRarityKills = 0;   // kills with enemyRarity >= 2 (rare/champion by the game's own flag)
 static volatile long g_HhAffixKills = 0;    // kills where affix data (affixList or enemyAffix flags) was present
 static PFUNC_YYGMLScript g_Orig_EnemyDestroyKillProc = nullptr;
@@ -3583,10 +3608,72 @@ static bool HhItemIsHeadhunter(const RValue& item)
     } catch (...) { return false; }
 }
 
+// ---- worn signature items --------------------------------------------------------------
+// The game keeps the local player's worn gear in the instance struct `equippedItems`
+// (ItemEquip / ItemUnequip / RunItemEquipped read and write it; ItemUnequip also clears the
+// item's itemEquippedPlayer).  Every 30 frames the struct is walked and each forged item
+// carrying fp_mechanic marks that mechanic as worn.  No registry pointers are dereferenced.
+static bool HhResolveLocalPlayer(RValue& out, std::string* how);   // defined below
+static std::set<std::string> g_WornMechanics;
+static uint32_t g_WornStamp = 0;
+static std::string g_WornShape = "not read yet";
+static void WornCollect(const RValue& item)
+{
+    try {
+        if (item.m_Kind != VALUE_OBJECT || !item.m_Object) return;
+        RValue has = g_Yytk->CallBuiltin("variable_struct_exists", { item, RValue("fp_mechanic") });
+        if (!has.ToBoolean()) return;
+        RValue m = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("fp_mechanic") });
+        if (m.m_Kind == VALUE_STRING) g_WornMechanics.insert(Lower(m.ToString()));
+    } catch (...) {}
+}
+static RValue ForgeRegistryStruct(bool create);
+static std::string g_WornDetail;
+static void RefreshWornMechanics(bool force = false)
+{
+    if (!force && g_WornStamp != 0 && g_HhFrame - g_WornStamp < 30) return;
+    g_WornStamp = g_HhFrame ? g_HhFrame : 1;
+    g_WornMechanics.clear(); g_WornDetail.clear();
+    try {
+        RValue reg = ForgeRegistryStruct(false);
+        if (reg.m_Kind != VALUE_OBJECT) { g_WornShape = "no registry yet"; return; }
+        RValue names = g_Yytk->CallBuiltin("variable_struct_get_names", { reg });
+        const int n = names.m_Kind == VALUE_ARRAY ? (int)g_Yytk->CallBuiltin("array_length", { names }).ToDouble() : 0;
+        int worn = 0;
+        for (int i = 0; i < n; ++i) {
+            RValue name = g_Yytk->CallBuiltin("array_get", { names, RValue((double)i) });
+            RValue item = g_Yytk->CallBuiltin("variable_struct_get", { reg, name });
+            if (item.m_Kind != VALUE_OBJECT || !item.m_Object) continue;
+            RValue hasM = g_Yytk->CallBuiltin("variable_struct_exists", { item, RValue("fp_mechanic") });
+            if (!hasM.ToBoolean()) continue;
+            RValue m = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("fp_mechanic") });
+            if (m.m_Kind != VALUE_STRING) continue;
+            const std::string mech = Lower(m.ToString());
+            // ItemEquip writes the wearer's player index here, ItemUnequip clears it.
+            double who = -1.0;
+            RValue hasE = g_Yytk->CallBuiltin("variable_struct_exists", { item, RValue("itemEquippedPlayer") });
+            if (hasE.ToBoolean()) {
+                RValue e = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("itemEquippedPlayer") });
+                if (e.m_Kind == VALUE_REAL || e.m_Kind == VALUE_INT32 || e.m_Kind == VALUE_INT64) who = e.ToDouble();
+            }
+            const bool isWorn = who >= 0.0;
+            if (isWorn) { g_WornMechanics.insert(mech); ++worn; }
+            if (g_WornDetail.size() < 600) g_WornDetail += mech + "=" + (hasE.ToBoolean() ? std::to_string((long long)who) : std::string("unset")) + " ";
+        }
+        g_WornShape = "registry " + std::to_string(n) + " items, " + std::to_string(worn) + " worn";
+    } catch (...) { g_WornShape = "exception"; }
+}
+static bool MechanicWorn(const char* mechanic)
+{
+    RefreshWornMechanics();
+    return g_WornMechanics.count(mechanic) > 0;
+}
+
 static bool HhEquipped(CInstance* player)
 {
     (void)player;
     if (g_HhForced.load()) return true;
+    if (MechanicWorn("headhunter")) { g_HhEquippedCache = true; return true; }
     if (g_HhEquippedStamp != 0 && g_HhFrame - g_HhEquippedStamp < 30) return g_HhEquippedCache;
     g_HhEquippedStamp = g_HhFrame;
     bool found = false;
@@ -3838,15 +3925,12 @@ static bool TyrantItemLoaded()
 {
     return g_TyItemTagged.load();
 }
+static bool MechanicWorn(const char* mechanic);   // defined with the Headhunter module below
 static bool TyrantActive()
 {
     if (!g_TyEnabled.load()) return false;
     if (g_TyForced.load()) return true;
-#ifndef FORGEPACT_RELEASE
-    return TyrantItemLoaded();   // research build: a loaded crown counts as worn (equip detection pending)
-#else
-    return false;
-#endif
+    return MechanicWorn("tyrant");   // the crown counts while it is worn
 }
 // Adds `count` random affixes the monster does not have yet: flag in enemyAffix, index in affixList.
 static int TyAddAffixes(const RValue& inst, int count)
@@ -3990,11 +4074,7 @@ static void InstallTyrantHook()
 static void TyrantAutoArm()
 {
     bool wanted = g_TyForced.load();
-#ifndef FORGEPACT_RELEASE
-    for (const CustomForgeEntry& e : g_CustomForgeEntries) if (e.mechanic == "tyrant") { wanted = true; break; }
-#else
-    for (const CustomForgeEntry& e : g_CustomForgeEntries) if (e.mechanic == "tyrant") { Out("tyrant: item found; mechanic is a preview in this build (use 'tyrant force' to try it)"); break; }
-#endif
+    for (const CustomForgeEntry& e : g_CustomForgeEntries) if (e.mechanic == "tyrant") { wanted = true; break; }   // active only while the crown is worn
     if (!wanted) return;
     InstallTyrantHook();
     InstallBeaconHook();   // "Rare monsters hunt you": rares use the Beacon's scan/leash/wake hooks
@@ -4007,7 +4087,7 @@ static void TyrantStatus()
         + " hook=" + (g_TyHookInstalled ? "yes" : "no") + " active=" + (TyrantActive() ? "yes" : "no")
         + " rarePct=" + std::to_string((int)g_TyRarePct) + " affixPct=" + std::to_string((int)g_TyAffixPct)
         + " seen=" + std::to_string(g_TySeen) + " upgraded=" + std::to_string(g_TyUpgraded) + " extraAffix=" + std::to_string(g_TyAffixed)
-        + " itemLoaded=" + (TyrantItemLoaded() ? "yes" : "no"));
+        + " itemLoaded=" + (TyrantItemLoaded() ? "yes" : "no") + " worn=" + (MechanicWorn("tyrant") ? "yes" : "no"));
 }
 
 #ifndef FORGEPACT_RELEASE
@@ -4091,11 +4171,7 @@ static bool BeaconActive()
 {
     if (!g_BeEnabled.load()) return false;
     if (g_BeForced.load()) return true;
-#ifndef FORGEPACT_RELEASE
-    return g_BeItemTagged.load();   // research build: a loaded amulet counts as worn
-#else
-    return false;
-#endif
+    return MechanicWorn("beacon");   // the amulet counts while it is worn
 }
 // Who hunts the player right now: 0 = nobody, 1 = rares and champions only, 2 = everyone.
 // The Beacon amulet decides all/rare through beaconmode; a Tyrant's Crown alone means rares.
@@ -4374,11 +4450,7 @@ static void BeaconStatus()
 static void BeaconAutoArm()
 {
     bool wanted = g_BeForced.load();
-#ifndef FORGEPACT_RELEASE
-    for (const CustomForgeEntry& e : g_CustomForgeEntries) if (e.mechanic == "beacon") { wanted = true; break; }
-#else
-    for (const CustomForgeEntry& e : g_CustomForgeEntries) if (e.mechanic == "beacon") { Out("beacon: item found; mechanic is a preview in this build (use 'beacon force' to try it)"); break; }
-#endif
+    for (const CustomForgeEntry& e : g_CustomForgeEntries) if (e.mechanic == "beacon") { wanted = true; break; }   // active only while the amulet is worn
     if (!wanted) return;
     InstallBeaconHook();
     g_BeEnabled.store(g_BeHookInstalled);
@@ -4862,6 +4934,7 @@ static RValue& Hook_EnemyDestroyKillProc(CInstance* S, CInstance* O, RValue& R, 
 {
     PERF_SCOPE(g_PerfKill);
     RValue& res = g_Orig_EnemyDestroyKillProc ? g_Orig_EnemyDestroyKillProc(S, O, R, argc, A) : R;
+    InterlockedIncrement(&g_HhHookCalls); InterlockedExchange(&g_HhLastArgc, (long)argc);
     SignatureDropOnKill(S);
     AngelicDropOnKill(S);
     if (g_HhEnabled.load() && S && argc >= 3 && A && A[2]) {
@@ -4892,15 +4965,9 @@ static void InstallHeadhunterHook()
 static void HeadhunterAutoArm()
 {
     bool wanted = g_HhForced.load();
-#ifndef FORGEPACT_RELEASE
+    // 1.3.15: the hook arms whenever a Headhunter item is known; HhEquipped() (the worn
+    // belt, read from the player's equippedItems) decides whether a kill steals anything.
     for (const CustomForgeEntry& e : g_CustomForgeEntries) if (e.mechanic == "headhunter") { wanted = true; break; }
-#else
-    // Player builds (1.3.7): the Headhunter groundwork ships dormant.  Forged
-    // items keep their fp_mechanic tag; the kill hook is only installed by an
-    // explicit "headhunter force" command until belt detection and the affix
-    // -> buff table are complete.
-    for (const CustomForgeEntry& e : g_CustomForgeEntries) if (e.mechanic == "headhunter") { Out("headhunter: item found; mechanic is a preview in this build (use 'headhunter force' to try it)"); break; }
-#endif
     if (!wanted) return;
     InstallHeadhunterHook();
     g_HhEnabled.store(g_HhHookInstalled);
@@ -4916,6 +4983,7 @@ static void HeadhunterStatus()
         + " kills=" + std::to_string(g_HhKills) + " rare=" + std::to_string(g_HhRareKills)
         + " rarityFlag=" + std::to_string(g_HhRarityKills) + " withAffixData=" + std::to_string(g_HhAffixKills)
         + " buffs=" + std::to_string(g_HhBuffsApplied) + " skippedNoBelt=" + std::to_string(g_HhSkippedNotEquipped)
+        + " killHook=" + std::to_string(g_HhHookCalls) + " argc=" + std::to_string(g_HhLastArgc)
         + " default=" + (g_HhDefaultOn ? std::to_string((long long)g_HhDefault.id) : std::string("off"))
         + " map=[" + m + "]");
 }
@@ -9553,7 +9621,7 @@ static bool HandleHeadhunterCommand(const std::string& lc, const std::string& re
             try { RValue js; g_Yytk->CallBuiltinEx(js, "json_stringify", g, g, { it }); body += (n ? "," : "") + js.ToString(); ++n; } catch (...) {}
         }
         body += "]";
-        { std::ofstream f(IPC_DIR + "\forged_dump.json", std::ios::binary | std::ios::trunc); f << body; }
+        { std::ofstream f(IPC_DIR + "\\forged_dump.json", std::ios::binary | std::ios::trunc); f << body; }
         Out("forgeddump: " + std::to_string(n) + " items -> forged_dump.json");
     } else if (lc == "hashprobe") {
         // Research: refresh itemDataHash on every remembered forged item and report the path used.
@@ -9686,6 +9754,13 @@ static bool HandleHeadhunterCommand(const std::string& lc, const std::string& re
 #ifndef FORGEPACT_RELEASE
     } else if (lc == "perf") {
         if (Lower(TrimCopy(rest)) == "reset") { PerfReset(); Out("perf: counters reset"); } else PerfReport();
+#endif
+#ifndef FORGEPACT_RELEASE
+    } else if (lc == "worn") {
+        RefreshWornMechanics(true);
+        std::string m; for (const auto& x : g_WornMechanics) m += x + " ";
+        Out("worn: " + g_WornShape + " | items: " + g_WornDetail + "| mechanics worn: " + (m.empty() ? std::string("(none)") : m)
+            + "| tyrant active=" + (TyrantActive() ? "yes" : "no") + " beacon active=" + (BeaconActive() ? "yes" : "no") + " headhunter equipped=" + (HhEquipped(nullptr) ? "yes" : "no"));
 #endif
     } else if (lc == "angeliclist") {
         g_AngelicPoolBuilt = false; BuildAngelicPool(true);
