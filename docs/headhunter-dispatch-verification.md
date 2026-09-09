@@ -76,3 +76,34 @@ game logs demonstrate that the earlier primary path did apply buffs locally,
 but those logs are not presented as tests of this patch. A passing API-boundary
 test or compilation is not a claim that every game build's hooks are verified,
 or that the supplied player's exact root cause has been proven.
+
+## Follow-up: Falor's first test, typed instance IDs
+
+The private test package was installed correctly: its DLL SHA-256 matched the
+installed DLL (`b0a45d047433f26d80c0067957605b14de84eae5b6f3701570d9057853366fe6`).
+The latest session recorded 307 kill callbacks, 307 death-script callbacks and
+50 death-effect callbacks, but zero deliveries into `HhOnKill`. This places the
+failure before the affix/buff code, rather than in hook installation.
+
+`HhResolveInstance` accepted a `VALUE_REF` input but rejected that same kind
+when reading the built-in `id`. The test runner had always returned a numeric
+`id`, so the original 21 scenarios did not exercise this boundary.
+
+Read-only inspection of the actual Steam executable (SHA-256
+`5e14b590b65ea9444c5728a30b022f7ec6fa1c0d69e1e654487ae43c2251261f`)
+confirmed the representation: the `id` accessor registered at RVA `0x0b568aac`
+is at RVA `0x0b5659c0`; its ordinary instance path returns kind 15 (`VALUE_REF`).
+Raw disassembly remains in the ignored local build directory. The
+[GameMaker id documentation](https://manual.gamemaker.io/monthly/en/GameMaker_Language/GML_Reference/Asset_Management/Instances/Instance_Variables/id.htm)
+also defines this value as an instance handle.
+
+Two additional native scenarios return typed IDs for the explicit killer and
+the local-player fallback. Both failed against the first test DLL's source;
+both pass after allowing `VALUE_REF` from the built-in getter. Conversion still
+goes through the runner and YYTK's live-instance lookup. No pointer casting,
+game-rule changes or removal of player validation was needed.
+
+All 48 test methods now pass, including 23 native scenarios. The full release-mode
+plugin compiles. A second private package contains the corrected DLL; no public
+release or in-place update of the running game is performed. Live combat with
+this second DLL still requires restarting the game after installation.

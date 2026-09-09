@@ -42,6 +42,7 @@ static CInstance* findInstance(int id) {
     for (auto* instance : instances) if (instance->id == id && instance->alive) return instance;
     return nullptr;
 }
+static int returnedIdKind = VALUE_REAL;
 struct FakeRunner {
     CInstance* resolve(const RValue& value) {
         if (value.m_Kind == VALUE_OBJECT) return value.instance && value.instance->alive ? value.instance : nullptr;
@@ -54,7 +55,11 @@ struct FakeRunner {
         auto* instance = resolve(args[0]);
         if (key == "instance_exists") return RValue(instance ? 1.0 : 0.0);
         if (key == "variable_instance_get" && instance) {
-            if (args[1].text == "id") return RValue(static_cast<double>(instance->id));
+            if (args[1].text == "id") {
+                RValue id(static_cast<double>(instance->id));
+                id.m_Kind = returnedIdKind;
+                return id;
+            }
             if (args[1].text == "object_index") return RValue(static_cast<double>(instance->object));
         }
         throw std::runtime_error("invalid builtin access");
@@ -131,6 +136,7 @@ static void InstallCreateHooks() {
 // PRODUCTION_FUNCTIONS
 
 static void reset() {
+    returnedIdKind = VALUE_REAL;
     g_HhEnabled = true;
     g_HhHandledIds.clear(); g_HhHandledOrder.clear();
     localPlayer = nullptr; localPlayerAsObject = false;
@@ -173,6 +179,21 @@ int main(int argc, char** argv) {
             localPlayer = &player; localPlayerAsObject = true;
             HhSteal(&enemy, nullptr, nullptr);
             require(delivered == 1, "local player object coerced to a numeric instance id");
+        } else if (test == "typed_instance_id_killer") {
+            returnedIdKind = VALUE_REF;
+            RValue result, killer(static_cast<double>(player.id));
+            killer.m_Kind = VALUE_REF;
+            RValue* arguments[] = {nullptr,nullptr,&killer};
+            Hook_EnemyDestroyKillProc(&enemy,nullptr,result,3,arguments);
+            require(delivered == 1 && lastPlayer == &player && originalCalls == 1,
+                "runner's typed instance id rejected before buff delivery");
+        } else if (test == "typed_instance_id_local_fallback") {
+            returnedIdKind = VALUE_REF;
+            localPlayer = &player; localPlayerAsObject = true;
+            RValue result;
+            Hook_HhDeathEffects(&enemy,nullptr,result,0,nullptr);
+            require(delivered == 1 && lastPlayer == &player && originalCalls == 1,
+                "typed id from local-player lookup silenced all death fallbacks");
         } else if (test == "deduplicate_success") {
             HhSteal(&enemy, &player, nullptr);
             HhSteal(&enemy, nullptr, &player);

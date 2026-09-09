@@ -4956,7 +4956,10 @@ static CInstance* HhResolveInstance(const RValue& value)
             && value.m_Kind != VALUE_REF && value.m_Kind != VALUE_OBJECT) return nullptr;
         if (!g_Yytk->CallBuiltin("instance_exists", { value }).ToBoolean()) return nullptr;
         RValue id = g_Yytk->CallBuiltin("variable_instance_get", { value, RValue("id") });
-        if (id.m_Kind != VALUE_REAL && id.m_Kind != VALUE_INT32 && id.m_Kind != VALUE_INT64) return nullptr;
+        // Modern runners return the built-in id as a typed instance reference.
+        // Rejecting VALUE_REF here silences both killer and local-player lookup.
+        if (id.m_Kind != VALUE_REAL && id.m_Kind != VALUE_INT32 && id.m_Kind != VALUE_INT64
+            && id.m_Kind != VALUE_REF) return nullptr;
         const double number = id.ToDouble();
         if (number < 0.0 || number > INT32_MAX) return nullptr;
         CInstance* instance = nullptr;
