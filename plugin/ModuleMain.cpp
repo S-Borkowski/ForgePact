@@ -3422,9 +3422,10 @@ static void CustomForgePostProcess(RValue& result, int argc, RValue** args, bool
 // ===== Headhunter mechanic ==================================================
 //
 // Path-of-Exile style belt: when the player kills a rare/champion monster the
-// monster's affixes are translated into timed player buffs.  Live-verified
-// facts (2026-09-04): EnemyDestroyKillProc runs with self = killing Player_obj
-// and argument 2 = the dying enemy instance; the enemy carries `affixList`
+// monster's affixes are translated into timed player buffs. Later native
+// captures use enemy self and a killer hint in argument 2; earlier notes used
+// the reverse shape. Resolve the roles by object type instead of assuming
+// that either shape applies to every build. The enemy carries `affixList`
 // (array) and `enemyRarity`; BuffAdd(playerIdx, buffId, [v0,v1], frames, ...)
 // creates one Draw_Player_Buff_obj per buff id and stores it in
 // global.playerBuff[playerIdx][0][buffId].  The belt is recognised by the
@@ -4461,7 +4462,7 @@ static void BeaconAutoArm()
     Out(std::string("beacon: ") + (g_BeHookInstalled ? "armed" : "hook failed") + " (range " + std::to_string((long long)g_BeRange) + ", mode " + (g_BeRareOnly ? "rare" : "all") + ")");
 }
 
-static void HhApplyBuff(CInstance* player, const HhBuff& b, double frames)
+static bool HhApplyBuff(CInstance* player, const HhBuff& b, double frames)
 {
     try {
         double mplr = 1.0;
@@ -4475,13 +4476,16 @@ static void HhApplyBuff(CInstance* player, const HhBuff& b, double frames)
         AurieStatus st = g_Yytk->CallGameScriptEx(result, "gml_Script_BuffAdd", player, player, args);
         if (AurieSuccess(st)) InterlockedIncrement(&g_HhBuffsApplied);
         if (g_HhTrace) Out("hh: BuffAdd id=" + std::to_string((long long)b.id) + " [" + std::to_string(b.v0) + "," + std::to_string(b.v1) + "] frames=" + std::to_string((int)frames) + " st=" + std::to_string((int)st));
+        return AurieSuccess(st);
     } catch (...) { Out("hh: BuffAdd EXCEPTION"); }
+    return false;
 }
 
 // Core: translate one dying enemy's affixes into buffs on `player`.
-static void HhOnKill(CInstance* player, const RValue& enemy)
+static bool HhOnKill(CInstance* player, const RValue& enemy)
 {
     InterlockedIncrement(&g_HhKills);
+    int applied = 0;
     try {
 #ifndef FORGEPACT_RELEASE
         // Research build: prove what argument 2 really is on the first kills (object name,
@@ -4509,7 +4513,7 @@ static void HhOnKill(CInstance* player, const RValue& enemy)
         if (rarity >= 2.0) InterlockedIncrement(&g_HhRarityKills);
         // Live 2026-09-04: normal monsters (rarity 1) can carry affix slots (#2, #16, #21 seen)
         // and even a filled affixList, so ONLY the game's own rarity flag decides.
-        if (rarity < 2.0) return;
+        if (rarity < 2.0) return false;
 
         // Affix keys.  Best source: the enemy's own health bar (enemy.myHealthBar ->
         // Enemy_Health_Bar_Parent_obj) carries `affixName`, the array of displayed affix
@@ -4603,26 +4607,35 @@ static void HhOnKill(CInstance* player, const RValue& enemy)
         if (g_HhTrace && (rarity >= 2.0 || !keys.empty())) Out("hh: affix text=\"" + affixText + "\"");
         if (!keys.empty()) InterlockedIncrement(&g_HhAffixKills);
 
-        // A kill counts when the game flags it rare (rarity >= 2) or the string affix list is filled.
-        if (rarity < 2.0 && keys.empty()) return;
+        // Only the game's rarity gate above makes a monster eligible.
         InterlockedIncrement(&g_HhRareKills);
         if (g_HhTrace) {
             std::string ks; for (const auto& k : keys) ks += (ks.empty() ? "" : ",") + k;
             Out("hh: rare kill rarity=" + std::to_string((int)rarity) + " affixes=[" + ks + "]");
         }
-        if (!HhEquipped(player)) { InterlockedIncrement(&g_HhSkippedNotEquipped); if (g_HhTrace) Out("hh: belt not equipped, skipped"); return; }
+        if (!HhEquipped(player)) { InterlockedIncrement(&g_HhSkippedNotEquipped); if (g_HhTrace) Out("hh: belt not equipped, skipped"); return false; }
         double spd = 60.0;
         try { spd = g_Yytk->CallBuiltin("game_get_speed", { RValue(0.0) }).ToDouble(); if (spd < 1.0) spd = 60.0; } catch (...) {}
         double frames = g_HhDurationSec * spd;
-        int applied = 0;
+        int mapped = 0;
         for (const std::string& key : keys) {
             auto it = g_HhMap.find(key);
             if (it == g_HhMap.end() && key.rfind("affix", 0) == 0) it = g_HhMap.find(key.substr(5));
-            if (it != g_HhMap.end()) { HhApplyBuff(player, it->second, frames); ++applied; HhRememberStolen(player, it->first, g_HhDurationSec, it->second.id); }
+            if (it != g_HhMap.end()) {
+                ++mapped;
+                if (HhApplyBuff(player, it->second, frames)) {
+                    ++applied;
+                    HhRememberStolen(player, it->first, g_HhDurationSec, it->second.id);
+                }
+            }
             else if (g_HhTrace) Out("hh: no mapping for affix '" + key + "'");
         }
-        if (applied == 0 && g_HhDefaultOn) { HhApplyBuff(player, g_HhDefault, frames); HhRememberStolen(player, "Rare Essence", g_HhDurationSec, g_HhDefault.id); }
+        if (mapped == 0 && g_HhDefaultOn && HhApplyBuff(player, g_HhDefault, frames)) {
+            ++applied;
+            HhRememberStolen(player, "Rare Essence", g_HhDurationSec, g_HhDefault.id);
+        }
     } catch (...) { Out("hh: EXCEPTION in HhOnKill"); }
+    return applied > 0;
 }
 
 #ifndef FORGEPACT_RELEASE
@@ -4934,27 +4947,52 @@ static void SigDropStatus()
         + " drops=" + std::to_string(g_SigDropHits) + " fails=" + std::to_string(g_SigDropFails) + " next=" + (g_SigDropNext == 0 ? "crown" : "belt"));
 }
 
-static void HhSteal(CInstance* enemyInst, CInstance* killerHint, CInstance* other);   // defined with the Headhunter module below
+// A runner reference or an object is not necessarily a numeric id. Ask for its
+// live instance id before going through YYTK's instance lookup.
+static CInstance* HhResolveInstance(const RValue& value)
+{
+    try {
+        if (value.m_Kind != VALUE_REAL && value.m_Kind != VALUE_INT32 && value.m_Kind != VALUE_INT64
+            && value.m_Kind != VALUE_REF && value.m_Kind != VALUE_OBJECT) return nullptr;
+        if (!g_Yytk->CallBuiltin("instance_exists", { value }).ToBoolean()) return nullptr;
+        RValue id = g_Yytk->CallBuiltin("variable_instance_get", { value, RValue("id") });
+        if (id.m_Kind != VALUE_REAL && id.m_Kind != VALUE_INT32 && id.m_Kind != VALUE_INT64) return nullptr;
+        const double number = id.ToDouble();
+        if (number < 0.0 || number > INT32_MAX) return nullptr;
+        CInstance* instance = nullptr;
+        if (AurieSuccess(g_Yytk->GetInstanceObject((int32_t)number, instance))) return instance;
+    } catch (...) {}
+    return nullptr;
+}
+static bool HhIsPlayerInstance(CInstance* instance)
+{
+    if (!instance) return false;
+    try {
+        const RValue value = instance->ToRValue();
+        if (!g_Yytk->CallBuiltin("instance_exists", { value }).ToBoolean()) return false;
+        static int playerObject = -1;
+        if (playerObject < 0) playerObject = (int)g_Yytk->CallBuiltin("asset_get_index", { RValue("Player_obj") }).ToDouble();
+        if (playerObject < 0) return false;
+        const RValue object = g_Yytk->CallBuiltin("variable_instance_get", { value, RValue("object_index") });
+        return (int)object.ToDouble() == playerObject
+            || g_Yytk->CallBuiltin("object_is_ancestor", { object, RValue((double)playerObject) }).ToBoolean();
+    } catch (...) { return false; }
+}
+static void HhSteal(CInstance* enemyInst, CInstance* killerHint, CInstance* other);
 static RValue& Hook_EnemyDestroyKillProc(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
 {
     PERF_SCOPE(g_PerfKill);
-    RValue& res = g_Orig_EnemyDestroyKillProc ? g_Orig_EnemyDestroyKillProc(S, O, R, argc, A) : R;
     InterlockedIncrement(&g_HhHookCalls); InterlockedExchange(&g_HhLastArgc, (long)argc);
+    if (g_HhEnabled.load() && S) {
+        // Resolve roles from live objects before the original can clean them up.
+        // Native captures use enemy self; older call-shape notes use player self.
+        CInstance* third = argc >= 3 && A && A[2] ? HhResolveInstance(*A[2]) : nullptr;
+        if (CallerIsEnemyInstance(S)) HhSteal(S, third, O);
+        else if (CallerIsEnemyInstance(third)) HhSteal(third, S, O);
+    }
+    RValue& res = g_Orig_EnemyDestroyKillProc ? g_Orig_EnemyDestroyKillProc(S, O, R, argc, A) : R;
     SignatureDropOnKill(S);
     AngelicDropOnKill(S);
-    if (g_HhEnabled.load() && S) {
-        // The third argument is the killer when the game passes one; it is only a hint, so a
-        // call shape with fewer arguments no longer silences the mechanic.
-        CInstance* killer = nullptr;
-        if (argc >= 3 && A && A[2]) {
-            try {
-                RValue pid = g_Yytk->CallBuiltin("variable_instance_get", { *A[2], RValue("id") });
-                if (pid.m_Kind == VALUE_REAL || pid.m_Kind == VALUE_INT32 || pid.m_Kind == VALUE_INT64)
-                    g_Yytk->GetInstanceObject((int32_t)pid.ToDouble(), killer);
-            } catch (...) { killer = nullptr; }
-        }
-        HhSteal(S, killer, O);
-    }
     return res;
 }
 
@@ -4972,24 +5010,34 @@ static bool HhTakeOnce(int id)
     while (g_HhHandledOrder.size() > 256) { g_HhHandledIds.erase(g_HhHandledOrder.front()); g_HhHandledOrder.pop_front(); }
     return true;
 }
+static void HhReleaseClaim(int id)
+{
+    g_HhHandledIds.erase(id);
+    g_HhHandledOrder.erase(std::remove(g_HhHandledOrder.begin(), g_HhHandledOrder.end(), id), g_HhHandledOrder.end());
+}
 static void HhSteal(CInstance* enemyInst, CInstance* killerHint, CInstance* other)
 {
     if (!g_HhEnabled.load() || !enemyInst) return;
+    int claimedId = -1;
     try {
+        if (!CallerIsEnemyInstance(enemyInst)) return;
         RValue enemy = enemyInst->ToRValue();
-        double id = -1.0;
-        try { id = g_Yytk->CallBuiltin("variable_instance_get", { enemy, RValue("id") }).ToDouble(); } catch (...) {}
-        if (!HhTakeOnce((int)id)) return;
-        CInstance* player = killerHint;
-        if (!player) player = other;
+        const double id = g_Yytk->CallBuiltin("variable_instance_get", { enemy, RValue("id") }).ToDouble();
+        if (id < 0.0 || id > INT32_MAX || g_HhHandledIds.count((int)id)) return;
+        CInstance* player = HhIsPlayerInstance(killerHint) ? killerHint : nullptr;
+        if (!player && HhIsPlayerInstance(other)) player = other;
         if (!player) {
             RValue p;
-            if (HhResolveLocalPlayer(p, nullptr)) {
-                try { g_Yytk->GetInstanceObject((int32_t)p.ToDouble(), player); } catch (...) { player = nullptr; }
-            }
+            if (HhResolveLocalPlayer(p, nullptr)) player = HhResolveInstance(p);
         }
-        if (player) HhOnKill(player, enemy);
+        if (!HhIsPlayerInstance(player)) return;
+        if (!HhTakeOnce((int)id)) return;
+        claimedId = (int)id;
+        // A temporary missing player or failed BuffAdd must not block the next
+        // death trigger. Keep the claim only once at least one buff was applied.
+        if (HhOnKill(player, enemy)) return;
     } catch (...) {}
+    if (claimedId >= 0) HhReleaseClaim(claimedId);
 }
 // Fallback trigger: the dying monster creates its own death effect.  Resolved lazily so a
 // game update that renames the object simply turns the fallback off instead of breaking.
@@ -5014,11 +5062,36 @@ static void HhDeathEffectTrigger(CInstance* S, int objIdx)
     HhSteal(S, nullptr, nullptr);
 }
 
+// Observe the game's death-effects script even when it chooses not to create
+// Enemy_Death_Effect_obj. This uses the dying enemy as self and shares the same
+// delivery/duplicate guard as the kill-proc and visual-effect paths.
+static PFUNC_YYGMLScript g_Orig_HhDeathEffects = nullptr;
+static volatile long g_HhDeathScriptCalls = 0;
+static RValue& Hook_HhDeathEffects(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
+{
+    if (g_HhEnabled.load()) {
+        InterlockedIncrement(&g_HhDeathScriptCalls);
+        HhSteal(S, O, nullptr);
+    }
+    return g_Orig_HhDeathEffects ? g_Orig_HhDeathEffects(S, O, R, argc, A) : R;
+}
+
 static void InstallHeadhunterHook()
 {
     if (g_HhHookInstalled) return;
     if (HookOneScript("EnemyDestroyKillProc", "fp_headhunter_kill", (PVOID)Hook_EnemyDestroyKillProc, &g_Orig_EnemyDestroyKillProc))
         g_HhHookInstalled = true;
+}
+
+static void EnableHeadhunter()
+{
+    InstallHeadhunterHook();
+    if (!g_Orig_HhDeathEffects)
+        HookOneScript("EnemyDestroyDeathEffects", "fp_hh_death_effects", (PVOID)Hook_HhDeathEffects, &g_Orig_HhDeathEffects);
+    // The effect fallback belongs to Headhunter itself. It must not depend on
+    // Density, Tyrant's Crown or Special Content having installed these hooks.
+    InstallCreateHooks();
+    g_HhEnabled.store(g_HhHookInstalled || g_Orig_HhDeathEffects || g_OrigICD || g_OrigICL);
 }
 
 // Called after the sidecar is loaded: arm the mechanic only when some forged
@@ -5030,15 +5103,14 @@ static void HeadhunterAutoArm()
     // belt, read from the player's equippedItems) decides whether a kill steals anything.
     for (const CustomForgeEntry& e : g_CustomForgeEntries) if (e.mechanic == "headhunter") { wanted = true; break; }
     if (!wanted) return;
-    InstallHeadhunterHook();
-    g_HhEnabled.store(g_HhHookInstalled);
-    Out(std::string("headhunter: ") + (g_HhHookInstalled ? "armed" : "hook failed") + " (" + std::to_string(g_HhDurationSec) + " s, " + std::to_string(g_HhMap.size()) + " mapped affixes)");
+    EnableHeadhunter();
+    Out(std::string("headhunter: ") + (g_HhEnabled.load() ? "armed" : "hook failed") + " (" + std::to_string(g_HhDurationSec) + " s, " + std::to_string(g_HhMap.size()) + " mapped affixes)");
 }
 
-static void HeadhunterStatus()
+static void HeadhunterStatus(bool includeMap = true)
 {
     std::string m;
-    for (const auto& kv : g_HhMap) m += kv.first + "->" + std::to_string((long long)kv.second.id) + " ";
+    if (includeMap) for (const auto& kv : g_HhMap) m += kv.first + "->" + std::to_string((long long)kv.second.id) + " ";
     Out(std::string("headhunter: ") + (g_HhEnabled.load() ? "ON" : "off") + (g_HhForced.load() ? " (forced)" : "")
         + " hook=" + (g_HhHookInstalled ? "yes" : "no") + " dur=" + std::to_string(g_HhDurationSec) + "s"
         + " kills=" + std::to_string(g_HhKills) + " rare=" + std::to_string(g_HhRareKills)
@@ -5046,8 +5118,28 @@ static void HeadhunterStatus()
         + " buffs=" + std::to_string(g_HhBuffsApplied) + " skippedNoBelt=" + std::to_string(g_HhSkippedNotEquipped)
         + " killHook=" + std::to_string(g_HhHookCalls) + " argc=" + std::to_string(g_HhLastArgc)
         + " deathEffect=" + std::to_string(g_HhAltTrigger)
+        + " deathScript=" + std::to_string(g_HhDeathScriptCalls)
+        + " deathHook=" + (g_Orig_HhDeathEffects ? "yes" : "no")
+        + " effectHooks=" + ((g_OrigICD || g_OrigICL) ? "yes" : "no")
         + " default=" + (g_HhDefaultOn ? std::to_string((long long)g_HhDefault.id) : std::string("off"))
-        + " map=[" + m + "]");
+        + (includeMap ? " map=[" + m + "]" : ""));
+}
+
+// Record real combat activity without requiring the player to reapply settings.
+// The frame loop calls this at most once every 120 frames; subsequent summaries
+// are limited to one per 30 seconds, and unchanged/disabled sessions stay quiet.
+static void HeadhunterActivityTick()
+{
+    if (!g_HhEnabled.load()) return;
+    const long hook = g_HhHookCalls, death = g_HhDeathScriptCalls, effect = g_HhAltTrigger;
+    if (hook == 0 && death == 0 && effect == 0) return;
+    static long lastHook = 0, lastDeath = 0, lastEffect = 0;
+    static double lastReportMs = -30000.0;
+    if (hook == lastHook && death == lastDeath && effect == lastEffect) return;
+    const double now = HhNowMs();
+    if (now - lastReportMs < 30000.0) return;
+    lastHook = hook; lastDeath = death; lastEffect = effect; lastReportMs = now;
+    HeadhunterStatus(false);
 }
 
 #define DROP_HOOK(NAME) \
@@ -9505,7 +9597,7 @@ static bool HandleHeadhunterCommand(const std::string& lc, const std::string& re
 {
     if (lc == "headhunter") {
         std::string on = Lower(TrimCopy(rest));
-        if (on == "on" || on == "1" || on == "force") { g_HhForced.store(on == "force"); InstallHeadhunterHook(); g_HhEnabled.store(g_HhHookInstalled); }
+        if (on == "on" || on == "1" || on == "force") { g_HhForced.store(on == "force"); EnableHeadhunter(); }
         else if (on == "off" || on == "0") { g_HhEnabled.store(false); g_HhForced.store(false); }
         HeadhunterStatus();
     } else if (lc == "hhdur") {
@@ -10632,6 +10724,7 @@ void FrameCallback(FWFrame& FrameContext)
     // all-off mode: it returns immediately while g_EstForce is empty.
     EstForceApply();
     ++g_HhFrame;
+    if (g_HhEnabled.load() && (g_HhFrame % 120) == 0) HeadhunterActivityTick();
     KuyrukIsle();
 #ifndef FORGEPACT_RELEASE
     CensusTick(fc);
