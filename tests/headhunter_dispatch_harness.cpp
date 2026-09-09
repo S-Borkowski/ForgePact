@@ -26,6 +26,7 @@ struct RValue {
         return number;
     }
     bool ToBoolean() const { return number != 0; }
+    CInstance* ToInstance() const { return instance; }
 };
 struct CInstance {
     int id;
@@ -43,6 +44,9 @@ static CInstance* findInstance(int id) {
     return nullptr;
 }
 static int returnedIdKind = VALUE_REAL;
+static bool sdkLookupWorks = true;
+static bool nativeLookupWorks = true;
+static CInstance* nativeLookupOverride = nullptr;
 struct FakeRunner {
     CInstance* resolve(const RValue& value) {
         if (value.m_Kind == VALUE_OBJECT) return value.instance && value.instance->alive ? value.instance : nullptr;
@@ -50,6 +54,10 @@ struct FakeRunner {
     }
     RValue CallBuiltin(const char* name, std::vector<RValue> args) {
         std::string key(name);
+        if (key == "@@GetInstance@@") {
+            if (!nativeLookupWorks) return RValue();
+            return RValue(nativeLookupOverride ? nativeLookupOverride : resolve(args[0]));
+        }
         if (key == "asset_get_index") return RValue(args[0].text == "Player_obj" ? 10.0 : -1.0);
         if (key == "object_is_ancestor") return RValue(args[0].number == 11 && args[1].number == 10 ? 1.0 : 0.0);
         auto* instance = resolve(args[0]);
@@ -65,7 +73,7 @@ struct FakeRunner {
         throw std::runtime_error("invalid builtin access");
     }
     int GetInstanceObject(int32_t id, CInstance*& result) {
-        result = findInstance(id);
+        result = sdkLookupWorks ? findInstance(id) : nullptr;
         return result ? 0 : -1;
     }
 };
@@ -137,6 +145,7 @@ static void InstallCreateHooks() {
 
 static void reset() {
     returnedIdKind = VALUE_REAL;
+    sdkLookupWorks = true; nativeLookupWorks = true; nativeLookupOverride = nullptr;
     g_HhEnabled = true;
     g_HhHandledIds.clear(); g_HhHandledOrder.clear();
     localPlayer = nullptr; localPlayerAsObject = false;
@@ -194,6 +203,29 @@ int main(int argc, char** argv) {
             Hook_HhDeathEffects(&enemy,nullptr,result,0,nullptr);
             require(delivered == 1 && lastPlayer == &player && originalCalls == 1,
                 "typed id from local-player lookup silenced all death fallbacks");
+        } else if (test == "native_lookup_with_broken_sdk_room") {
+            sdkLookupWorks = false; returnedIdKind = VALUE_REF;
+            localPlayer = &player;
+            RValue result;
+            Hook_HhDeathEffects(&enemy,nullptr,result,0,nullptr);
+            require(delivered == 1 && lastPlayer == &player && originalCalls == 1,
+                "valid player was lost because YYTK's room-list layout is stale");
+        } else if (test == "native_numeric_lookup_with_broken_sdk_room") {
+            sdkLookupWorks = false;
+            RValue result, killer(static_cast<double>(player.id));
+            RValue* arguments[] = {nullptr,nullptr,&killer};
+            Hook_EnemyDestroyKillProc(&enemy,nullptr,result,3,arguments);
+            require(delivered == 1 && lastPlayer == &player && originalCalls == 1,
+                "numeric killer still used YYTK's broken room traversal");
+        } else if (test == "native_lookup_unavailable") {
+            nativeLookupWorks = false; localPlayer = &player;
+            HhSteal(&enemy,nullptr,nullptr);
+            require(delivered == 0 && g_HhHandledIds.empty(),
+                "missing native resolver consumed or delivered a kill");
+        } else if (test == "native_lookup_wrong_identity") {
+            nativeLookupOverride = &childPlayer;
+            require(HhResolveInstance(RValue(static_cast<double>(player.id))) == nullptr,
+                "native resolver returned a different instance id without rejection");
         } else if (test == "deduplicate_success") {
             HhSteal(&enemy, &player, nullptr);
             HhSteal(&enemy, nullptr, &player);

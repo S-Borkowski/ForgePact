@@ -4947,8 +4947,8 @@ static void SigDropStatus()
         + " drops=" + std::to_string(g_SigDropHits) + " fails=" + std::to_string(g_SigDropFails) + " next=" + (g_SigDropNext == 0 ? "crown" : "belt"));
 }
 
-// A runner reference or an object is not necessarily a numeric id. Ask for its
-// live instance id before going through YYTK's instance lookup.
+// Resolve through the runner rather than YYTK 4's version-dependent room layout.
+// Its stale active-list offset can make GetInstanceObject see only the last object.
 static CInstance* HhResolveInstance(const RValue& value)
 {
     try {
@@ -4962,8 +4962,13 @@ static CInstance* HhResolveInstance(const RValue& value)
             && id.m_Kind != VALUE_REF) return nullptr;
         const double number = id.ToDouble();
         if (number < 0.0 || number > INT32_MAX) return nullptr;
-        CInstance* instance = nullptr;
-        if (AurieSuccess(g_Yytk->GetInstanceObject((int32_t)number, instance))) return instance;
+        // The engine's named resolver returns the actual instance as VALUE_OBJECT.
+        // No room offsets, persistent raw pointers or game-build addresses are used.
+        RValue resolved = g_Yytk->CallBuiltin("@@GetInstance@@", { id });
+        if (resolved.m_Kind != VALUE_OBJECT || !resolved.ToInstance()) return nullptr;
+        if (!g_Yytk->CallBuiltin("instance_exists", { resolved }).ToBoolean()) return nullptr;
+        if (g_Yytk->CallBuiltin("variable_instance_get", { resolved, RValue("id") }).ToDouble() != number) return nullptr;
+        return resolved.ToInstance();
     } catch (...) {}
     return nullptr;
 }

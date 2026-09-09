@@ -107,3 +107,58 @@ All 48 test methods now pass, including 23 native scenarios. The full release-mo
 plugin compiles. A second private package contains the corrected DLL; no public
 release or in-place update of the running game is performed. Live combat with
 this second DLL still requires restarting the game after installation.
+
+## Follow-up: second test, incompatible SDK room traversal
+
+The second private DLL was also installed correctly: its SHA-256 matched the
+loaded plugin (`8d64a0f469f9b0b0c9237ad2ace226cc94d025f52730dbbca42ddde952ab3f42`).
+Combat callbacks continued to fire while deliveries into `HhOnKill` stayed zero.
+The typed-ID correction was necessary but insufficient.
+
+Read-only inspection of that running Steam session isolated another failure in
+YYToolkit 4.0.1's `GetInstanceObject`. Its room-member layout reads the current
+runner's last active instance as the first. Following forward links therefore
+visits one non-player instance and stops. An independent reverse traversal found
+4,341 active instances, including the actual player. The SDK's cached player
+object index matched that player's object index. Thus the live player existed,
+but this SDK lookup could not reach it. The original API mock always returned a
+working lookup and did not model the SDK/game layout mismatch.
+
+`HhResolveInstance` now calls the runner's named `@@GetInstance@@` builtin instead
+of `GetInstanceObject`. The builtin returns the live instance as `VALUE_OBJECT`.
+The code checks existence before and after resolution, validates the returned
+ID, and retains the separate player-role checks. Production code contains no
+new room offsets or executable addresses and does not cache raw instance
+pointers. A missing resolver, null result or mismatched identity fails closed.
+The rest of YYToolkit and the game's buff rules are unchanged.
+
+### Verification of the real native boundary
+
+The running process was opened with query/read permissions only. The resolver's
+machine code and required memory pages were copied into an isolated Unicorn
+emulator. No code was called or memory written inside the live game.
+
+- Native resolution of reference, real and integer IDs returned exactly the
+  player pointer independently found in the active list. A nonexistent ID
+  returned a null object.
+- A second check executed the complete lookup boundary in copied memory:
+  `instance_exists`, `variable_instance_get("id")`, `@@GetInstance@@`, the
+  runner's pointer conversion used by `ToInstance`, existence/ID revalidation,
+  and `variable_instance_get("object_index")`.
+- All four input representations (reference, real, integer and object) passed
+  that round trip and identified `Player_obj`. A nonexistent ID failed the
+  initial existence check.
+- The dispatch harness adds two cases where the SDK room lookup is broken but
+  native resolution works, plus unavailable-resolver and wrong-identity safety
+  cases. The suite passes all 48 test methods, including 27 native C++ scenarios.
+- The complete plugin compiles with `FORGEPACT_RELEASE` in a separate build
+  directory. The new private package reuses the unchanged panel executable and
+  contains this newly compiled plugin. Package verification checks the DLL
+  identity, binaries, ZIP contents and isolated-profile WebView2/UI/API startup.
+
+These checks prove the observed lookup failure and the replacement boundary on
+this Steam executable. They do not prove end-to-end buff delivery in live combat
+with the new DLL. That still requires installing it and restarting the game.
+The running game, installed plugin, user settings and existing release files
+are preserved. No package is published to GitHub. Memory copies, disassembly
+and runtime player identifiers remain in the ignored local build directory.

@@ -74,6 +74,8 @@ class HeadhunterDispatchTests(unittest.TestCase):
             'missing_player_retry', 'failed_buff_retry', 'exception_retry',
             'projectile_context', 'object_player_reference', 'deduplicate_success',
             'typed_instance_id_killer', 'typed_instance_id_local_fallback',
+            'native_lookup_with_broken_sdk_room', 'native_numeric_lookup_with_broken_sdk_room',
+            'native_lookup_unavailable', 'native_lookup_wrong_identity',
             'reject_non_enemy', 'disabled', 'player_subclass', 'bounded_cache',
             'capture_before_cleanup', 'player_self_call_shape', 'kill_without_arguments',
             'standalone_fallback_install', 'fallback_without_primary', 'no_trigger_available',
