@@ -17,21 +17,29 @@ you ship, or you will get crashes at load time — the interface is a raw vtable
 ## Build
 
 ```
+plugin_build\build.bat
+```
+or
+```
 plugin_build\build.bat release
 ```
 
-Output: `plugin_build\BloodPactPlugin_ship.dll` — the player build. Copy it to
+Both are equivalent (`build.bat`'s only special-cased argument is `dev`; anything else,
+including no argument at all, takes this branch). Output:
+`plugin_build\BloodPactPlugin_ship.dll` — the player build. Copy it to
 `modfiles_shipped\BloodPactPlugin.dll`; `build_release.py` refuses to package if those
 two files differ, so a stale plugin cannot ship by accident.
 
 ```
-plugin_build\build.bat
+plugin_build\build.bat dev
 ```
 
 Output: `plugin_build\BloodPactPlugin_rel.dll` — the research build. Same code, but
 without `/DFORGEPACT_RELEASE`, so the runtime-inspection commands (`structdump`,
 `readmem`, `census`, `enemylog`, `probestruct`, …) are compiled in. Use this one for
-analysis; never ship it.
+analysis; never ship it. **Bare `build.bat` (no argument) does NOT produce this build —
+that was the behavior in an earlier version of the script and this doc was never updated;
+you need the literal `dev` argument.**
 
 The exact compile line is in `build.bat`; the only difference between the two builds is
 the `/DFORGEPACT_RELEASE` define.

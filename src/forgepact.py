@@ -34,6 +34,8 @@ try:
         scan_relic_levels,
         ModDefinition,
         GLOBAL_MOD_REGISTRY,
+        SATANIC_BUFFS,
+        SATANIC_DEBUFFS,
     )
 except ImportError:
     _sdk_path = Path(__file__).resolve().parents[2] / "hs-game-sdk" / "python"
@@ -50,6 +52,8 @@ except ImportError:
             scan_relic_levels,
             ModDefinition,
             GLOBAL_MOD_REGISTRY,
+            SATANIC_BUFFS,
+            SATANIC_DEBUFFS,
         )
     except Exception:
         GameObject = None
@@ -57,6 +61,8 @@ except ImportError:
         StatId = None
         PROC_FAMILIES = {}
         GLOBAL_MOD_REGISTRY = None
+        SATANIC_BUFFS = ()
+        SATANIC_DEBUFFS = ()
 
 PORT = 8766
 # Windows sometimes reserves a port range (Hyper-V/WSL) and refuses the bind.
@@ -118,6 +124,17 @@ DROPS = [
     ("gold", "Gold", ""),
 ]
 
+# Satanic Zone buff/debuff pool.  Names/ids/descriptions come from
+# hs-game-sdk (hand-verified game knowledge, not mechanically extracted --
+# see hs-game-sdk/curated/satanic_zone.json).  All on by default; deselecting
+# one keeps the plugin from letting the game roll it into a future zone.
+# Below the floor per column is refused client- and server-side.  Buffs and
+# debuffs get different floors (user-set, 2026-09-10).
+SATANIC_BUFF_LIST = [(m.id, m.name, m.description) for m in SATANIC_BUFFS]
+SATANIC_DEBUFF_LIST = [(m.id, m.name, m.description) for m in SATANIC_DEBUFFS]
+MIN_ENABLED_SATANIC_BUFFS = 3
+MIN_ENABLED_SATANIC_DEBUFFS = 2
+
 # Oyuncu istatistigi carpanlari.  Bunlar sabit bir taban deger yazmaz: oyunun
 # hesapladigi guncel toplam YYToolkit tarafinda okunur ve DONUS degeri carpilir.
 # Ucuncu alan panelde izin verilen guvenli/yararli ust sinir, dorduncu alan
@@ -176,6 +193,13 @@ DEFAULTS = {
     "keys": {k: 1 for k, *_ in KEYS},
     "stats": {k: 1 for k, *_ in STATS},
     "percent_stats": {k: 0 for k, *_ in PERCENT_STATS},
+    # All mods enabled by default; a saved config only ever lists the ones a
+    # user turned off, so a game update that adds new buff/debuff ids picks
+    # up the "enabled" default automatically (see load_cfg's nested merge).
+    "satanic_mods": {
+        "buff": {str(i): True for i, *_ in SATANIC_BUFF_LIST},
+        "debuff": {str(i): True for i, *_ in SATANIC_DEBUFF_LIST},
+    },
 }
 
 _lock = threading.Lock()
@@ -189,6 +213,15 @@ def load_cfg() -> dict:
             for k, v in saved.items():
                 if k in ("spawners", "drops", "keys", "stats", "percent_stats"):
                     cfg[k] = {**cfg[k], **v}
+                elif k == "satanic_mods" and isinstance(v, dict):
+                    # Nested: merge each polarity's id->bool dict on its own,
+                    # so ids missing from an older saved file (a mod added by
+                    # a later update) still default to enabled rather than
+                    # being dropped by a flat overwrite.
+                    cfg[k] = {
+                        "buff": {**cfg[k]["buff"], **v.get("buff", {})},
+                        "debuff": {**cfg[k]["debuff"], **v.get("debuff", {})},
+                    }
                 else:
                     cfg[k] = v
         except Exception:
@@ -589,6 +622,11 @@ def build_cmds(cfg: dict) -> list:
             out.append(f"stat {key} {1.0 + bonus / 100.0:g}")
     settings = cfg.get("keys", {})
     out.extend(build_key_cmds(settings, include_resets=False))
+    for polarity in ("buff", "debuff"):
+        pool = cfg.get("satanic_mods", {}).get(polarity, {})
+        disabled = [k for k, v in pool.items() if not v]
+        if disabled:
+            out.append(f"satmods {polarity} {','.join(disabled)}")
     return out
 
 
@@ -1262,6 +1300,10 @@ class H(BaseHTTPRequestHandler):
                         # Third field is the drop type: the panel's explanation text
                         # differs per family because they do not all mean the same thing.
                         "keys": [[k, l, t] for k, l, t in KEYS],
+                        "satanicBuffs": [[i, l, d] for i, l, d in SATANIC_BUFF_LIST],
+                        "satanicDebuffs": [[i, l, d] for i, l, d in SATANIC_DEBUFF_LIST],
+                        "minEnabledSatanicBuffs": MIN_ENABLED_SATANIC_BUFFS,
+                        "minEnabledSatanicDebuffs": MIN_ENABLED_SATANIC_DEBUFFS,
                         "lastApplied": LAST["applied"], "queued": LAST["queued"]})
         else:
             self._json({"err": "not found"}, 404)
@@ -1273,7 +1315,10 @@ class H(BaseHTTPRequestHandler):
         try:
             cfg = load_cfg()
             if u.path == "/api/set":
-                sec, key, val = body.get("section"), body["key"], body["value"]
+                # key is optional only for the satanic_mods bulk form (body["keys"]
+                # instead of a single body["key"]) - every other section still
+                # requires it and gets a KeyError same as before if it's missing.
+                sec, key, val = body.get("section"), body.get("key"), body["value"]
                 if sec == "keys":
                     cfg[sec][key] = max(1, min(100, int(val)))
                 elif sec == "stats":
@@ -1294,6 +1339,41 @@ class H(BaseHTTPRequestHandler):
                         return
                     ceiling = next((mx for k, _i, _l, mx in SPAWNERS if k == key), 100)
                     cfg[sec][key] = max(1, min(ceiling, int(val)))
+                elif sec == "satanic_mods":
+                    polarity = body.get("polarity")
+                    if polarity not in ("buff", "debuff"):
+                        self._json({"err": "polarity must be buff or debuff"}, 400); return
+                    pool = cfg["satanic_mods"][polarity]
+                    floor = MIN_ENABLED_SATANIC_BUFFS if polarity == "buff" else MIN_ENABLED_SATANIC_DEBUFFS
+                    new_val = bool(val)
+                    keys_bulk = body.get("keys")
+                    if keys_bulk is not None:
+                        # Select All / Deselect All: one request for the whole column
+                        # instead of one per row, so it applies (and sends its one
+                        # live "satmods" command) instantly rather than row-by-row.
+                        ids = [str(k) for k in keys_bulk if str(k) in pool]
+                        if not new_val:
+                            # Never drop below the floor - silently keep enough of
+                            # the requested ids enabled rather than erroring, since
+                            # this is a "turn off everything you can" bulk action.
+                            # Only ids that are CURRENTLY enabled count against the
+                            # budget - one already off costs nothing to "re-disable".
+                            enabled_ids = [k for k in ids if pool[k]]
+                            allowed = max(0, len(enabled_ids) - floor)
+                            ids = enabled_ids[:allowed]
+                        for k in ids:
+                            pool[k] = new_val
+                    else:
+                        if key not in pool:
+                            self._json({"err": "unknown satanic mod id"}, 400); return
+                        if pool[key] and not new_val:
+                            # Deselecting one: refuse if it would drop this polarity's
+                            # enabled count below its floor (buffs and debuffs differ).
+                            enabled_after = sum(1 for v in pool.values() if v) - 1
+                            if enabled_after < floor:
+                                self._json({"err": f"at least {floor} {polarity}s must stay enabled"}, 400)
+                                return
+                        pool[key] = new_val
                 elif key == "density":
                     # 0.5 steps: 1, 1.5, 2 ...  Whole numbers are stored as
                     # float("3") -> 3.0; the plugin prints with %g so it shows as "x3".
@@ -1331,6 +1411,10 @@ class H(BaseHTTPRequestHandler):
                         send_cmds([command], cfg)
                     elif sec == "spawners":
                         send_cmds([f"specialrate {key} {int(val)}"], cfg)
+                    elif sec == "satanic_mods":
+                        polarity = body.get("polarity")
+                        disabled_csv = ",".join(k for k, v in cfg["satanic_mods"][polarity].items() if not v)
+                        send_cmds([f"satmods {polarity} {disabled_csv}"], cfg)
                     elif key in ("density", "density_on"):
                         send_cmds([f"density {cfg['density'] if cfg['density_on'] else 1}"], cfg)
                     elif key == "map_reveal":
@@ -1423,6 +1507,11 @@ HTML = r"""<!DOCTYPE html>
 <style>
 :root{--bg:#0d0a08;--card:#171210;--card2:#1e1713;--ember:#ff7a1a;--ember2:#ffb347;--tx:#e8dcc8;--mut:#8a7a64;--line:#33261c;--ok:#5ad87a;--arcane:#a77cff;--blood:#ff5b6e;--steel:#65c7d5}
 *{box-sizing:border-box}
+*{scrollbar-width:thin;scrollbar-color:var(--line) var(--card)}
+*::-webkit-scrollbar{width:10px;height:10px}
+*::-webkit-scrollbar-track{background:var(--card)}
+*::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px;border:2px solid var(--card)}
+*::-webkit-scrollbar-thumb:hover{background:var(--ember)}
 body{margin:0;font:14px/1.5 'Segoe UI',sans-serif;background:radial-gradient(1200px 500px at 50% -150px,#2a1408 0%,var(--bg) 60%);color:var(--tx);min-height:100vh}
 #wrap{max-width:980px;margin:0 auto;padding:26px 20px 60px}
 header{display:flex;align-items:center;gap:16px;margin-bottom:6px;position:relative;padding:4px 0 10px}
@@ -1487,6 +1576,14 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;heigh
 .modifier-group .row .lbl{width:auto}
 .modifier-group .note{margin:-4px 0 8px}
 @media(max-width:820px){.tabbar{grid-template-columns:1fr 1fr}.modifier-grid{grid-template-columns:1fr}.modifier-group.wide{grid-column:auto}.modifier-group .row{grid-template-columns:150px 1fr 64px}}
+.sat-list{max-height:420px;overflow-y:auto;padding-right:4px}
+.sat-list .row{display:flex;align-items:center;gap:10px;border-bottom:1px solid #241d2c}
+.sat-list .row:last-child{border-bottom:none}
+.sat-desc{font-size:11px;color:#8f816e;font-weight:normal}
+.group-title.positive{color:#72d6a5}
+.group-title.negative{color:#e0697a}
+.sat-bulk{display:flex;gap:8px;margin:2px 0 8px}
+.sat-bulk button{font-size:11px;padding:4px 10px}
 </style></head><body><div id="wrap">
 <header><div class="logo">&#128293;</div><div>
   <h1>FORGEPACT</h1><div class="sub">Hero Siege game mods &middot; live control</div>
@@ -1634,6 +1731,69 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;heigh
   <div class="note" id="raritynote">off</div>
 </div>
 
+<div class="card modifier-card tab-card" data-tab="world">
+  <h2><svg width="26" height="26" viewBox="0 0 64 64" style="vertical-align:-6px" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <defs>
+      <radialGradient id="satRedGlow" cx="50%" cy="50%" r="50%">
+        <stop offset="0%" stop-color="#ff6b7a" stop-opacity="1"/>
+        <stop offset="55%" stop-color="#c81a34" stop-opacity="0.6"/>
+        <stop offset="100%" stop-color="#c81a34" stop-opacity="0"/>
+      </radialGradient>
+      <radialGradient id="satSkullFill" cx="42%" cy="32%" r="75%">
+        <stop offset="0%" stop-color="#2b2622"/>
+        <stop offset="55%" stop-color="#14100d"/>
+        <stop offset="100%" stop-color="#060504"/>
+      </radialGradient>
+      <linearGradient id="satFadeGrad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="black"/>
+        <stop offset="0.35" stop-color="white"/>
+        <stop offset="1" stop-color="white"/>
+      </linearGradient>
+      <mask id="satFadeTop"><rect x="0" y="0" width="64" height="64" fill="url(#satFadeGrad)"/></mask>
+      <filter id="satSmokeBlur" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="2.2"/></filter>
+      <filter id="satSoftBlur" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="1.1"/></filter>
+    </defs>
+    <g filter="url(#satSmokeBlur)" stroke-linecap="round" fill="none">
+      <path d="M20,52 C14,46 18,38 12,30 C7,23 13,15 9,6" stroke="#15110e" stroke-width="5" opacity="0.22"/>
+      <path d="M20,52 C14,46 18,38 12,30 C7,23 13,15 9,6" stroke="#100c0a" stroke-width="2" opacity="0.45"/>
+      <path d="M44,52 C50,45 45,36 51,28 C56,20 49,13 54,4" stroke="#15110e" stroke-width="5" opacity="0.22"/>
+      <path d="M44,52 C50,45 45,36 51,28 C56,20 49,13 54,4" stroke="#100c0a" stroke-width="2" opacity="0.45"/>
+      <path d="M30,50 C26,44 31,40 27,34 C24,29 29,24 26,16" stroke="#15110e" stroke-width="4" opacity="0.18"/>
+    </g>
+    <ellipse cx="32" cy="34" rx="24" ry="22" fill="#0a0705" opacity="0.25" filter="url(#satSmokeBlur)"/>
+    <ellipse cx="32" cy="30" rx="19" ry="17" fill="url(#satRedGlow)" opacity="0.5" filter="url(#satSoftBlur)"/>
+    <g mask="url(#satFadeTop)">
+      <path d="M32,6 C20,6 12,15 12,26 C12,33 15,37 18,40 C17,43 17,46 18,48 C20,52 24,54 32,54 C40,54 44,52 46,48 C47,46 47,43 46,40 C49,37 52,33 52,26 C52,15 44,6 32,6 Z" fill="url(#satSkullFill)"/>
+      <ellipse cx="23" cy="27" rx="5.2" ry="6.4" fill="#050403"/>
+      <ellipse cx="41" cy="27" rx="5.2" ry="6.4" fill="#050403"/>
+      <circle cx="23" cy="28.5" r="2.6" fill="url(#satRedGlow)"/>
+      <circle cx="41" cy="28.5" r="2.6" fill="url(#satRedGlow)"/>
+      <path d="M32,33 L28.5,40 L35.5,40 Z" fill="#050403"/>
+      <path d="M27,46 L27,52 M32,46 L32,52 M37,46 L37,52" stroke="#050403" stroke-width="1.6" stroke-linecap="round"/>
+      <path d="M46,14 C50,19 52,23 52,26 C52,33 49,37 46,40" fill="none" stroke="#ff5b6e" stroke-width="1.6" opacity="0.85" filter="url(#satSoftBlur)"/>
+    </g>
+  </svg> Satanic Zone Mods</h2>
+  <div class="hint">The World Section modifiers Hero Siege can roll onto a Satanic Zone. Every mod is on by default; deselect the ones you never want to see and the plugin keeps the game's own roll away from them. At least <span id="satminbuffnote">3</span> positive and <span id="satmindebuffnote">2</span> negative mods must stay enabled - a Satanic Zone still needs a pool to roll from.</div>
+  <div class="modifier-grid">
+    <div class="modifier-group">
+      <div class="group-title positive">Positive</div>
+      <div class="sat-bulk">
+        <button class="btn" id="satbuffAll" type="button">Select All</button>
+        <button class="btn" id="satbuffNone" type="button">Deselect All</button>
+      </div>
+      <div class="sat-list" id="satbuffs"></div>
+    </div>
+    <div class="modifier-group">
+      <div class="group-title negative">Negative</div>
+      <div class="sat-bulk">
+        <button class="btn" id="satdebuffAll" type="button">Select All</button>
+        <button class="btn" id="satdebuffNone" type="button">Deselect All</button>
+      </div>
+      <div class="sat-list" id="satdebuffs"></div>
+    </div>
+  </div>
+</div>
+
 <div class="card tab-card" data-tab="mods">
   <h2>&#10024; Gameplay Mods</h2>
   <div class="hint">Toggle custom game modifications, drop pool adjustments, and quality-of-life tweaks. Settings apply immediately while the game is running.</div>
@@ -1714,6 +1874,12 @@ function row(sec,key,label,val,tagHtml,max,note,step){
   return `<div class="row"><span class="lbl">${label}${tagHtml||''}</span>
     <input type="range" min="${mn}" max="${mx}" step="${step||1}" value="${val}" data-sec="${sec}" data-key="${key}">
     <span class="val ${off?'off':''}" style="width:64px" title="Click to type a value">${sliderText(sec,val)}</span></div>${n}`;
+}
+function satRow(polarity,id,name,desc,enabled){
+  return `<div class="row">
+    <span class="lbl" style="width:auto;flex:1">${name}<br><span class="sat-desc">${desc}</span></span>
+    <label class="switch"><input type="checkbox" data-sat-polarity="${polarity}" data-sat-id="${id}" ${enabled?'checked':''}><span class="sl"></span></label>
+  </div>`;
 }
 // Click the value next to a slider to type it.  Sliders with 100-200 steps on a
 // 200 px track skip values (80, 85, 95 ...); typing lands exactly.  Enter or
@@ -1848,6 +2014,13 @@ async function boot(){
   document.getElementById('hhval').className='val '+(hh?'':'off');
   document.getElementById('exepath').value=c.game_exe||'';
   document.getElementById('spawners').innerHTML=ST.spawners.map(([k,i,l,mx])=>row('spawners',k,l,c.spawners[k]||1,'',mx)).join('');
+  document.getElementById('satminbuffnote').textContent=ST.minEnabledSatanicBuffs||3;
+  document.getElementById('satmindebuffnote').textContent=ST.minEnabledSatanicDebuffs||2;
+  const satPool=(polarity)=>(c.satanic_mods&&c.satanic_mods[polarity])||{};
+  document.getElementById('satbuffs').innerHTML=(ST.satanicBuffs||[]).map(([id,name,desc])=>
+    satRow('buff',id,name,desc,satPool('buff')[id]!==false)).join('');
+  document.getElementById('satdebuffs').innerHTML=(ST.satanicDebuffs||[]).map(([id,name,desc])=>
+    satRow('debuff',id,name,desc,satPool('debuff')[id]!==false)).join('');
   document.getElementById('keys').innerHTML=ST.keys.map(([k,l,t])=>{
     const v=(c.keys&&c.keys[k])||1;
     return row('keys',k,l,v,'',100,keyNote(k,t,v));
@@ -2029,6 +2202,45 @@ function bind(){
     if(res.cfg) ST.cfg=res.cfg;
     toast(res.ok||res.err); status();
   };
+  bindSatanicMods();
+}
+// One row's checkbox posts {section:'satanic_mods', polarity, key:id, value}. The
+// server re-validates the per-polarity floor (see /api/set), so a rejected
+// deselect below the floor snaps the checkbox back rather than trusting the client.
+function bindSatanicMods(){
+  const setOne=async(box)=>{
+    const polarity=box.dataset.satPolarity, id=box.dataset.satId, value=box.checked;
+    const res=await j('/api/set',{method:'POST',body:JSON.stringify({section:'satanic_mods',polarity,key:id,value})});
+    if(res.err){ box.checked=!value; toast(res.err); return false; }
+    if(res.cfg) ST.cfg=res.cfg;
+    return true;
+  };
+  document.querySelectorAll('input[data-sat-polarity]').forEach(box=>{
+    box.onchange=()=>setOne(box);
+  });
+  // One request for the whole column (not one per row - that was the slow,
+  // one-by-one-with-animation path). The server clamps a "deselect all" to
+  // the polarity's floor itself (see /api/set), so the client just asks for
+  // everything and repaints from whatever cfg comes back.
+  const bulkSet=async(polarity,ids,value)=>{
+    const res=await j('/api/set',{method:'POST',body:JSON.stringify({section:'satanic_mods',polarity,keys:ids,value})});
+    if(res.err){ toast(res.err); return; }
+    if(res.cfg){
+      ST.cfg=res.cfg;
+      const pool=res.cfg.satanic_mods[polarity]||{};
+      document.querySelectorAll(`input[data-sat-polarity="${polarity}"]`).forEach(box=>{
+        box.checked=pool[box.dataset.satId]!==false;
+      });
+    }
+    toast(`${polarity==='buff'?'positive':'negative'} mods: ${value?'all selected':'deselected to the minimum'}`);
+  };
+  const wireBulk=(polarity,allId,noneId,list)=>{
+    const ids=list.map(m=>String(m[0]));
+    document.getElementById(allId).onclick=()=>bulkSet(polarity,ids,true);
+    document.getElementById(noneId).onclick=()=>bulkSet(polarity,ids,false);
+  };
+  wireBulk('buff','satbuffAll','satbuffNone',ST.satanicBuffs||[]);
+  wireBulk('debuff','satdebuffAll','satdebuffNone',ST.satanicDebuffs||[]);
 }
 setInterval(async()=>{const s=await j('/api/state');ST.gameRunning=s.gameRunning;ST.lastApplied=s.lastApplied;ST.queued=s.queued;ST.ipcOk=s.ipcOk;status()},5000);
 boot();

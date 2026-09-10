@@ -7645,6 +7645,271 @@ static void RareDropCmd(const std::string& rest)
     Out("raredrop: unknown '" + a1 + "'  (heroic | ceiling | satanic | angelic | list)");
 }
 
+// ---- Satanic Zone mod pool: satmods <buff|debuff> <csv of disabled ids> ----
+// Lets the game roll a Satanic Zone's buffs/debuffs exactly as it always
+// has, then - only for the ids the user disabled - swaps in a random
+// still-enabled id from the same polarity's full range instead. Nothing is
+// forced: an id the user left on can still fail to appear, and turning
+// everything back on (empty csv for both polarities) is bit-for-bit vanilla.
+//
+// Hook target is UNCONFIRMED against a live game (see
+// docs/satanic-zone-mods-research.md, Phase 0) - LoadSatanicZone is the
+// primary candidate; GetSatanicZoneOffline / LoadRandomSatanicStat are the
+// documented fallbacks if probing shows the roll happens there instead.
+static PFUNC_YYGMLScript g_OrigLoadSatanicZone = nullptr;
+static std::set<int> g_SatDisabledBuffs;    // empty = every buff (1-25) enabled
+static std::set<int> g_SatDisabledDebuffs;  // empty = every debuff (1-26) enabled
+static volatile long g_SatModsHits = 0;
+static volatile long g_SatLoadCalls = 0;   // every call, regardless of whether anything needed filtering
+static const int kSatanicBuffCount = 25;
+static const int kSatanicDebuffCount = 26;
+// Research-only: log the first N LoadSatanicZone calls (args + resulting
+// arrays) so Phase 0 can see call cadence directly in out.txt, not just infer
+// it from g_SatModsHits (which only moves when a disabled id was present).
+static volatile long g_SatLoadTraceLeft = 40;
+
+// Resolves the single Controller_obj instance (same pattern as ObjVarJson).
+static bool ResolveControllerObj(RValue& out)
+{
+    try {
+        RValue oi = g_Yytk->CallBuiltin("asset_get_index", { RValue("Controller_obj") });
+        RValue id = g_Yytk->CallBuiltin("instance_find", { oi, RValue(0.0) });
+        if (id.ToDouble() < 0) return false;
+        out = id;
+        return true;
+    } catch (...) { return false; }
+}
+
+// Rewrites one polarity's array in place: any id in `disabled` is replaced by a
+// random id NOT already present in the array and NOT disabled; if every id in
+// [1, idCount] is disabled, that slot is left out of the array instead (the
+// zone simply carries fewer/zero mods of that polarity - not a bug).
+static void FilterSatanicArray(const RValue& controller, const char* varName,
+                                const std::set<int>& disabled, int idCount)
+{
+    if (disabled.empty()) return;
+    try {
+        RValue ex = g_Yytk->CallBuiltin("variable_instance_exists", { controller, RValue(varName) });
+        if (!ex.ToBoolean()) return;
+        RValue arr = g_Yytk->CallBuiltin("variable_instance_get", { controller, RValue(varName) });
+        if (arr.m_Kind != VALUE_ARRAY) return;
+        int n = (int)g_Yytk->CallBuiltin("array_length", { arr }).ToDouble();
+        if (n <= 0) return;
+
+        std::set<int> present;
+        std::vector<int> current(n, 0);
+        for (int i = 0; i < n; ++i) {
+            int id = (int)g_Yytk->CallBuiltin("array_get", { arr, RValue((double)i) }).ToDouble();
+            current[i] = id;
+            present.insert(id);
+        }
+
+        std::vector<int> replacement;   // same length as current, -1 = drop this slot
+        bool changed = false;
+        for (int i = 0; i < n; ++i) {
+            int id = current[i];
+            if (disabled.find(id) == disabled.end()) { replacement.push_back(id); continue; }
+            changed = true;
+            int pick = -1;
+            for (int attempt = 0; attempt < 200 && pick < 0; ++attempt) {
+                int cand = 1 + (std::rand() % idCount);
+                if (disabled.find(cand) != disabled.end()) continue;
+                if (present.find(cand) != present.end()) continue;
+                pick = cand;
+            }
+            if (pick > 0) { present.insert(pick); replacement.push_back(pick); }
+            // else: enabled pool exhausted for this polarity - drop the slot.
+        }
+        if (!changed) return;
+
+        RValue newArr = g_Yytk->CallBuiltin("array_create", { RValue((double)replacement.size()) });
+        for (size_t i = 0; i < replacement.size(); ++i)
+            g_Yytk->CallBuiltin("array_set", { newArr, RValue((double)i), RValue((double)replacement[i]) });
+        g_Yytk->CallBuiltin("variable_instance_set", { controller, RValue(varName), newArr });
+        BP_DIAG_INCREMENT(g_SatModsHits);
+    } catch (...) {}
+}
+
+static RValue& HookLoadSatanicZone(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
+{
+    BP_DIAG_INCREMENT(g_SatLoadCalls);
+    RValue& r = g_OrigLoadSatanicZone ? g_OrigLoadSatanicZone(S, O, R, argc, A) : R;
+    bool traced = false;
+    if (g_SatLoadTraceLeft > 0) {
+        --g_SatLoadTraceLeft;
+        traced = true;
+        RValue controller;
+        std::string buffsBefore = "?", debuffsBefore = "?";
+        if (ResolveControllerObj(controller)) {
+            try {
+                RValue bv = g_Yytk->CallBuiltin("variable_instance_get", { controller, RValue("satanicZoneBuff") });
+                RValue dv = g_Yytk->CallBuiltin("variable_instance_get", { controller, RValue("satanicZoneDebuff") });
+                buffsBefore = Describe(bv);
+                debuffsBefore = Describe(dv);
+            } catch (...) {}
+        }
+        Out("satmods TRACE: LoadSatanicZone call#" + std::to_string(g_SatLoadCalls) + " argc=" + std::to_string(argc)
+            + (argc >= 1 && A && A[0] ? " arg0=" + Describe(*A[0]) : "")
+            + " -> " + Describe(r)
+            + " | before filter: buffs=" + buffsBefore + " debuffs=" + debuffsBefore);
+    }
+    if (!g_SatDisabledBuffs.empty() || !g_SatDisabledDebuffs.empty()) {
+        RValue controller;
+        if (ResolveControllerObj(controller)) {
+            FilterSatanicArray(controller, "satanicZoneBuff", g_SatDisabledBuffs, kSatanicBuffCount);
+            FilterSatanicArray(controller, "satanicZoneDebuff", g_SatDisabledDebuffs, kSatanicDebuffCount);
+        }
+    }
+    if (traced) {
+        try {
+            RValue controller;
+            if (ResolveControllerObj(controller)) {
+                RValue bv = g_Yytk->CallBuiltin("variable_instance_get", { controller, RValue("satanicZoneBuff") });
+                RValue dv = g_Yytk->CallBuiltin("variable_instance_get", { controller, RValue("satanicZoneDebuff") });
+                Out("satmods TRACE:   after filter: buffs=" + Describe(bv) + " debuffs=" + Describe(dv));
+            }
+        } catch (...) {}
+    }
+    return r;
+}
+
+static bool EnsureSatanicZoneHook()
+{
+    if (g_OrigLoadSatanicZone) return true;
+    return HookOneScript("LoadSatanicZone", "fp_loadsz", (PVOID)HookLoadSatanicZone, &g_OrigLoadSatanicZone);
+}
+
+// ---- Poll-and-correct: the actual filtering mechanism -----------------
+// Live research 2026-09-10 found LoadSatanicZone never fires during normal
+// play (call counter stayed 0 through zone loads, waypoint travel); rereading
+// HS-Offline-Tracker's own README, LoadSatanicZone(room) is THEIR diagnostic
+// code asking the game a question, not something the game calls on its own
+// during a real roll. So hooking a specific "roll" routine is the wrong
+// approach - the actual write site is still unidentified (and may not even
+// be a single script; the array visibly changed once mid-session with the
+// hook installed and calls staying at 0).
+//
+// Instead: sample Controller_obj.satanicZoneBuff/Debuff every
+// kSatanicPollFrames frames from the existing FrameCallback, and the instant
+// the content differs from what we last saw (i.e. the game changed it),
+// filter it right then. This needs no knowledge of which script performs the
+// roll, and is only as stale as the poll interval (well under a second).
+static const uint32_t kSatanicPollFrames = 15;   // ~0.25s at 60fps
+static std::vector<int> g_SatLastSeenBuffs;
+static std::vector<int> g_SatLastSeenDebuffs;
+static volatile long g_SatPollChanges = 0;   // how many times a poll saw new content (game-driven, not ours)
+// Verbose "content changed" trace: dev builds only, so a player's out.txt
+// does not fill up with every Satanic Zone roll they happen to see.
+#ifndef FORGEPACT_RELEASE
+static volatile long g_SatLoadTraceLeftPoll = 40;
+#else
+static volatile long g_SatLoadTraceLeftPoll = 0;
+#endif
+
+static std::vector<int> ReadIntArray(const RValue& controller, const char* varName)
+{
+    std::vector<int> out;
+    try {
+        RValue ex = g_Yytk->CallBuiltin("variable_instance_exists", { controller, RValue(varName) });
+        if (!ex.ToBoolean()) return out;
+        RValue arr = g_Yytk->CallBuiltin("variable_instance_get", { controller, RValue(varName) });
+        if (arr.m_Kind != VALUE_ARRAY) return out;
+        int n = (int)g_Yytk->CallBuiltin("array_length", { arr }).ToDouble();
+        for (int i = 0; i < n; ++i)
+            out.push_back((int)g_Yytk->CallBuiltin("array_get", { arr, RValue((double)i) }).ToDouble());
+    } catch (...) {}
+    return out;
+}
+
+// Called every kSatanicPollFrames frames from FrameCallback.
+static void SatanicPollTick()
+{
+    // Cheap bail-out: nothing to correct and nothing to trace.
+    if (g_SatDisabledBuffs.empty() && g_SatDisabledDebuffs.empty() && g_SatLoadTraceLeftPoll <= 0) return;
+    RValue controller;
+    if (!ResolveControllerObj(controller)) return;
+
+    std::vector<int> buffs = ReadIntArray(controller, "satanicZoneBuff");
+    std::vector<int> debuffs = ReadIntArray(controller, "satanicZoneDebuff");
+    const bool changed = (buffs != g_SatLastSeenBuffs) || (debuffs != g_SatLastSeenDebuffs);
+
+    if (changed) {
+        BP_DIAG_INCREMENT(g_SatPollChanges);
+        if (g_SatLoadTraceLeftPoll > 0) {
+            --g_SatLoadTraceLeftPoll;
+            auto fmt = [](const std::vector<int>& v) {
+                std::string s = "[";
+                for (size_t i = 0; i < v.size(); ++i) s += (i ? "," : "") + std::to_string(v[i]);
+                return s + "]";
+            };
+            Out("satmods POLL: content changed (#" + std::to_string(g_SatPollChanges) + ") buffs "
+                + fmt(g_SatLastSeenBuffs) + " -> " + fmt(buffs) + "  debuffs "
+                + fmt(g_SatLastSeenDebuffs) + " -> " + fmt(debuffs));
+        }
+    }
+
+    if (!g_SatDisabledBuffs.empty() || !g_SatDisabledDebuffs.empty()) {
+        FilterSatanicArray(controller, "satanicZoneBuff", g_SatDisabledBuffs, kSatanicBuffCount);
+        FilterSatanicArray(controller, "satanicZoneDebuff", g_SatDisabledDebuffs, kSatanicDebuffCount);
+        // Re-read post-filter so the cache reflects what we left behind, not
+        // what the game rolled - otherwise our own correction would look
+        // like another "game changed it" event next tick.
+        g_SatLastSeenBuffs = ReadIntArray(controller, "satanicZoneBuff");
+        g_SatLastSeenDebuffs = ReadIntArray(controller, "satanicZoneDebuff");
+    } else {
+        g_SatLastSeenBuffs = buffs;
+        g_SatLastSeenDebuffs = debuffs;
+    }
+}
+
+static std::set<int> ParseIdCsv(const std::string& csv)
+{
+    std::set<int> out;
+    size_t p = 0;
+    while (p <= csv.size()) {
+        size_t c = csv.find(',', p);
+        if (c == std::string::npos) c = csv.size();
+        std::string tok = TrimCopy(csv.substr(p, c - p));
+        if (!tok.empty()) { try { out.insert(std::stoi(tok)); } catch (...) {} }
+        p = c + 1;
+    }
+    return out;
+}
+
+// satmods <buff|debuff> <csv of disabled ids>   -- empty csv clears that polarity
+// satmods status                                 -- report current state
+static void SatModsCmd(const std::string& rest)
+{
+    std::string a1, a2;
+    a1 = Lower(TrimCopy(FirstToken(rest, a2)));
+    a2 = TrimCopy(a2);
+
+    if (a1.empty() || a1 == "status") {
+        Out("satmods: poll(active" + std::string((!g_SatDisabledBuffs.empty() || !g_SatDisabledDebuffs.empty()) ? "" : ", nothing to filter yet")
+            + ")=every " + std::to_string(kSatanicPollFrames) + " frames"
+            + " disabled buffs=" + std::to_string(g_SatDisabledBuffs.size()) + "/" + std::to_string(kSatanicBuffCount)
+            + " disabled debuffs=" + std::to_string(g_SatDisabledDebuffs.size()) + "/" + std::to_string(kSatanicDebuffCount)
+            + " pollChanges=" + std::to_string(g_SatPollChanges)
+            + " hits=" + std::to_string(g_SatModsHits)
+            + " | diag: LoadSatanicZone hook=" + std::string(g_OrigLoadSatanicZone ? "on" : "off")
+            + " calls=" + std::to_string(g_SatLoadCalls));
+        return;
+    }
+    if (a1 != "buff" && a1 != "debuff") {
+        Out("satmods: unknown '" + a1 + "' (buff | debuff | status)");
+        return;
+    }
+
+    std::set<int>& target = (a1 == "buff") ? g_SatDisabledBuffs : g_SatDisabledDebuffs;
+    target = ParseIdCsv(a2);
+    // Best-effort diagnostic hook - poll-and-correct (SatanicPollTick, driven
+    // from FrameCallback) is the real filtering mechanism and needs no hook,
+    // so a failure here is not fatal to the feature. See the comment above
+    // SatanicPollTick for why LoadSatanicZone stopped being trusted as the hook target.
+    if (!target.empty()) EnsureSatanicZoneHook();
+    Out("satmods " + a1 + ": " + std::to_string(target.size()) + " id(s) disabled");
+}
+
 // StatCmd/StatAddCmd moved to ForgePact::StatsManager (see the module includes anchor above).
 // itemjson <path> -- json_parse file -> InitItemFromJson -> json_stringify result to bp_ipc\iteminfo.json
 static void ItemJson(const std::string& path)
@@ -10242,7 +10507,7 @@ static void RunCommand(const std::string& line)
         "ping", "density", "reveal", "specialrate", "dropmult",
         "stat", "statadd", "raredrop", "droprate", "dungeonkey",
         "headhunter", "hhdur", "hhmap", "hhdefault", "hhlabel", "tyrant", "beacon", "beaconrange", "beaconmode", "beaconwake", "beaconspawn", "beaconfarstep", "tyrantchance", "tyrantaffix", "hhlabelfont", "hhlabeloffset", "hhlabelmax",
-        "enemyspeed", "rarity", "sigdrop", "angelicdrop", "relicfilter", "orbpickup"
+        "enemyspeed", "rarity", "sigdrop", "angelicdrop", "relicfilter", "orbpickup", "satmods"
     };
     if (kPlayerCommands.find(lc) == kPlayerCommands.end()) {
         Out("command unavailable in player build: " + cmd);
@@ -10648,6 +10913,8 @@ static void RunCommand(const std::string& line)
         else Out("angelicwatch: kills=" + std::to_string(g_KillsSeen) + " gameRolls=" + std::to_string(g_AngChanceCalls) + " lastChance=" + std::to_string((long long)g_AngLastChance));
     } else if (lc == "raredrop") {
         RareDropCmd(rest);
+    } else if (lc == "satmods") {
+        SatModsCmd(rest);
 #ifndef FORGEPACT_RELEASE
     } else if (lc == "socketprobe") {
         SocketProbeCmd(rest);
@@ -10928,6 +11195,7 @@ void FrameCallback(FWFrame& FrameContext)
     EstForceApply();
     ++g_HhFrame;
     if (g_HhEnabled.load() && (g_HhFrame % 120) == 0) HeadhunterActivityTick();
+    if ((fc % kSatanicPollFrames) == 0) SatanicPollTick();
     KuyrukIsle();
 #ifndef FORGEPACT_RELEASE
     CensusTick(fc);

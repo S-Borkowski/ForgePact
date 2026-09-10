@@ -15,6 +15,7 @@ panel; settings are applied live while the game runs and re-applied on every lau
 | **Combat Modifiers** | Total Damage, Attack Speed, Faster Cast Rate, Defense, Life/Mana Replenish, physical and spell Critical Chance/Damage |
 | **Character Stats** | Experience, Magic Find and Movement Speed use the character's current total value, including equipment bonuses |
 | **Full Map Reveal** | Clears fog of war in every zone (toggleable; F5 in-game also toggles it) |
+| **Satanic Zone Mods** | Pick which of the game's 25 positive / 26 negative World Section mods can roll onto a Satanic Zone; everything is on by default |
 | **Auto-apply** | Saved settings are re-sent every time the game starts |
 
 ForgePact does not write permanent stat changes into your save or modify the game exe
@@ -216,6 +217,28 @@ inventory tooltip and calls `DrawInventoryStatsNew(x, y, item, statId, label, fo
 returns the row height (30) or 0, and the caller adds the return value to its y cursor. The
 plugin draws its rows at `y`, hands the game `y + rows·30` for its own row, and returns both
 heights, so nothing overlaps and the box grows by exactly the rows added.
+
+### Satanic Zone Mods
+**World → Satanic Zone Mods** lists every World Section modifier Hero Siege can put on a
+Satanic Zone — 25 positive (buffs) and 26 negative (debuffs), names and descriptions from
+the game's own data. Everything starts enabled; deselecting one keeps the plugin from
+letting a future zone roll it, while the game still rolls the rest itself — nothing is
+forced. Positive mods keep a minimum of 3 enabled, negative mods a minimum of 2, since a
+Satanic Zone still needs a pool to draw from. Plugin command: `satmods <buff|debuff> <csv
+of disabled ids>`.
+
+No single game routine could be pinned down as "the roll" (see the research doc), so this
+does not hook one: a poll running every 15 frames off the plugin's existing frame callback
+watches `Controller_obj.satanicZoneBuff`/`satanicZoneDebuff` and, the instant either array's
+content changes, swaps out any id you disabled for a random still-enabled one — live-tested
+correcting a disabled id within one poll tick, leaving every enabled id untouched.
+
+The buff/debuff table lives in [`hs-game-sdk/curated/satanic_zone.json`](../hs-game-sdk/curated/satanic_zone.json)
+(hand-verified game knowledge, not extracted from the binary) and is shared with the rest
+of the toolkit through the generated `hs_game_sdk` bindings — see
+[`tools/generate_satanic_zone_sdk.py`](../tools/generate_satanic_zone_sdk.py). Full method
+and live findings are in
+[`docs/satanic-zone-mods-research.md`](docs/satanic-zone-mods-research.md).
 
 ### Known limitation — The Abyss
 `Spawn_Abyss_obj` is **not** supported. It is the only mechanic in its family that
