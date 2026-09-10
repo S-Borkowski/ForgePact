@@ -6693,6 +6693,83 @@ static void NAddr(const std::string& name)
     Out(buf);
 }
 
+// naddrall -- naddr, in bulk, for every script this plugin ever hooks by name
+// (kept in sync by hand with the HookOneScript("<Name>", ...) call sites and
+// the StatsManager multiplier table; NOT the full ~6000-script data.win list).
+// Answers, without a disassembler and without querying one name at a time,
+// questions like "do these two script names compile to the same native
+// address" or "what is this hook's real module+RVA right now" - e.g. for
+// checking a claim that some compiled caller reaches a hook target by a
+// route other than this script's own dispatch entry. Writes one CSV line per
+// name to bp_ipc\script_addresses.csv; a blank address means the name wasn't
+// found (removed/renamed script) rather than an error worth stopping for.
+static void NAddrAll()
+{
+    static const char* kNames[] = {
+        // HookOneScript("<Name>", ...) literal call sites across ModuleMain.cpp
+        // and the ForgePact:: headers (2026-09 review follow-up).
+        "LoadDrops", "CreateItemNew", "CreateItemInit", "GenerateItemRandomStats",
+        "GPV", "DropRelic", "DropItemAngelicChance", "draw_text_outline",
+        "cpr_irandom", "ZoneStateResetSingle", "ZoneStateResetAll",
+        "ZoneGenChaosTower", "TalentUse", "StatFasterCastRate", "SocketSetTarget",
+        "SPV", "RunItemEquipped", "RandomChaosTower",
+        "PopulateTalentStructMapNecromancer", "PathFindTakeTarget",
+        "PathFindStartPath", "PathFindScanTick", "PathFindLeashCheck",
+        "PathFindAggroBroadcast", "LootGroundCreateFromItem", "LootGroundCreate",
+        "LocalActivateDeactivateProps", "LoadSummonStats", "LoadSatanicDropTier",
+        "LoadCommonItems", "ItemEquip", "IsObtainablePlace", "IsMyPlayer",
+        "IsLoggedIn", "GetRuneword", "GetItemTooltipString", "GetItemStatString",
+        "GenerateItemSpecialStats", "EquipItemUnequip", "EnemyRaritySettings",
+        "EnemyHitRegDamageParent", "EnemyDestroyKillProc", "EnemyDestroyDeathEffects",
+        "DropUberParts", "DropRubyKey", "DropOres", "DropOreMaterials",
+        "DropMonsterGold", "DropKeys", "DropItemBoss", "DropItemAngelic",
+        "DropItem", "DropGold", "DropDungeonKeys", "DropDimensionalShard",
+        "DropChaosKey", "DropBossRunes", "DropBossParts", "DropBossGems",
+        "DropBifrostKey", "DropBattleFragments", "DropAngelicKey",
+        "DropAngelicCharm", "DrawTooltip", "DrawInventoryStatsNew", "DrawHudBuffs",
+        "DebugLogAddExt", "CreateItemDrop", "CreateEnemyFreePos", "CreateEnemyElite",
+        "CombatText", "CA_playerBuffAdd", "CA_enemyCreate", "BuffAdd",
+        "ActivateDeactivateProps",
+        // ForgePact::StatsManager's multiplier table (14-entry).
+        "StatMagicFind", "StatAttackSpeed", "StatExperienceGain",
+        "StatMovementSpeed", "CalculateEndDamage", "StatExtraGold",
+        "StatLifeReplenish", "StatManaReplenish", "StatDefense", "StatCritDamage",
+        "StatCritRate", "StatSpellCritDamage", "StatSpellCritRate",
+        "EnemyCalculateExperience",
+    };
+
+    std::ofstream f(IPC_DIR + "\\script_addresses.csv", std::ios::trunc);
+    if (!f) { Out("naddrall: cannot open bp_ipc\\script_addresses.csv"); return; }
+    f << "name,func_ptr,module,module_base,rva\n";
+
+    int found = 0, missing = 0;
+    for (const char* name : kNames) {
+        std::string full = std::string("gml_Script_") + name;
+        PVOID p = nullptr;
+        AurieStatus st = g_Yytk->GetNamedRoutinePointer(full.c_str(), &p);
+        PVOID src = nullptr;
+        if (AurieSuccess(st) && p) {
+            CScript* sc = reinterpret_cast<CScript*>(p);
+            try { src = (PVOID)sc->m_Functions->m_ScriptFunction; } catch (...) {}
+        }
+        if (!src) { f << name << ",,,,\n"; missing++; continue; }
+        HMODULE mod = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)src, &mod);
+        char modname[MAX_PATH] = { 0 };
+        if (mod) GetModuleFileNameA(mod, modname, MAX_PATH);
+        char line[700];
+        sprintf_s(line, "%s,%p,%s,%p,0x%llX\n",
+            name, src, modname, (void*)mod,
+            (unsigned long long)((char*)src - (char*)mod));
+        f << line;
+        found++;
+    }
+    f.close();
+    char summary[128];
+    sprintf_s(summary, "naddrall: %d found, %d missing -> bp_ipc\\script_addresses.csv", found, missing);
+    Out(summary);
+}
+
 // Spawn an item: json_parse the file -> InitItemFromJson -> LootGroundCreateFromItem at player.
 static void SpawnItem(const std::string& path)
 {
@@ -10398,6 +10475,8 @@ static void RunCommand(const std::string& line)
     } else if (lc == "naddr") {
         std::string n = rest; while (!n.empty() && (n.back()=='\r'||n.back()=='\n'||n.back()==' ')) n.pop_back();
         NAddr(n);
+    } else if (lc == "naddrall") {
+        NAddrAll();
     } else if (lc == "sweep") {
         std::stringstream s(rest); int lo=0, hi=0, slot=0; s >> lo >> hi; if (!(s >> slot)) slot = 0;
         g_SweepLo = lo; g_SweepHi = hi; g_SweepSlot = slot; g_SweepArmed = true;
