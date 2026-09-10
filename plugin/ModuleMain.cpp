@@ -6770,6 +6770,40 @@ static void NAddrAll()
     Out(summary);
 }
 
+// naddrorig <ScriptName> -- naddr/naddrall report the CURRENT native function
+// pointer for a script, which for anything this plugin hooks unconditionally
+// at startup (Headhunter's kill hook among them, since HeadhunterAutoArm()
+// runs from InstallHook() every launch) is already this plugin's OWN hook
+// function, not the game's original compiled code - by the time a command can
+// even be sent, the swap has already happened. This reports the TRUE vanilla
+// address instead, from the g_Orig_* pointer HookOneScript captured before
+// installing that hook. Only knows the names below; add an entry to check
+// another always-armed hook the same way.
+static void NAddrOrig(const std::string& name)
+{
+    struct Entry { const char* name; PFUNC_YYGMLScript ptr; };
+    const Entry table[] = {
+        { "EnemyDestroyKillProc", g_Orig_EnemyDestroyKillProc },
+        { "DropRelic",            g_Orig_DropRelic },
+    };
+    for (const auto& e : table) {
+        if (name != e.name) continue;
+        PVOID src = (PVOID)e.ptr;
+        if (!src) { Out("naddrorig " + name + ": not captured yet (hook not installed)"); return; }
+        HMODULE mod = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)src, &mod);
+        char modname[MAX_PATH] = { 0 };
+        if (mod) GetModuleFileNameA(mod, modname, MAX_PATH);
+        char buf[600];
+        sprintf_s(buf, "naddrorig %s: orig_func=%p modbase=%p rva=0x%llX mod=%s",
+            name.c_str(), src, (void*)mod,
+            (unsigned long long)((char*)src - (char*)mod), modname);
+        Out(buf);
+        return;
+    }
+    Out("naddrorig " + name + ": no known orig pointer registered for this name");
+}
+
 // Spawn an item: json_parse the file -> InitItemFromJson -> LootGroundCreateFromItem at player.
 static void SpawnItem(const std::string& path)
 {
@@ -10477,6 +10511,9 @@ static void RunCommand(const std::string& line)
         NAddr(n);
     } else if (lc == "naddrall") {
         NAddrAll();
+    } else if (lc == "naddrorig") {
+        std::string n = rest; while (!n.empty() && (n.back()=='\r'||n.back()=='\n'||n.back()==' ')) n.pop_back();
+        NAddrOrig(n);
     } else if (lc == "sweep") {
         std::stringstream s(rest); int lo=0, hi=0, slot=0; s >> lo >> hi; if (!(s >> slot)) slot = 0;
         g_SweepLo = lo; g_SweepHi = hi; g_SweepSlot = slot; g_SweepArmed = true;
