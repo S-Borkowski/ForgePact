@@ -21,6 +21,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <YYToolkit/YYTK_Shared.hpp>
+#include <hs_game_sdk/hs_game_sdk.hpp>
 #include <windows.h>
 #include <algorithm>
 #include <fstream>
@@ -173,6 +174,15 @@ static std::string Lower(std::string s)
     for (auto& c : s) c = (char)std::tolower((unsigned char)c);
     return s;
 }
+
+// A game-memory-read RValue (e.g. an item's droprate.base) can come back as an
+// inf/NaN/huge double when an index/offset is stale after a game update.
+// %f/%.0f on such a value expands to hundreds of characters and overruns a
+// fixed sprintf_s buffer, which makes the CRT abort the whole process
+// (0xC0000409 / STATUS_STACK_BUFFER_OVERRUN).  Route every game-supplied
+// double through this before handing it to a %f-style sprintf_s so a bad
+// read degrades the printed number instead of crashing the game.
+static inline double SafeF(double v) { return std::isfinite(v) ? v : 0.0; }
 
 static std::string Describe(const RValue& v)
 {
@@ -1426,18 +1436,17 @@ static RValue& HookElite(CInstance* S, CInstance* O, RValue& R, int argc, RValue
 
 static bool HookOneScript(const char* shortName, const char* id, PVOID dest, PFUNC_YYGMLScript* origOut)
 {
+    UNREFERENCED_PARAMETER(id);
     std::string full = std::string("gml_Script_") + shortName;
     PVOID p = nullptr;
     AurieStatus st = g_Yytk->GetNamedRoutinePointer(full.c_str(), &p);
     if (!AurieSuccess(st) || !p) { Out(std::string("hook ") + shortName + ": not found st=" + std::to_string((int)st)); return false; }
     CScript* sc = reinterpret_cast<CScript*>(p);
-    PVOID src = nullptr;
-    try { src = (PVOID)sc->m_Functions->m_ScriptFunction; } catch (...) {}
-    if (!src) { Out(std::string("hook ") + shortName + ": null src"); return false; }
-    PVOID tramp = nullptr;
-    AurieStatus hs = MmCreateHook(g_ArSelfModule, id, src, dest, &tramp);
-    if (!AurieSuccess(hs)) { Out(std::string("hook ") + shortName + ": MmCreateHook failed st=" + std::to_string((int)hs)); return false; }
-    *origOut = reinterpret_cast<PFUNC_YYGMLScript>(tramp);
+    if (!sc || !sc->m_Functions) { Out(std::string("hook ") + shortName + ": null functions"); return false; }
+    if (origOut && !*origOut) {
+        *origOut = sc->m_Functions->m_ScriptFunction;
+    }
+    sc->m_Functions->m_ScriptFunction = reinterpret_cast<PFUNC_YYGMLScript>(dest);
     Out(std::string("HOOK INSTALLED on ") + shortName);
     return true;
 }
@@ -3122,7 +3131,67 @@ static bool RefreshItemHash(const RValue& item, std::string* howOut = nullptr)
     return false;
 }
 
-static bool RepoStruct(int kategori, int indeks, RValue& out);   // defined with the drop groups below
+// --- Esya dusus sansi (droprate) ve Repository tanimlari ---------------------
+// Verified Season 10 repository sizes for the supported build.  Unknown and
+// empty categories fail closed.  Do not probe past these bounds:
+// GetNormalRepoStruct raises a runner-level array error before C++ can catch it.
+static constexpr int kSeason10RepoCounts[] = {
+    15, 20, 15, 0, 20, 25, 18, 30, 15, 0,
+    60, 27, 44, 65, 74, 200, 156, 0, 16, 7,
+};
+static constexpr bool RepoIndexValid(int kategori, int indeks)
+{
+    return kategori >= 0
+        && kategori < static_cast<int>(sizeof(kSeason10RepoCounts) / sizeof(kSeason10RepoCounts[0]))
+        && indeks >= 0
+        && indeks < kSeason10RepoCounts[kategori];
+}
+static constexpr int kSeason10RelicRepoCount = kSeason10RepoCounts[16];
+static_assert(RepoIndexValid(16, 155));
+static_assert(!RepoIndexValid(16, 156));
+static_assert(RepoIndexValid(15, 199));
+static_assert(!RepoIndexValid(15, 200));
+static_assert(!RepoIndexValid(3, 0));
+
+static bool RepoStruct(int kategori, int indeks, RValue& out)
+{
+    if (!RepoIndexValid(kategori, indeks)) return false;
+    try {
+        out = g_Yytk->CallGameScript("gml_Script_GetNormalRepoStruct",
+                                     { RValue((double)kategori), RValue(0.0), RValue((double)indeks) });
+        return out.m_Kind == VALUE_OBJECT;
+    } catch (...) { return false; }
+}
+
+static std::string RepoAd(RValue& st)
+{
+    try {
+        RValue info = g_Yytk->CallBuiltin("variable_struct_get", { st, RValue("itemBaseInfoStruct") });
+        if (info.m_Kind != VALUE_OBJECT) return "?";
+        RValue nm = g_Yytk->CallBuiltin("variable_struct_get", { info, RValue("28") });
+        return nm.ToString();
+    } catch (...) { return "?"; }
+}
+
+static std::map<int, double> g_DropRateVanilya;
+static double VanilyaBase(int kategori, int indeks, RValue& st, RValue& drOut)
+{
+    drOut = g_Yytk->CallBuiltin("variable_struct_get", { st, RValue("droprate") });
+    if (drOut.m_Kind != VALUE_OBJECT) return -1.0;
+    RValue simdi = g_Yytk->CallBuiltin("variable_struct_get", { drOut, RValue("base") });
+    int anahtar = kategori * 1000 + indeks;
+    auto it = g_DropRateVanilya.find(anahtar);
+    if (it == g_DropRateVanilya.end()) {
+        // A stale index/offset can hand back garbage (NaN/inf) here; cache -1 so
+        // every caller's existing "vanilya <= 0.0 -> skip" guard also rejects it,
+        // instead of writing/printing a non-finite droprate.base.
+        double v = simdi.ToDouble();
+        if (!std::isfinite(v)) v = -1.0;
+        g_DropRateVanilya[anahtar] = v;
+        return v;
+    }
+    return it->second;
+}
 
 // ---- socket share ----------------------------------------------------------------------
 // Socket bonuses reach itemStatStruct only through GenerateItemSpecialStats(item, def),
@@ -3406,6 +3475,46 @@ static bool TryApplyCustomForge(RValue* candidate, bool finalPass = false)
         }
     } catch (...) {}
     return false;
+}
+
+// ===== Object-Oriented Mod Component: RelicFilterManager =====
+class RelicFilterManager {
+public:
+    static RelicFilterManager& Instance() {
+        static RelicFilterManager s_Instance;
+        return s_Instance;
+    }
+
+    bool IsEnabled() const { return m_Enabled.load(); }
+    void SetEnabled(bool enabled) { m_Enabled.store(enabled); }
+
+    void GetPlayerMaxedRelics(std::unordered_set<int>& outMaxed) const;
+
+private:
+    std::atomic<bool> m_Enabled{ false };
+};
+
+static std::atomic<bool> g_FilterMaxRelics{ false };
+// Set when `relicfilter 1` arrives before a player exists; the frame callback
+// installs the DropRelic hook later (see FrameCallback).
+static std::atomic<bool> g_RelicFilterPending{ false };
+static bool HhResolveLocalPlayer(RValue& out, std::string* how = nullptr);
+
+inline void RelicFilterManager::GetPlayerMaxedRelics(std::unordered_set<int>& outMaxed) const
+{
+    outMaxed.clear();
+    if (!m_Enabled.load()) return;
+    try {
+        RValue player;
+        if (!HhResolveLocalPlayer(player)) return;
+        outMaxed = HeroSiege::Player::GetMaxedRelicIds(g_Yytk, player);
+    } catch (...) {}
+}
+
+static void GetPlayerMaxedRelics(std::unordered_set<int>& outMaxed)
+{
+    RelicFilterManager::Instance().SetEnabled(g_FilterMaxRelics.load());
+    RelicFilterManager::Instance().GetPlayerMaxedRelics(outMaxed);
 }
 
 static void CustomForgePostProcess(RValue& result, int argc, RValue** args, bool finalPass)
@@ -3781,23 +3890,54 @@ static void HhDrawOutlinedWorld(double x, double y, const std::string& text, con
 static double g_HhLabelOffsetPx = 150.0;  // GUI pixels above the player's bounding box top (tuned live 2026-09-05)
 // The local player as an RValue usable with variable_instance_get: the game's own
 // GetMyPlayer() first, then the first Player_obj instance.  Returns false if none.
-static bool HhResolveLocalPlayer(RValue& out, std::string* how = nullptr)
+// Is this RValue something the callers can actually read variables from?
+// Proved by doing exactly what they will do, rather than by trusting a kind tag.
+static bool HhUsableInstance(const RValue& v)
+{
+    if (v.m_Kind != VALUE_OBJECT && v.m_Kind != VALUE_REF) return false;
+    try {
+        RValue x = g_Yytk->CallBuiltin("variable_instance_get", { v, RValue("x") });
+        return x.m_Kind == VALUE_REAL || x.m_Kind == VALUE_INT32 || x.m_Kind == VALUE_INT64;
+    } catch (...) { return false; }
+}
+
+static bool HhResolveLocalPlayer(RValue& out, std::string* how)
 {
     try {
         CInstance* g = nullptr; g_Yytk->GetGlobalInstance(&g);
         RValue p;
         AurieStatus st = g_Yytk->CallGameScriptEx(p, "gml_Script_GetMyPlayer", g, g, {});
-        if (AurieSuccess(st) && (p.m_Kind == VALUE_REAL || p.m_Kind == VALUE_INT32 || p.m_Kind == VALUE_INT64 || p.m_Kind == VALUE_REF || p.m_Kind == VALUE_OBJECT)) {
-            RValue ex = g_Yytk->CallBuiltin("instance_exists", { p });
-            if (ex.ToBoolean()) { out = p; if (how) *how = "GetMyPlayer"; return true; }
+        if (AurieSuccess(st) && HhUsableInstance(p)) {
+            out = p;
+            if (how) *how = "GetMyPlayer";
+            return true;
         }
     } catch (...) {}
     try {
         RValue obj = g_Yytk->CallBuiltin("asset_get_index", { RValue("Player_obj") });
         if (obj.ToDouble() >= 0) {
             RValue inst = g_Yytk->CallBuiltin("instance_find", { obj, RValue(0.0) });
-            RValue ex = g_Yytk->CallBuiltin("instance_exists", { inst });
-            if (ex.ToBoolean()) { out = inst; if (how) *how = "instance_find(Player_obj)"; return true; }
+            // MEASURED 2026-09-10: this runner returns an instance REFERENCE
+            // (VALUE_REF, kind 15) here, not a number.  The old code accepted
+            // only VALUE_REAL/INT32/INT64, so this fallback ALWAYS failed and
+            // every feature gated on the local player silently did nothing -
+            // orbpickup logged seen=176993 with noplayer=176993, and the relic
+            // filter never armed.  A reference is passed straight through;
+            // variable_instance_get accepts it.
+            if (HhUsableInstance(inst)) {
+                out = inst;
+                if (how) *how = "instance_find(Player_obj)";
+                return true;
+            }
+            // Older runners hand back a bare instance id.
+            if (inst.m_Kind == VALUE_REAL || inst.m_Kind == VALUE_INT32 || inst.m_Kind == VALUE_INT64) {
+                CInstance* player = nullptr;
+                if (AurieSuccess(g_Yytk->GetInstanceObject((int32_t)inst.ToDouble(), player)) && player) {
+                    out = player->ToRValue();
+                    if (how) *how = "instance_find(Player_obj) id";
+                    return true;
+                }
+            }
         }
     } catch (...) {}
     if (how) *how = "none";
@@ -4408,10 +4548,45 @@ static RValue& Hook_LocalActivateDeactivateProps(CInstance* S, CInstance* O, RVa
 static bool g_BeSpawnNear = false;   // experimental: spawners in this zone type had already given birth at load; off by default
 static long g_BeSpawnLies = 0;
 static TRoutine g_OrigDistanceToObject = nullptr;
+static bool g_DistanceHookAttempted = false;
+static std::atomic<bool> g_OrbPickupRadius{ false };
+static constexpr double kOrbPickupFactor = 10.0;
+
+// MEASURED 2026-09-09: the globes do NOT reach the player through
+// distance_to_object - with the player and all four globe objects resolved
+// correctly, a full session shortened exactly 0 distance checks.  Each globe
+// instead runs its own step script (gml_Script_ExpGlobeStepMain /
+// gml_Script_MFGlobeStepMain, SDK script indices 1804 / 1805), so the pickup
+// radius is widened by hooking those and pulling the globe toward the player
+// ourselves.  That needs no knowledge of the script's internal variables: once
+// the globe is close enough, the game's own pickup logic fires normally.
+static volatile long g_OrbPickupHits = 0;   // globes pulled
+// "pulled 0 globes" has several very different causes, so each one is counted:
+// the hook never firing is a different bug from the hook firing with no player
+// or with every globe out of reach.
+static volatile long g_OrbNoPlayer  = 0;    // globe found, but no player position
+static std::string g_OrbPlayerHow = "(not tried)";   // which resolver found the player
+static volatile long g_OrbOutOfReach = 0;   // ...but the globe was too far
+static volatile long g_OrbNearestPx = -1;   // closest globe seen, in px
+// The player position, refreshed once per frame by the frame callback, so a
+// globe's step hook costs no player lookup of its own.
+static std::atomic<bool> g_PlayerPosValid{ false };
+static double g_PlayerX = 0.0, g_PlayerY = 0.0;
+// Vanilla globe pickup radius is roughly a tile; x10 is what the panel asks for.
+static constexpr double kGlobeBaseRadius = 48.0;
+// Constant velocity, not an accelerating ramp: the earlier version sped up as the
+// globe closed in and snapped the last stretch in a single frame once step >= d,
+// which read as an unnatural teleport right before pickup (user report
+// 2026-09-10: "make the orbs come a little slower ... like it is done normally").
+// A fixed px/frame speed glides in steadily instead, arriving smoothly (the same
+// step >= d check now only prevents overshooting past the player).
+static constexpr double kGlobePullSpeed  = 6.0;    // px per frame, constant
+
 static void Hook_distance_to_object(RValue& Result, CInstance* S, CInstance* O, int argc, RValue* Args)
 {
     if (g_OrigDistanceToObject) g_OrigDistanceToObject(Result, S, O, argc, Args);
-    if (!g_BeSpawnNear || !S || !BeaconActive()) return;
+
+    if (!g_BeSpawnNear || !S || !BeaconActive()) return;   // native pass-through
     try {
         RValue inst = S->ToRValue();
         RValue oi = g_Yytk->CallBuiltin("variable_instance_get", { inst, RValue("object_index") });
@@ -4433,12 +4608,119 @@ static void InstallBeaconHook()
 {
     if (g_BeHookAttempted) return;
     g_BeHookAttempted = true;
-    HookBuiltin("distance_to_object", "fp_beacon_dist", (PVOID)Hook_distance_to_object, &g_OrigDistanceToObject);
+    if (!g_DistanceHookAttempted) {
+        g_DistanceHookAttempted = true;
+        HookBuiltin("distance_to_object", "fp_beacon_dist", (PVOID)Hook_distance_to_object, &g_OrigDistanceToObject);
+    }
     bool a = HookOneScript("PathFindScanTick",   "fp_beacon_scan",  (PVOID)Hook_PathFindScanTick,   &g_Orig_PathFindScanTick);
     bool b = HookOneScript("PathFindLeashCheck", "fp_beacon_leash", (PVOID)Hook_PathFindLeashCheck, &g_Orig_PathFindLeashCheck);
     HookOneScript("ActivateDeactivateProps",      "fp_beacon_wake",  (PVOID)Hook_ActivateDeactivateProps,      &g_Orig_ActivateDeactivateProps);
     HookOneScript("LocalActivateDeactivateProps", "fp_beacon_wakel", (PVOID)Hook_LocalActivateDeactivateProps, &g_Orig_LocalActivateDeactivateProps);
     g_BeHookInstalled = a && b;
+}
+
+// ---- orb (globe) pickup radius --------------------------------------------
+// One hook body for both globe types: run the game's own step first, then pull
+// the globe toward the player if it is inside the widened radius.  Globes are
+// few (tens on screen at most), so the four runner calls per globe per step are
+// nothing like hooking distance_to_object, which every spawner calls.
+// MEASURED 2026-09-10: hooking the globe step scripts does NOT work either -
+// both hooks installed (exp=yes, mf=yes) and the body ran 0 times, so the globes'
+// step logic is not dispatched through those script-table entries.  Two failed
+// interception points is enough: the pull is now driven from the frame callback,
+// which is known to run (the stall watchdog heartbeats prove it), by enumerating
+// the globe instances directly.  Nothing about how the game dispatches globe
+// behaviour matters any more.
+static int g_PlayerObjIdx = -1;
+static std::vector<int> g_GlobeObjIdx;
+static bool g_OrbAssetsResolved = false;
+static volatile long g_OrbGlobesSeen = 0;
+
+// The name is what gets looked up at runtime, so an index shift after a game
+// patch cannot break it; the SDK constant alongside makes a rename a build error.
+struct OrbAsset { const char* name; HeroSiege::Objects::GameObject sdk; };
+static constexpr OrbAsset kOrbAssets[] = {
+    { "Experienceglobe_obj",        HeroSiege::Objects::GameObject::Experienceglobe_obj },
+    { "Magic_Find_Globe_obj",       HeroSiege::Objects::GameObject::Magic_Find_Globe_obj },
+};
+
+static void ResolveOrbAssets()
+{
+    if (g_OrbAssetsResolved) return;
+    g_OrbAssetsResolved = true;
+    auto assetIndex = [](const char* name, HeroSiege::Objects::GameObject fallback) -> int {
+        try {
+            const int i = (int)g_Yytk->CallBuiltin("asset_get_index", { RValue(std::string(name)) }).ToDouble();
+            if (i >= 0) return i;
+        } catch (...) {}
+        return (int)fallback;   // name gone: the SDK's index is the best guess left
+    };
+    g_PlayerObjIdx = assetIndex("Player_obj", HeroSiege::Objects::GameObject::Player_obj);
+    for (const OrbAsset& a : kOrbAssets) {
+        const int i = assetIndex(a.name, a.sdk);
+        if (i >= 0) g_GlobeObjIdx.push_back(i);
+    }
+}
+
+static void PullOneGlobe(const RValue& inst)
+{
+    if (!g_PlayerPosValid.load()) { InterlockedIncrement(&g_OrbNoPlayer); return; }
+    try {
+        const double gx = g_Yytk->CallBuiltin("variable_instance_get", { inst, RValue("x") }).ToDouble();
+        const double gy = g_Yytk->CallBuiltin("variable_instance_get", { inst, RValue("y") }).ToDouble();
+        const double dx = g_PlayerX - gx, dy = g_PlayerY - gy;
+        const double d2 = dx * dx + dy * dy;
+        const double reach = kGlobeBaseRadius * kOrbPickupFactor;
+        if (std::isfinite(d2)) {
+            const long px = (long)std::sqrt(d2);
+            if (g_OrbNearestPx < 0 || px < g_OrbNearestPx) g_OrbNearestPx = px;
+        }
+        if (d2 > reach * reach) { InterlockedIncrement(&g_OrbOutOfReach); return; }
+        if (d2 < 1.0) return;                         // already on the player
+        const double d = std::sqrt(d2);
+        // Constant speed toward the player; clamp to 1.0 only so the last frame
+        // lands exactly on the player instead of overshooting past it.
+        const double t = (kGlobePullSpeed >= d) ? 1.0 : (kGlobePullSpeed / d);
+        g_Yytk->CallBuiltin("variable_instance_set", { inst, RValue("x"), RValue(gx + dx * t) });
+        g_Yytk->CallBuiltin("variable_instance_set", { inst, RValue("y"), RValue(gy + dy * t) });
+        InterlockedIncrement(&g_OrbPickupHits);
+    } catch (...) {}
+}
+
+// Called once per frame from FrameCallback while the mod is on.  Globes are few
+// (tens on screen at worst), and the per-frame cost is one instance_number per
+// globe object plus four calls per globe actually present.
+static void OrbPickupTick()
+{
+    ResolveOrbAssets();
+    if (g_GlobeObjIdx.empty()) return;
+    int budget = 64;                       // a runaway globe count cannot cost a frame
+    for (int objIdx : g_GlobeObjIdx) {
+        int n = 0;
+        try { n = (int)g_Yytk->CallBuiltin("instance_number", { RValue((double)objIdx) }).ToDouble(); }
+        catch (...) { continue; }
+        for (int i = 0; i < n && budget > 0; ++i, --budget) {
+            try {
+                RValue inst = g_Yytk->CallBuiltin("instance_find", { RValue((double)objIdx), RValue((double)i) });
+                if (inst.m_Kind == VALUE_UNDEFINED) continue;
+                InterlockedIncrement(&g_OrbGlobesSeen);
+                PullOneGlobe(inst);
+            } catch (...) {}
+        }
+    }
+}
+
+// Reads as a decision tree: seen=0 while standing next to globes means the object
+// indices are wrong; seen>0 with noplayer>0 means the player never resolved;
+// only outofreach means the radius is simply too small (nearest= says by how much).
+static void OrbPickupStats()
+{
+    char b[300];
+    sprintf_s(b, "orbpickup stat: globe objs=%zu | seen=%ld pulled=%ld noplayer=%ld outofreach=%ld | nearest=%ld px (reach %.0f px) | player via %s",
+              g_GlobeObjIdx.size(),
+              g_OrbGlobesSeen, g_OrbPickupHits, g_OrbNoPlayer, g_OrbOutOfReach,
+              g_OrbNearestPx, kGlobeBaseRadius * kOrbPickupFactor, g_OrbPlayerHow.c_str());
+    Out(b);
 }
 static void BeaconStatus()
 {
@@ -5421,7 +5703,151 @@ static RValue& Hook_CombatText(CInstance* S, CInstance* O, RValue& R, int argc, 
     return g_OrigCombatText ? g_OrigCombatText(S, O, R, argc, kullan) : R;
 }
 
-DROP_HOOK(DropRelic)
+// ===== Relic Drop Pool Filter Mod (Remove owned relics from drop pool) =====
+static PFUNC_YYGMLScript g_Orig_DropRelic = nullptr;
+static volatile long g_cnt_DropRelic = 0;
+static int g_mult_DropRelic = 1;
+
+static void ScanItemForMaxRelic(const RValue& item, std::unordered_set<int>& outMaxed)
+{
+    try {
+        if (item.m_Kind != VALUE_OBJECT || !item.m_Object) return;
+        RValue hasB = g_Yytk->CallBuiltin("variable_struct_exists", { item, RValue("b") });
+        if (!hasB.ToBoolean()) return;
+        RValue bVal = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("b") });
+        if (bVal.m_Kind != VALUE_REAL && bVal.m_Kind != VALUE_INT32 && bVal.m_Kind != VALUE_INT64) return;
+        int b = static_cast<int>(bVal.ToDouble());
+        if (b < 0 || b >= kSeason10RelicRepoCount) return;
+
+        bool isRelic = false;
+        double level = 0.0;
+
+        RValue hasCls = g_Yytk->CallBuiltin("variable_struct_exists", { item, RValue("cls") });
+        if (hasCls.ToBoolean()) {
+            RValue clsVal = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("cls") });
+            if (static_cast<int>(clsVal.ToDouble()) == 16) isRelic = true;
+        }
+
+        RValue hasG = g_Yytk->CallBuiltin("variable_struct_exists", { item, RValue("g") });
+        if (hasG.ToBoolean()) {
+            RValue gVal = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("g") });
+            int g = static_cast<int>(gVal.ToDouble());
+            if (g >= 10 && g <= 14) isRelic = true;
+        }
+
+        RValue hasO = g_Yytk->CallBuiltin("variable_struct_exists", { item, RValue("o") });
+        if (hasO.ToBoolean()) {
+            RValue oVal = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("o") });
+            level = oVal.ToDouble();
+        }
+        RValue hasRL = g_Yytk->CallBuiltin("variable_struct_exists", { item, RValue("relicLevel") });
+        if (hasRL.ToBoolean()) {
+            RValue rlVal = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("relicLevel") });
+            if (rlVal.ToDouble() > level) level = rlVal.ToDouble();
+            isRelic = true;
+        }
+
+        if (isRelic && level >= 10.0) {
+            outMaxed.insert(b);
+        }
+    } catch (...) {}
+}
+
+static void ScanContainerForMaxRelics(const RValue& container, std::unordered_set<int>& outMaxed, int depth = 0)
+{
+    if (depth > 5) return;
+    try {
+        if (container.m_Kind == VALUE_OBJECT && container.m_Object) {
+            ScanItemForMaxRelic(container, outMaxed);
+            RValue names = g_Yytk->CallBuiltin("variable_struct_get_names", { container });
+            if (names.m_Kind == VALUE_ARRAY) {
+                int count = static_cast<int>(g_Yytk->CallBuiltin("array_length", { names }).ToDouble());
+                for (int i = 0; i < count; ++i) {
+                    RValue key = g_Yytk->CallBuiltin("array_get", { names, RValue(static_cast<double>(i)) });
+                    RValue child = g_Yytk->CallBuiltin("variable_struct_get", { container, key });
+                    ScanContainerForMaxRelics(child, outMaxed, depth + 1);
+                }
+            }
+        } else if (container.m_Kind == VALUE_ARRAY) {
+            int len = static_cast<int>(g_Yytk->CallBuiltin("array_length", { container }).ToDouble());
+            for (int i = 0; i < len; ++i) {
+                RValue child = g_Yytk->CallBuiltin("array_get", { container, RValue(static_cast<double>(i)) });
+                ScanContainerForMaxRelics(child, outMaxed, depth + 1);
+            }
+        }
+    } catch (...) {}
+}
+
+static RValue& Hook_DropRelic(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A) {
+    BP_DIAG_INCREMENT(g_cnt_DropRelic);
+
+    std::unordered_set<int> maxedRelics;
+    std::vector<std::pair<int, double>> modifiedBases;
+
+    if (g_FilterMaxRelics.load()) {
+        GetPlayerMaxedRelics(maxedRelics);
+
+        if (!maxedRelics.empty() && maxedRelics.size() < static_cast<size_t>(kSeason10RelicRepoCount)) {
+            for (int rId : maxedRelics) {
+                if (!RepoIndexValid(16, rId)) continue;
+                RValue st;
+                if (!RepoStruct(16, rId, st)) continue;
+                try {
+                    RValue dr = g_Yytk->CallBuiltin("variable_struct_get", { st, RValue("droprate") });
+                    if (dr.m_Kind == VALUE_OBJECT) {
+                        RValue curBase = g_Yytk->CallBuiltin("variable_struct_get", { dr, RValue("base") });
+                        modifiedBases.push_back({ rId, curBase.ToDouble() });
+                        g_Yytk->CallBuiltin("variable_struct_set", { dr, RValue("base"), RValue(1e18) });
+                    }
+                } catch (...) {}
+            }
+        }
+    }
+
+    for (int i = 1; i < g_mult_DropRelic; i++) {
+        RValue t;
+        if (g_Orig_DropRelic) g_Orig_DropRelic(S, O, t, argc, A);
+    }
+    RValue& _res = g_Orig_DropRelic ? g_Orig_DropRelic(S, O, R, argc, A) : R;
+
+    for (const auto& p : modifiedBases) {
+        RValue st;
+        if (RepoStruct(16, p.first, st)) {
+            try {
+                RValue dr = g_Yytk->CallBuiltin("variable_struct_get", { st, RValue("droprate") });
+                if (dr.m_Kind == VALUE_OBJECT) {
+                    g_Yytk->CallBuiltin("variable_struct_set", { dr, RValue("base"), RValue(p.second) });
+                }
+            } catch (...) {}
+        }
+    }
+
+    // Secondary guarantee: If dropped result or instance is in maxedRelics, reroll to unmaxed relic
+    if (g_FilterMaxRelics.load() && !maxedRelics.empty() && maxedRelics.size() < static_cast<size_t>(kSeason10RelicRepoCount)) {
+        std::vector<int> validRelics;
+        for (int i = 0; i < kSeason10RelicRepoCount; ++i) {
+            if (maxedRelics.find(i) == maxedRelics.end()) {
+                validRelics.push_back(i);
+            }
+        }
+        if (!validRelics.empty()) {
+            try {
+                if (_res.m_Kind == VALUE_OBJECT && _res.m_Object) {
+                    if (g_Yytk->CallBuiltin("variable_struct_exists", { _res, RValue("b") }).ToBoolean()) {
+                        int b = static_cast<int>(g_Yytk->CallBuiltin("variable_struct_get", { _res, RValue("b") }).ToDouble());
+                        if (maxedRelics.find(b) != maxedRelics.end()) {
+                            int pick = validRelics[std::rand() % validRelics.size()];
+                            g_Yytk->CallBuiltin("variable_struct_set", { _res, RValue("b"), RValue(static_cast<double>(pick)) });
+                        }
+                    }
+                }
+            } catch (...) {}
+        }
+    }
+
+    BP_LOGDROP("DropRelic", _res, argc, A);
+    return _res;
+}
 DROP_HOOK(DropBossGems)
 DROP_HOOK(DropDungeonKeys)
 DROP_HOOK(DropBossRunes)
@@ -6435,6 +6861,13 @@ static void InstallHook()
     }
     g_Base = (uintptr_t)GetModuleHandleA(nullptr);
 
+#ifdef FORGEPACT_RELEASE
+    // Yayin derlemesi: arastirma kancasi ve teshis gunlugu yok.
+    // Functional hooks are installed on-demand when commands arrive.
+    g_HookInstalled = true;
+    Out("BloodPact: yayin modu (density + ozel icerik + minimap)");
+    return;
+#else
     // Load the editor-authored sidecar before choosing the release hook set.
     // This remains inert when the user has not forged any custom items.
     LoadCustomForgeEntries();
@@ -6445,20 +6878,10 @@ static void InstallHook()
     if (g_SigDropPct > 0.0 || g_AngelicDropOneIn > 0.0) InstallHeadhunterHook();   // kill hook carries the signature and angelic drops
 
     // Development builds install the complete research surface eagerly.
-    // Player builds install only the functional hook group requested by a
-    // non-vanilla command (density/specialrate/dropmult).
-#ifndef FORGEPACT_RELEASE
     InstallCreateHooks();
     InstallDropMultHooks();
     InstallNecroBalanceHooks();
-#endif
 
-#ifdef FORGEPACT_RELEASE
-    // Yayin derlemesi: arastirma kancasi ve teshis gunlugu yok.
-    g_HookInstalled = true;
-    Out("BloodPact: yayin modu (density + ozel icerik + minimap)");
-    return;
-#else
     PVOID p = nullptr;
     AurieStatus st = g_Yytk->GetNamedRoutinePointer("gml_Script_GetBloodPactInfo", &p);
     if (!AurieSuccess(st) || !p) { Out("InstallHook: cannot find GetBloodPactInfo st=" + std::to_string((int)st)); return; }
@@ -8771,65 +9194,6 @@ static void CensusTick(unsigned long long fc)
 //   keys_key 100 | keys_crystal_key 400 | keys_chaos_key 2700 | keys_bifrost_key 32750
 // Bu alan yazilabilir; cagriyi cogaltmak yerine zarin kendisini degistiriyoruz.
 static int g_DropRateKat = 12;   // 12 = Keys
-// Verified Season 10 repository sizes for the supported build.  Unknown and
-// empty categories fail closed.  Do not probe past these bounds:
-// GetNormalRepoStruct raises a runner-level array error before C++ can catch it.
-static constexpr int kSeason10RepoCounts[] = {
-    15, 20, 15, 0, 20, 25, 18, 30, 15, 0,
-    60, 27, 44, 65, 74, 200, 156, 0, 16, 7,
-};
-static constexpr bool RepoIndexValid(int kategori, int indeks)
-{
-    return kategori >= 0
-        && kategori < static_cast<int>(sizeof(kSeason10RepoCounts) / sizeof(kSeason10RepoCounts[0]))
-        && indeks >= 0
-        && indeks < kSeason10RepoCounts[kategori];
-}
-static constexpr int kSeason10RelicRepoCount = kSeason10RepoCounts[16];
-static_assert(RepoIndexValid(16, 155));
-static_assert(!RepoIndexValid(16, 156));
-static_assert(RepoIndexValid(15, 199));
-static_assert(!RepoIndexValid(15, 200));
-static_assert(!RepoIndexValid(3, 0));
-// Vanilya droprate.base degerleri - carpan HER ZAMAN bunlardan hesaplanir,
-// yoksa ust uste uygulayinca 5x5=25 olur.  Anahtar: kategori*1000 + indeks.
-static std::map<int, double> g_DropRateVanilya;
-
-static bool RepoStruct(int kategori, int indeks, RValue& out)
-{
-    if (!RepoIndexValid(kategori, indeks)) return false;
-    try {
-        out = g_Yytk->CallGameScript("gml_Script_GetNormalRepoStruct",
-                                     { RValue((double)kategori), RValue(0.0), RValue((double)indeks) });
-        return out.m_Kind == VALUE_OBJECT;
-    } catch (...) { return false; }
-}
-
-// Esyanin ic adi: itemBaseInfoStruct["28"]
-static std::string RepoAd(RValue& st)
-{
-    try {
-        RValue info = g_Yytk->CallBuiltin("variable_struct_get", { st, RValue("itemBaseInfoStruct") });
-        if (info.m_Kind != VALUE_OBJECT) return "?";
-        RValue nm = g_Yytk->CallBuiltin("variable_struct_get", { info, RValue("28") });
-        return nm.ToString();
-    } catch (...) { return "?"; }
-}
-
-// Esyanin VANILYA base degeri.  Ilk cagrida o anki deger saklanir.
-static double VanilyaBase(int kategori, int indeks, RValue& st, RValue& drOut)
-{
-    drOut = g_Yytk->CallBuiltin("variable_struct_get", { st, RValue("droprate") });
-    if (drOut.m_Kind != VALUE_OBJECT) return -1.0;
-    RValue simdi = g_Yytk->CallBuiltin("variable_struct_get", { drOut, RValue("base") });
-    int anahtar = kategori * 1000 + indeks;
-    auto it = g_DropRateVanilya.find(anahtar);
-    if (it == g_DropRateVanilya.end()) {
-        g_DropRateVanilya[anahtar] = simdi.ToDouble();
-        return simdi.ToDouble();
-    }
-    return it->second;
-}
 
 // --- Blood Pact aileleri: ada gore eslesen genel gruplar -------------------
 // Eski gruplar sabit indeks listesi tasiyordu (bifrost={2} gibi).  Yeni
@@ -8944,7 +9308,7 @@ static void DropRateCmd(const std::string& rest)
                 }
             } catch (...) {}
             char ln[200];
-            sprintf_s(ln, "   [%3d] %-34s base=%.0f", i, ad.c_str(), b);
+            sprintf_s(ln, "   [%3d] %-34.34s base=%.0f", i, ad.c_str(), SafeF(b));
             Out(ln);
         }
         return;
@@ -8985,7 +9349,7 @@ static void DropRateCmd(const std::string& rest)
             }
             char rb[220];
             sprintf_s(rb, "droprate group relic: x%.0f, %d esya  (ornek: %.0f -> %.0f)",
-                      v, sayac, ornekEski, ornekYeni);
+                      SafeF(v), sayac, SafeF(ornekEski), SafeF(ornekYeni));
             Out(rb);
             return;
         }
@@ -9009,7 +9373,7 @@ static void DropRateCmd(const std::string& rest)
                           g->ad, g->kategori, g->parcalar);
             } else {
                 sprintf_s(gb, "droprate group %s: x%.0f, %d esya  (ornek: %.0f -> %.0f)%s",
-                          g->ad, v, n, ornekEski, ornekYeni,
+                          g->ad, SafeF(v), n, SafeF(ornekEski), SafeF(ornekYeni),
                           g->tip >= 0 ? "  [dis kapi icin: dungeonkey add " : "  [dis kapi zaten acik]");
                 if (g->tip >= 0) {
                     char ek[16]; sprintf_s(ek, "%d]", g->tip);
@@ -9043,7 +9407,7 @@ static void DropRateCmd(const std::string& rest)
         }
         char b[220];
         sprintf_s(b, "droprate group %s: x%.0f, %d esya  (ornek: %.0f -> %.0f)",
-                  grup.c_str(), v, sayac, ornekEski, ornekYeni);
+                  grup.c_str(), SafeF(v), sayac, SafeF(ornekEski), SafeF(ornekYeni));
         Out(b);
         return;
     }
@@ -9061,7 +9425,7 @@ static void DropRateCmd(const std::string& rest)
             RValue eski = g_Yytk->CallBuiltin("variable_struct_get", { dr, RValue("base") });
             g_Yytk->CallBuiltin("variable_struct_set", { dr, RValue("base"), RValue(v) });
             char ln[220];
-            sprintf_s(ln, "droprate set [%d] %s : %.0f -> %.0f", i, ad.c_str(), eski.ToDouble(), v);
+            sprintf_s(ln, "droprate set [%d] %s : %.0f -> %.0f", i, ad.c_str(), SafeF(eski.ToDouble()), SafeF(v));
             Out(ln);
         } catch (...) { Out("droprate: kullanim -> droprate set 2 100"); }
         return;
@@ -9400,6 +9764,7 @@ static void DungeonKeyCmd(const std::string& rest)
     if (v == "typemap") {
         std::string sansStr, bayrak; sansStr = FirstToken(a2, bayrak);
         try { g_TypeMapSans = std::stod(sansStr); } catch (...) { g_TypeMapSans = 100000.0; }
+        if (!std::isfinite(g_TypeMapSans)) g_TypeMapSans = 100000.0;
         // "all" -> tarama suresince TUM esyalarin ic zari da 1'e cekilir
         g_TypeMapTumOranlar = (Lower(bayrak).find("all") != std::string::npos);
         if (!g_OrigLoadDrops)
@@ -9434,7 +9799,7 @@ static void DungeonKeyCmd(const std::string& rest)
         try {
             int n = std::stoi(tipStr);
             double d = std::stod(degStr);
-            if (d <= 0.0) d = 1.0;
+            if (!std::isfinite(d) || d <= 0.0) d = 1.0;   // reject <=0, NaN and "inf" text
             g_DkTipOlcek[n] = d;
             char sb[140];
             sprintf_s(sb, "dungeonkey scale: tip %d -> olcek %.4f", n, d);
@@ -9453,7 +9818,7 @@ static void DungeonKeyCmd(const std::string& rest)
             liste += std::to_string(x);
             auto ic = g_DkTipCarpan.find(x);
             double kc = (ic == g_DkTipCarpan.end()) ? g_DkChanceMult : ic->second;
-            char cb[56]; sprintf_s(cb, "(x%.0f olcek %.5f)", kc, TipOlcek(x));
+            char cb[56]; sprintf_s(cb, "(x%.0f olcek %.5f)", SafeF(kc), SafeF(TipOlcek(x)));
             liste += cb;
         }
         Out(std::string("dungeonkey: ") + (g_DkOn ? "ACIK" : "kapali") + " | prime evil parcasi atlandi=" + std::to_string(g_DkPartsSkipped)
@@ -9473,7 +9838,10 @@ static void DungeonKeyCmd(const std::string& rest)
                 g_DkTipler.insert(n);
                 // Ikinci arguman verilirse o tipin KENDI kapi carpani olur.
                 if (!carpStr.empty()) {
-                    try { g_DkTipCarpan[n] = std::stod(carpStr); } catch (...) {}
+                    try {
+                        double c = std::stod(carpStr);
+                        if (std::isfinite(c) && c > 0.0) g_DkTipCarpan[n] = c;
+                    } catch (...) {}
                 }
             } else {
                 g_DkTipler.erase(n);
@@ -9502,7 +9870,7 @@ static void DungeonKeyCmd(const std::string& rest)
         else if (c == "autox") {
             double m = 1.0;
             try { m = std::stod(carpanStr); } catch (...) {}
-            if (m < 1.0) m = 1.0;
+            if (!std::isfinite(m) || m < 1.0) m = 1.0;
             g_DkChance = -1.0; g_DkChanceMult = m;
             char b[120]; sprintf_s(b, "dungeonkey: oran = auto x%.0f (dis kapi carpani)", m);
             Out(b);
@@ -10165,7 +10533,7 @@ static void RunCommand(const std::string& line)
         "ping", "density", "reveal", "specialrate", "dropmult",
         "stat", "statadd", "raredrop", "droprate", "dungeonkey",
         "headhunter", "hhdur", "hhmap", "hhdefault", "hhlabel", "tyrant", "beacon", "beaconrange", "beaconmode", "beaconwake", "beaconspawn", "beaconfarstep", "tyrantchance", "tyrantaffix", "hhlabelfont", "hhlabeloffset", "hhlabelmax",
-        "enemyspeed", "rarity", "sigdrop", "angelicdrop"
+        "enemyspeed", "rarity", "sigdrop", "angelicdrop", "relicfilter", "orbpickup"
     };
     if (kPlayerCommands.find(lc) == kPlayerCommands.end()) {
         Out("command unavailable in player build: " + cmd);
@@ -10174,7 +10542,34 @@ static void RunCommand(const std::string& line)
 #endif
 
     if (HandleHeadhunterCommand(lc, rest)) return;
-    if (lc == "ping") {
+    if (lc == "relicfilter") {
+        bool enable = (rest == "1" || rest == "true" || rest == "on");
+        g_FilterMaxRelics.store(enable);
+        RelicFilterManager::Instance().SetEnabled(enable);
+        // Hooking DropRelic while character selection is still running stalls the
+        // runner.  Arm it instead: the frame callback installs the hook once the
+        // setup gate has passed and a real player instance exists, so the panel
+        // can send this at launch (build_cmds) and it still applies in-game.
+        if (enable && !g_Orig_DropRelic) g_RelicFilterPending.store(true);
+        if (!enable) g_RelicFilterPending.store(false);
+        Out(std::string("relicfilter -> ") + (enable ? (g_Orig_DropRelic ? "ON" : "ON (armed, applies once you are in-game)") : "OFF"));
+    } else if (lc == "orbpickup") {
+        std::string ov = Lower(rest);
+        while (!ov.empty() && std::isspace((unsigned char)ov.back())) ov.pop_back();
+        if (ov == "stat") { OrbPickupStats(); return; }
+        bool enable = (ov == "10" || ov == "1" || ov == "true" || ov == "on");
+        g_OrbPickupRadius.store(enable);
+        if (enable) {
+            ResolveOrbAssets();
+            char ob[180];
+            sprintf_s(ob, "orbpickup -> globes pulled from %.0f px (player obj=%d, globe objs=%zu, driven per frame)",
+                      kGlobeBaseRadius * kOrbPickupFactor, g_PlayerObjIdx, g_GlobeObjIdx.size());
+            Out(ob);
+        } else {
+            Out("orbpickup -> OFF");
+            OrbPickupStats();
+        }
+    } else if (lc == "ping") {
         short ma=0, mi=0, pa=0; g_Yytk->QueryVersion(ma, mi, pa);
         Out("pong (YYTK " + std::to_string(ma) + "." + std::to_string(mi) + "." + std::to_string(pa) + ")");
     } else if (lc == "script") {
@@ -10354,6 +10749,9 @@ static void RunCommand(const std::string& line)
         ForceRelicDrop(n);
     } else if (lc == "relicgate") {
         SetRelicGate(rest == "1" || rest == "on" || rest == "true");
+    // NOTE: `relicfilter` is handled at the top of RunCommand.  A second branch
+    // here was unreachable and installed a different (eager) hook set, which made
+    // the command read as if it did two contradictory things.
 #ifndef FORGEPACT_RELEASE
     } else if (lc == "scount") {
         SCountCmd(rest);
@@ -10362,13 +10760,13 @@ static void RunCommand(const std::string& line)
         while (!v.empty() && std::isspace((unsigned char)v.back())) v.pop_back();
         if (v == "off") { g_GpvLog = 0; Out("gpvlog -> KAPALI"); }
         else if (v == "stat") {
-            Out("gpvlog: " + std::to_string(g_GpvGorulen.size()) + " farkli kayit -> bp_ipc\gpv.txt");
+            Out("gpvlog: " + std::to_string(g_GpvGorulen.size()) + " farkli kayit -> bp_ipc\\gpv.txt");
         } else {
             if (!g_OrigGPV) HookOneScript("GPV", "fp_gpv", (PVOID)HookGPV, &g_OrigGPV);
             if (!g_OrigSPV) HookOneScript("SPV", "fp_spv", (PVOID)HookSPV, &g_OrigSPV);
             g_GpvLog = 1;
             Out(std::string("gpvlog -> ACIK  (GPV kanca=") + (g_OrigGPV ? "var" : "YOK")
-                + ", SPV kanca=" + (g_OrigSPV ? "var" : "YOK") + ")  -> bp_ipc\gpv.txt");
+                + ", SPV kanca=" + (g_OrigSPV ? "var" : "YOK") + ")  -> bp_ipc\\gpv.txt");
         }
 #endif
 #ifndef FORGEPACT_RELEASE
@@ -10716,11 +11114,132 @@ static void PollCommands()
     Out("---- done ----");
 }
 
+// ===== stall watchdog =======================================================
+// A multi-second freeze on the character screen was reported three times and
+// could not be pinned down from the logs - the guesses (a hot builtin hook, the
+// runner-interface scan) were all wrong.  So the plugin names the culprit
+// itself: a background thread watches for frames to stop arriving and samples
+// the frame thread's instruction pointer, writing the owning module + RVA to
+// out.txt.  That distinguishes "stuck in BloodPactPlugin" from "stuck in
+// YYToolkit" from "stuck in the game" without a debugger.
+//
+// The frame thread is suspended ONLY for the GetThreadContext call and every
+// allocation/format happens after it is resumed, so a lock the stalled thread
+// holds (heap, CRT, loader) can never deadlock the watchdog.
+static std::atomic<uint64_t> g_LastFrameTickMs{ 0 };
+static HANDLE g_FrameThread = nullptr;
+static std::atomic<bool> g_WatchdogRun{ false };
+
+// Deliberately does NOT go through Out(): that also calls into the YYTK
+// interface, which is not ours to touch from a second thread.
+static void OutRaw(const std::string& s)
+{
+    std::ofstream f(OutPath(), std::ios::app);
+    f << s << "\n";
+}
+
+static std::string ModuleAndRvaOf(uintptr_t addr)
+{
+    HMODULE mod = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)addr, &mod) || !mod) {
+        char b[32]; sprintf_s(b, "0x%llX", (unsigned long long)addr);
+        return std::string("<unknown> ") + b;
+    }
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(mod, path, MAX_PATH);
+    std::string p(path);
+    const size_t slash = p.find_last_of("\\/");
+    std::string name = (slash == std::string::npos) ? p : p.substr(slash + 1);
+    char b[48];
+    sprintf_s(b, "+0x%llX", (unsigned long long)(addr - (uintptr_t)mod));
+    return name + b;
+}
+
+// Blocked in a kernel wait tells us WHERE but not WHY.  Disk bytes and free
+// memory across the stall separate "the machine is thrashing" (whole-PC freeze,
+// paging) from "the frame thread is waiting on the GPU" (game-only stall).
+struct StallSnapshot { unsigned long long readBytes, writeBytes, otherBytes, availMb; };
+static StallSnapshot TakeStallSnapshot()
+{
+    StallSnapshot s{ 0, 0, 0, 0 };
+    IO_COUNTERS io{};
+    if (GetProcessIoCounters(GetCurrentProcess(), &io)) {
+        s.readBytes = io.ReadTransferCount;
+        s.writeBytes = io.WriteTransferCount;
+        s.otherBytes = io.OtherTransferCount;
+    }
+    MEMORYSTATUSEX ms{}; ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) s.availMb = ms.ullAvailPhys / (1024ull * 1024ull);
+    return s;
+}
+
+static void StallWatchdogLoop()
+{
+    constexpr uint64_t kStallMs = 3000;     // a frame this late is not a slow frame
+    bool stalling = false;
+    int samplesThisStall = 0, reports = 0;
+    uint64_t worst = 0;
+    StallSnapshot before{};
+    while (g_WatchdogRun.load()) {
+        Sleep(500);
+        const uint64_t last = g_LastFrameTickMs.load();
+        if (!last || !g_FrameThread) continue;
+        const uint64_t behind = GetTickCount64() - last;
+
+        if (behind < kStallMs) {
+            if (stalling) {
+                stalling = false;
+                const StallSnapshot after = TakeStallSnapshot();
+                char b[220];
+                sprintf_s(b, "STALL ended - frames were %llu ms apart | disk read %llu KB, write %llu KB, other %llu KB | free RAM %llu -> %llu MB",
+                          (unsigned long long)worst,
+                          (after.readBytes - before.readBytes) / 1024,
+                          (after.writeBytes - before.writeBytes) / 1024,
+                          (after.otherBytes - before.otherBytes) / 1024,
+                          before.availMb, after.availMb);
+                OutRaw(b);
+            }
+            continue;
+        }
+        if (!stalling) { stalling = true; samplesThisStall = 0; worst = 0; before = TakeStallSnapshot(); }
+        if (behind > worst) worst = behind;
+        // A handful of samples per stall is enough to tell a spin from a wait,
+        // and the session cap keeps a permanent hang from filling the disk.
+        if (samplesThisStall >= 5 || reports >= 40) continue;
+
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_CONTROL;
+        bool captured = false;
+        if (SuspendThread(g_FrameThread) != (DWORD)-1) {
+            captured = GetThreadContext(g_FrameThread, &ctx) != 0;
+            ResumeThread(g_FrameThread);
+        }
+        if (!captured) continue;
+        ++samplesThisStall; ++reports;
+        OutRaw("STALL " + std::to_string(behind) + " ms - frame thread at " + ModuleAndRvaOf((uintptr_t)ctx.Rip));
+    }
+}
+
+static void StartStallWatchdog()
+{
+    if (g_WatchdogRun.exchange(true)) return;
+    try { std::thread(StallWatchdogLoop).detach(); }
+    catch (...) { g_WatchdogRun.store(false); }
+}
+
 void FrameCallback(FWFrame& FrameContext)
 {
     UNREFERENCED_PARAMETER(FrameContext);
     static uint32_t fc = 0;
     g_RuntimeFrame = fc;
+
+    // Watchdog heartbeat.  One tick read + one atomic store per frame.
+    g_LastFrameTickMs.store(GetTickCount64());
+    if (!g_FrameThread) {
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+                        GetCurrentProcess(), &g_FrameThread, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    }
 #ifndef FORGEPACT_RELEASE
     PerfFrameTick();
 #endif
@@ -10739,7 +11258,10 @@ void FrameCallback(FWFrame& FrameContext)
 #endif
 
     // one-time setup once the runner is fully alive: load config + install hook
-    if (!g_Setup && fc > 60) {
+    // Character selection still runs menu/controller code after the runner is
+    // alive. Delay ForgePact setup until that transition has settled; release
+    // commands are not consumed before this point.
+    if (!g_Setup && fc > 300) {
         g_Setup = true;
         Trace("1-setup-start");
         try { LoadConfig(); Trace("2-loadconfig-ok"); InstallHook(); Trace("3-installhook-ok"); }
@@ -10750,6 +11272,39 @@ void FrameCallback(FWFrame& FrameContext)
         try { SetRelicGate(true); } catch (...) {}   // relic gate ALWAYS ON (every kill drops a relic; only generates in Satanic Zones)
 #endif
         Trace("5-setup-done");
+    }
+
+    // Orb pickup: the player position the globe step hooks pull toward, read
+    // once per frame here instead of once per globe per step.
+    if (g_OrbPickupRadius.load()) {
+        RValue player;
+        std::string how;
+        if (HhResolveLocalPlayer(player, &how)) {
+            g_OrbPlayerHow = how;
+            try {
+                const double px = g_Yytk->CallBuiltin("variable_instance_get", { player, RValue("x") }).ToDouble();
+                const double py = g_Yytk->CallBuiltin("variable_instance_get", { player, RValue("y") }).ToDouble();
+                if (std::isfinite(px) && std::isfinite(py)) {
+                    g_PlayerX = px; g_PlayerY = py;
+                    g_PlayerPosValid.store(true);
+                } else { g_PlayerPosValid.store(false); }
+            } catch (...) { g_PlayerPosValid.store(false); }
+        } else { g_OrbPlayerHow = how; g_PlayerPosValid.store(false); }
+        OrbPickupTick();
+    }
+
+    // Relic filter, armed by `relicfilter 1`: the DropRelic hook goes in only
+    // once the runner has settled AND a real player exists.  Installing it during
+    // character selection stalled the game for about a minute, which is why the
+    // panel used to withhold the command entirely and the mod never applied
+    // after a restart (user report 2026-09-09).  Checked once a second at most.
+    if (g_RelicFilterPending.load() && g_Setup && (fc % 60) == 0) {
+        RValue player;
+        if (HhResolveLocalPlayer(player)) {
+            g_RelicFilterPending.store(false);
+            HookOneScript("DropRelic", "bp_drelic", (PVOID)Hook_DropRelic, &g_Orig_DropRelic);
+            Out(std::string("relicfilter: hook installed -> ") + (g_Orig_DropRelic ? "ON" : "FAILED (DropRelic not found)"));
+        }
     }
 
 #ifndef FORGEPACT_RELEASE
@@ -10907,7 +11462,10 @@ EXPORTED AurieStatus ModuleInitialize(
     // InstallSingleInstanceBypass();  // DISABLED: the blocker was Goldberg's port, not a mutex; this broke Goldberg init
 
     g_Yytk = YYTK::GetInterface();
-    if (!g_Yytk) return AURIE_MODULE_DEPENDENCY_NOT_RESOLVED;
+    if (!g_Yytk) {
+        Aurie::DbgPrint("[BloodPact] ERROR: Failed to get YYToolkit interface!\n");
+        return AURIE_MODULE_DEPENDENCY_NOT_RESOLVED;
+    }
 
     CreateDirectoryA(IPC_DIR.c_str(), nullptr);
     Out("==== BloodPact plugin loaded ====");
@@ -10917,11 +11475,15 @@ EXPORTED AurieStatus ModuleInitialize(
 #endif
 
     AurieStatus st = g_Yytk->CreateCallback(Module, EVENT_FRAME, (PVOID)FrameCallback, 0);
-    InstallHeadLabelHook();
-    if (!AurieSuccess(st))
+    if (!AurieSuccess(st)) {
         Out("FAILED to register frame callback st=" + std::to_string((int)st));
-    else
+        g_Yytk->PrintError(__FILE__, __LINE__, "[BloodPact] Failed to register frame callback (st=%d)", (int)st);
+    } else {
+        g_Yytk->PrintInfo("[BloodPact] BloodPact plugin successfully loaded into YYToolkit.");
         g_Yytk->Print(CM_LIGHTGREEN, "[BloodPact] ready - watching bp_ipc\\cmd.txt");
+        StartStallWatchdog();
+    }
 
+    Aurie::DbgPrint("[BloodPact] BloodPact plugin initialized successfully.\n");
     return AURIE_SUCCESS;
 }

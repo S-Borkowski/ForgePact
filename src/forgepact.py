@@ -23,6 +23,41 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+try:
+    from hs_game_sdk import (
+        GameObject,
+        GameScript,
+        StatId,
+        PROC_FAMILIES,
+        EquipmentSlot,
+        PlayerEquipment,
+        scan_relic_levels,
+        ModDefinition,
+        GLOBAL_MOD_REGISTRY,
+    )
+except ImportError:
+    _sdk_path = Path(__file__).resolve().parents[2] / "hs-game-sdk" / "python"
+    if _sdk_path.exists() and str(_sdk_path) not in sys.path:
+        sys.path.insert(0, str(_sdk_path))
+    try:
+        from hs_game_sdk import (
+            GameObject,
+            GameScript,
+            StatId,
+            PROC_FAMILIES,
+            EquipmentSlot,
+            PlayerEquipment,
+            scan_relic_levels,
+            ModDefinition,
+            GLOBAL_MOD_REGISTRY,
+        )
+    except Exception:
+        GameObject = None
+        GameScript = None
+        StatId = None
+        PROC_FAMILIES = {}
+        GLOBAL_MOD_REGISTRY = None
+
 PORT = 8766
 # Windows sometimes reserves a port range (Hyper-V/WSL) and refuses the bind.
 # So free ports are tried in order; whichever works is opened in the browser.
@@ -124,6 +159,8 @@ DEFAULTS = {
     "headhunter": False,
     "tyrant": False,
     "beacon": False,
+    "mod_filter_max_relics": False,
+    "mod_orb_pickup_radius": False,
     # Monster Rarity: the share of normal monsters raised to Rare and to Ancient
     # (percent each, together at most 100; the rest stay normal).
     "rarity_rare": 0,
@@ -186,13 +223,15 @@ KNOWN_RI_CACHE = {
 
 
 def ensure_ri_cache(cfg=None) -> bool:
-    """Write the known YYTK RI cache next to the exe so the FIRST launch is also instant."""
+    """Use only a verified cache; remove unknown caches so YYTK must rescan."""
     try:
         exe = exe_path(cfg)
         content = KNOWN_RI_CACHE.get(exe.stat().st_size)
-        if not content:
-            return False
         cache = exe.with_name(exe.name + ".yytkcache")
+        if not content:
+            if cache.exists():
+                cache.unlink()
+            return False
         if not cache.exists() or cache.read_text(errors="ignore").split()[:1] != content.split()[:1]:
             cache.write_text(content, encoding="ascii")
         return True
@@ -358,7 +397,14 @@ def send_cmds(lines: list, cfg=None) -> str:
     closed they are processed on startup)."""
     d = ipc_dir(cfg)
     if not d.exists():
-        return "ERROR: bp_ipc folder not found next to the game exe (is the mod plugin installed?)"
+        exe = exe_path(cfg)
+        if exe.parent.exists():
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                return "ERROR: bp_ipc folder not found next to the game exe (is the mod plugin installed?)"
+        else:
+            return "ERROR: bp_ipc folder not found next to the game exe (is the mod plugin installed?)"
     with _lock:
         cmd = d / "cmd.txt"
         existing = ""
@@ -501,6 +547,13 @@ def build_cmds(cfg: dict) -> list:
     if cfg.get("beacon", False):
         # Custom Forge Beacon amulet: every monster on the map hunts the player.
         out.append("beacon force")
+    if cfg.get("mod_filter_max_relics", False):
+        # Safe to send at launch: the plugin only ARMS the filter here and installs
+        # the DropRelic hook once a player exists.  Withholding it used to mean the
+        # toggle stayed on in the panel but did nothing after a game restart.
+        out.append("relicfilter 1")
+    if cfg.get("mod_orb_pickup_radius", False):
+        out.append("orbpickup 10")
     rare, ancient = rarity_setting(cfg)
     if rare > 0 or ancient > 0:
         out.append(f"rarity {rare} {ancient}")
@@ -1258,7 +1311,7 @@ class H(BaseHTTPRequestHandler):
                     # moved wins and the other gives way
                     other = "rarity_ancient" if key == "rarity_rare" else "rarity_rare"
                     cfg[other] = min(_pct(cfg.get(other, 0)), 100 - cfg[key])
-                elif key in ("density_on", "auto_apply", "map_reveal", "headhunter", "tyrant", "beacon"):
+                elif key in ("density_on", "auto_apply", "map_reveal", "headhunter", "tyrant", "beacon", "mod_filter_max_relics", "mod_orb_pickup_radius"):
                     cfg[key] = bool(val)
                 save_cfg(cfg)
                 live = ""
@@ -1288,6 +1341,10 @@ class H(BaseHTTPRequestHandler):
                         send_cmds(["tyrant force" if cfg["tyrant"] else "tyrant off"], cfg)
                     elif key == "beacon":
                         send_cmds(["beacon force" if cfg["beacon"] else "beacon off"], cfg)
+                    elif key == "mod_filter_max_relics":
+                        send_cmds([f"relicfilter {1 if cfg['mod_filter_max_relics'] else 0}"], cfg)
+                    elif key == "mod_orb_pickup_radius":
+                        send_cmds([f"orbpickup {10 if cfg['mod_orb_pickup_radius'] else 0}"], cfg)
                     elif key in ("rarity_rare", "rarity_ancient"):
                         # Always explicit: "rarity off" returns a live hook to vanilla.
                         send_cmds([rarity_cmd(cfg)], cfg)
@@ -1375,11 +1432,12 @@ h1{font-size:26px;margin:0;letter-spacing:2px;background:linear-gradient(90deg,v
 .sub{color:var(--mut);font-size:12px;letter-spacing:3px;text-transform:uppercase}
 .control-dock{position:sticky;top:0;z-index:10;margin:8px 0 18px;padding:9px 0 12px;background:linear-gradient(180deg,#0d0a08fa 82%,#0d0a0800);backdrop-filter:blur(9px)}
 #statusbar{display:flex;gap:10px;align-items:center;margin:9px 0 0;flex-wrap:wrap}
-.tabbar{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:8px;padding:5px;border:1px solid #33261c;border-radius:12px;background:#100c0ae8;box-shadow:0 5px 22px #0008}
+.tabbar{display:grid;grid-template-columns:repeat(5,minmax(100px,1fr));gap:8px;padding:5px;border:1px solid #33261c;border-radius:12px;background:#100c0ae8;box-shadow:0 5px 22px #0008}
 .tabbtn{appearance:none;border:1px solid transparent;background:transparent;color:#8f816e;border-radius:8px;padding:9px 12px;cursor:pointer;font-size:12px;font-weight:700;letter-spacing:.9px;text-transform:uppercase;transition:.18s}
 .tabbtn:hover{color:var(--ember2);background:#241711;border-color:#49301f}
 .tabbtn.active{color:#fff2dc;background:linear-gradient(180deg,#563018,#33200e);border-color:#8e5526;box-shadow:inset 0 0 16px #ff8a2130,0 0 15px #ff7a1a20}
 .tabbtn[data-tab="modifiers"].active{background:linear-gradient(180deg,#49305c,#291c35);border-color:#8059a4;box-shadow:inset 0 0 16px #a77cff30,0 0 15px #a77cff22}
+.tabbtn[data-tab="mods"].active{background:linear-gradient(180deg,#204a43,#132c28);border-color:#388e7d;color:#d1fffa;box-shadow:inset 0 0 16px #388e7d30,0 0 15px #388e7d22}
 .chip{padding:6px 14px;border-radius:20px;font-size:12px;border:1px solid var(--line);background:var(--card)}
 .chip.on{border-color:var(--ok);color:var(--ok);box-shadow:0 0 12px #5ad87a22}
 .chip.off{border-color:#777;color:#999}
@@ -1439,6 +1497,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;heigh
   <button class="tabbtn" data-tab="modifiers" role="tab">&#9876; Modifiers</button>
   <button class="tabbtn" data-tab="world" role="tab">&#127757; World</button>
   <button class="tabbtn" data-tab="loot" role="tab">&#128176; Loot</button>
+  <button class="tabbtn" data-tab="mods" role="tab">&#10024; Mods</button>
 </nav>
 <div id="statusbar">
   <span class="chip" id="chipGame">...</span>
@@ -1575,39 +1634,41 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;heigh
   <div class="note" id="raritynote">off</div>
 </div>
 
-<div class="card tab-card" data-tab="world">
-  <h2>&#128506; Map Reveal</h2>
-  <div class="hint">Reveals the full minimap in every zone (removes fog of war). Off by default; enable it when you want every map revealed.</div>
+<div class="card tab-card" data-tab="mods">
+  <h2>&#10024; Gameplay Mods</h2>
+  <div class="hint">Toggle custom game modifications, drop pool adjustments, and quality-of-life tweaks. Settings apply immediately while the game is running.</div>
   <div class="row" style="border:none">
-    <span class="lbl">Reveal full map</span>
-    <label class="switch"><input type="checkbox" id="map_reveal"><span class="sl"></span></label>
-    <span class="val" id="mapval">on</span>
+    <span class="lbl" style="width:auto;flex:1">Remove owned relics from drop pool<br><span style="font-size:11px;color:#8f816e;font-weight:normal">When a relic is dropped, prevents relics already at maximum level (10 out of 10) in your equipped slots, backpack, or inventory from dropping.</span></span>
+    <label class="switch"><input type="checkbox" id="mod_filter_max_relics"><span class="sl"></span></label>
+    <span class="val" id="mfmrval">on</span>
   </div>
+    <div class="row" style="border:none">
+        <span class="lbl" style="width:auto;flex:1">Experience and Magic Find orb pickup radius<br><span style="font-size:11px;color:#8f816e;font-weight:normal">Makes the player collect matching orbs from 10 times the normal distance.</span></span>
+        <label class="switch"><input type="checkbox" id="mod_orb_pickup_radius"><span class="sl"></span></label>
+        <span class="val" id="morval">off</span>
+    </div>
+    <div class="row" style="border:none">
+        <span class="lbl" style="width:auto;flex:1">Reveal full map<br><span style="font-size:11px;color:#8f816e;font-weight:normal">Reveals the full minimap in every zone (removes fog of war).</span></span>
+        <label class="switch"><input type="checkbox" id="map_reveal"><span class="sl"></span></label>
+        <span class="val" id="mapval">on</span>
+    </div>
 </div>
 
-<div class="card tab-card" data-tab="world">
-  <h2>&#129686; Headhunter</h2>
-  <div class="hint">For an item forged with <b>Mechanic: Headhunter</b> in the Item Editor. While on, killing a rare or champion monster grants its affixes to you as 20-second buffs (Extra Fast &rarr; movement speed, Berserker/Raging/Enraged &rarr; attack speed, Vampiric &rarr; life replenish, elemental Enchanted &rarr; cast rate, others &rarr; movement speed for now). The equipped-belt check is still in progress, so the effect is active whenever this switch is on and the forged item exists.</div>
+<div class="card tab-card" data-tab="mods">
+  <h2>&#129686; Items</h2>
+  <div class="hint">Custom forge mechanics tied to items made in the Item Editor. Settings apply immediately while the game is running.</div>
   <div class="row" style="border:none">
-    <span class="lbl">Headhunter buffs on rare kills</span>
+    <span class="lbl" style="width:auto;flex:1">Headhunter buffs on rare kills<br><span style="font-size:11px;color:#8f816e;font-weight:normal">For an item forged with Mechanic: Headhunter. While on, killing a rare or champion monster grants its affixes to you as 20-second buffs (Extra Fast &rarr; movement speed, Berserker/Raging/Enraged &rarr; attack speed, Vampiric &rarr; life replenish, elemental Enchanted &rarr; cast rate, others &rarr; movement speed for now). The equipped-belt check is still in progress, so the effect is active whenever this switch is on and the forged item exists.</span></span>
     <label class="switch"><input type="checkbox" id="headhunter"><span class="sl"></span></label>
     <span class="val" id="hhval">on</span>
   </div>
-</div>
-<div class="card tab-card" data-tab="world">
-  <h2>&#128081; Tyrant's Crown</h2>
-  <div class="hint">For an item forged with <b>Mechanic: Tyrant's Crown</b> in the Item Editor. While on, normal monsters near you rise to rare more often (15% each) and every rare or champion carries one extra affix. Pairs with Headhunter: more rares, more affixes to steal.</div>
   <div class="row" style="border:none">
-    <span class="lbl">Tyrant's Crown: more rares, richer rares</span>
+    <span class="lbl" style="width:auto;flex:1">Tyrant's Crown: more rares, richer rares<br><span style="font-size:11px;color:#8f816e;font-weight:normal">For an item forged with Mechanic: Tyrant's Crown. While on, normal monsters near you rise to rare more often (15% each) and every rare or champion carries one extra affix. Pairs with Headhunter: more rares, more affixes to steal.</span></span>
     <label class="switch"><input type="checkbox" id="tyrant"><span class="sl"></span></label>
     <span class="val" id="tyval">on</span>
   </div>
-</div>
-<div class="card tab-card" data-tab="world">
-  <h2>&#128293; Beacon</h2>
-  <div class="hint">For an amulet forged with <b>Mechanic: Beacon</b> in the Item Editor. While on, every monster on the map hunts you the moment it spawns and never turns back, through the game's own aggro system. Plugin commands: <code>beaconmode rare</code> limits it to rares and champions, <code>beaconrange &lt;px&gt;</code> caps the distance.</div>
   <div class="row" style="border:none">
-    <span class="lbl">Beacon: every monster hunts you</span>
+    <span class="lbl" style="width:auto;flex:1">Beacon: every monster hunts you<br><span style="font-size:11px;color:#8f816e;font-weight:normal">For an amulet forged with Mechanic: Beacon. While on, every monster on the map hunts you the moment it spawns and never turns back, through the game's own aggro system. Plugin commands: beaconmode rare limits it to rares and champions, beaconrange &lt;px&gt; caps the distance.</span></span>
     <label class="switch"><input type="checkbox" id="beacon"><span class="sl"></span></label>
     <span class="val" id="beval">on</span>
   </div>
@@ -1775,6 +1836,14 @@ async function boot(){
   document.getElementById('beacon').checked=be;
   document.getElementById('beval').textContent=be?'on':'off';
   document.getElementById('beval').className='val '+(be?'':'off');
+  const mfmr=!!c.mod_filter_max_relics;
+  document.getElementById('mod_filter_max_relics').checked=mfmr;
+  document.getElementById('mfmrval').textContent=mfmr?'on':'off';
+  document.getElementById('mfmrval').className='val '+(mfmr?'':'off');
+    const mor=!!c.mod_orb_pickup_radius;
+    document.getElementById('mod_orb_pickup_radius').checked=mor;
+    document.getElementById('morval').textContent=mor?'on':'off';
+    document.getElementById('morval').className='val '+(mor?'':'off');
   rarityLoad(c);
   document.getElementById('hhval').className='val '+(hh?'':'off');
   document.getElementById('exepath').value=c.game_exe||'';
@@ -1893,6 +1962,16 @@ function bind(){
     document.getElementById('beval').className='val '+(e.target.checked?'':'off');
     toast('beacon '+(e.target.checked?'ON':'OFF')+' - '+(res.ok||res.err));
   };
+  document.getElementById('mod_filter_max_relics').onchange=async(e)=>{
+    const res=await j('/api/set',{method:'POST',body:JSON.stringify({key:'mod_filter_max_relics',value:e.target.checked})});
+    const v=document.getElementById('mfmrval');v.textContent=e.target.checked?'on':'off';v.className='val '+(e.target.checked?'':'off');
+    toast('Remove owned relics from drop pool '+(e.target.checked?'ON':'OFF')+' - '+(res.ok||res.err));
+  };
+    document.getElementById('mod_orb_pickup_radius').onchange=async(e)=>{
+        const res=await j('/api/set',{method:'POST',body:JSON.stringify({key:'mod_orb_pickup_radius',value:e.target.checked})});
+        const v=document.getElementById('morval');v.textContent=e.target.checked?'on':'off';v.className='val '+(e.target.checked?'':'off');
+        toast('Orb pickup radius '+(e.target.checked?'10x ON':'OFF')+' - '+(res.ok||res.err));
+    };
   { const el=document.getElementById('angelic_items');
     el.oninput=angelicPaint;
     el.onchange=async()=>{ const v=sliderVal(el); const res=await j('/api/set',{method:'POST',body:JSON.stringify({key:'angelic_items',value:v})}); angelicPaint(); toast('angelic drops '+(v>1?'x'+v:'off')+' - '+(res.ok||res.err)); };
