@@ -295,6 +295,31 @@ load there anyway.
   the outer `LoadDrops` chance gate, the per-item `droprate.base` roll, and why keys
   outside their home zone can never drop without opening the outer gate (Turkish).
 
+### Building the plugin
+
+`plugin_build/build.bat` compiles `plugin/ModuleMain.cpp` against three header-only
+dependencies, resolved as sibling checkouts next to this repository (i.e. as
+`../Aurie`, `../YYToolkit`, `../hs-game-sdk` relative to wherever `ForgePact/` is
+checked out):
+
+- **Aurie Framework** headers (`Aurie/shared.hpp`).
+- **YYToolkit** shared headers (`YYToolkit/YYTK_Shared.hpp`).
+- **hs-game-sdk** (`hs_game_sdk/hs_game_sdk.hpp`) — the typed Hero Siege object/player/room
+  wrappers `ModuleMain.cpp` uses. This one is not yet a submodule of this repository; it
+  currently lives in the
+  [hero-siege-offline-toolkit](https://github.com/S-Borkowski/hero-siege-offline-toolkit)
+  super-repo (see `hs-game-sdk/` there), on the `feature/hs-game-sdk-and-agent-guidelines`
+  branch as of this writing. Until it is published as its own pinned dependency, building
+  ForgePact standalone means checking that repo out alongside this one and pointing
+  `build.bat` at `hs-game-sdk/cpp/include`. Building from inside a full toolkit checkout
+  (where ForgePact is already a submodule next to `hs-game-sdk/`) needs no extra setup.
+
+Without `hs-game-sdk/cpp/include` on the include path, compilation fails immediately at
+the `#include <hs_game_sdk/hs_game_sdk.hpp>` line (`fatal error C1083`). The Python test
+suite (`py -m unittest discover -s tests`) checks the plugin's *source* against its
+documented contracts and does not compile it, so a green test run does not confirm the
+plugin actually builds.
+
 ## 📜 License — AGPL-3.0
 
 ForgePact is released under the **GNU Affero General Public License v3.0** (see

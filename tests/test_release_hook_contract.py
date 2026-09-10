@@ -51,6 +51,40 @@ class ReleaseHookContractTests(unittest.TestCase):
         ):
             self.assertNotIn(eager, release)
 
+    def test_release_build_still_loads_custom_forge_and_auto_arms_items(self):
+        # A prior edit moved the `#ifdef FORGEPACT_RELEASE ... return;` early
+        # exit above these calls, so a shipped build skipped the Item Editor
+        # sidecar and Headhunter/Tyrant's Crown/Beacon auto-arm entirely.
+        # They must run unconditionally, before the release/dev split.
+        body = function_body(self.plugin, "static void InstallHook()")
+        guard_at = body.index("#ifdef FORGEPACT_RELEASE")
+        unconditional = body[:guard_at]
+        for call in (
+            "LoadCustomForgeEntries();",
+            "InstallCustomForgeItemHooks();",
+            "HeadhunterAutoArm();",
+            "TyrantAutoArm();",
+            "BeaconAutoArm();",
+        ):
+            self.assertIn(call, unconditional)
+
+    def test_module_initialize_registers_headhunter_hud_label_hook(self):
+        # InstallHeadLabelHook() registers Hook_DrawHudBuffs, which renders the
+        # stolen-affix labels; a rewrite of ModuleInitialize previously dropped
+        # this call, so the labels stopped rendering even when the underlying
+        # buff application kept working.
+        init = function_body(self.plugin, "EXPORTED AurieStatus ModuleInitialize(")
+        self.assertIn("InstallHeadLabelHook();", init)
+
+    def test_safe_f_bounds_large_finite_magnitudes_not_just_nan_and_inf(self):
+        # SafeF must reject not only inf/NaN but also large finite doubles
+        # (e.g. an IPC-supplied "1e300"): %.0f of a merely-finite huge value
+        # still overruns every fixed sprintf_s buffer it feeds.
+        safe_f = function_body(self.plugin, "static inline double SafeF(double v)")
+        self.assertIn("std::isfinite(v)", safe_f)
+        self.assertRegex(safe_f, r"kMaxSafeF|1e1[0-9]|1e[2-9][0-9]?")
+        self.assertIn("return kMaxSafeF;", safe_f)
+
     def test_functional_hooks_install_only_for_non_vanilla_commands(self):
         drop = function_body(self.plugin, "static void SetDropMult(")
         self.assertIn("if (n > 1) InstallDropMultHooks();", drop)

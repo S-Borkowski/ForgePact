@@ -189,13 +189,25 @@ static std::string Lower(std::string s)
 }
 
 // A game-memory-read RValue (e.g. an item's droprate.base) can come back as an
-// inf/NaN/huge double when an index/offset is stale after a game update.
-// %f/%.0f on such a value expands to hundreds of characters and overruns a
-// fixed sprintf_s buffer, which makes the CRT abort the whole process
-// (0xC0000409 / STATUS_STACK_BUFFER_OVERRUN).  Route every game-supplied
-// double through this before handing it to a %f-style sprintf_s so a bad
-// read degrades the printed number instead of crashing the game.
-static inline double SafeF(double v) { return std::isfinite(v) ? v : 0.0; }
+// inf/NaN/huge double when an index/offset is stale after a game update, and
+// an IPC-supplied value (e.g. "droprate set 2 1e300") can be huge without
+// being inf/NaN at all. %f/%.0f on any such value expands to hundreds of
+// characters and overruns a fixed sprintf_s buffer, which makes the CRT
+// abort the whole process (0xC0000409 / STATUS_STACK_BUFFER_OVERRUN). Route
+// every such double through this before handing it to a %f-style sprintf_s
+// so a bad read degrades the printed number instead of crashing the game.
+// Clamped, not just filtered: rejecting only inf/NaN still let a finite value
+// like 1e300 through, and %.0f of that alone is ~300 characters - already
+// wider than every fixed buffer this is used with. 1e15 is a small fraction
+// of any of those buffers (16 characters under %.0f) while comfortably
+// covering every real in-game rate/multiplier this file prints.
+static inline double SafeF(double v) {
+    if (!std::isfinite(v)) return 0.0;
+    constexpr double kMaxSafeF = 1e15;
+    if (v > kMaxSafeF) return kMaxSafeF;
+    if (v < -kMaxSafeF) return -kMaxSafeF;
+    return v;
+}
 
 static std::string Describe(const RValue& v)
 {
@@ -6558,15 +6570,12 @@ static void InstallHook()
     }
     g_Base = (uintptr_t)GetModuleHandleA(nullptr);
 
-#ifdef FORGEPACT_RELEASE
-    // Yayin derlemesi: arastirma kancasi ve teshis gunlugu yok.
-    // Functional hooks are installed on-demand when commands arrive.
-    g_HookInstalled = true;
-    Out("BloodPact: yayin modu (density + ozel icerik + minimap)");
-    return;
-#else
     // Load the editor-authored sidecar before choosing the release hook set.
     // This remains inert when the user has not forged any custom items.
+    // Runs in every build - a release build with no forged items just finds
+    // nothing to load, but a release build that skipped this outright would
+    // silently drop custom-item stats/names/tooltips and Headhunter/Tyrant's
+    // Crown/Beacon auto-arm for players who used the Item Editor.
     LoadCustomForgeEntries();
     InstallCustomForgeItemHooks();
     HeadhunterAutoArm();
@@ -6574,6 +6583,13 @@ static void InstallHook()
     BeaconAutoArm();
     if (g_SigDropPct > 0.0 || g_AngelicDropOneIn > 0.0) InstallHeadhunterHook();   // kill hook carries the signature and angelic drops
 
+#ifdef FORGEPACT_RELEASE
+    // Yayin derlemesi: arastirma kancasi ve teshis gunlugu yok.
+    // Functional hooks are installed on-demand when commands arrive.
+    g_HookInstalled = true;
+    Out("BloodPact: yayin modu (density + ozel icerik + minimap)");
+    return;
+#else
     // Development builds install the complete research surface eagerly.
     InstallCreateHooks();
     InstallDropMultHooks();
@@ -10988,6 +11004,7 @@ EXPORTED AurieStatus ModuleInitialize(
 #endif
 
     AurieStatus st = g_Yytk->CreateCallback(Module, EVENT_FRAME, (PVOID)FrameCallback, 0);
+    InstallHeadLabelHook();
     if (!AurieSuccess(st)) {
         Out("FAILED to register frame callback st=" + std::to_string((int)st));
         g_Yytk->PrintError(__FILE__, __LINE__, "[BloodPact] Failed to register frame callback (st=%d)", (int)st);
