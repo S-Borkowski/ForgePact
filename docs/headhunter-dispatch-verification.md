@@ -162,3 +162,10 @@ with the new DLL. That still requires installing it and restarting the game.
 The running game, installed plugin, user settings and existing release files
 are preserved. No package is published to GitHub. Memory copies, disassembly
 and runtime player identifiers remain in the ignored local build directory.
+
+## Release packaging: 1.3.16
+
+Version 1.3.16 promotes the same plugin and panel binaries from the third private
+package. Its release notes retain the pending live-combat verification boundary.
+The release archive includes versioned build information and per-file SHA-256
+checksums. The private-test status above describes the earlier validation stage.
