@@ -28,10 +28,18 @@ def function_body(source: str, signature: str) -> str:
     raise AssertionError(f"unterminated body for {signature}")
 
 
+MAP_REVEAL_HEADER_PATH = PROJECT_ROOT / "plugin" / "include" / "ForgePact" / "MapRevealManager.hpp"
+STATS_HEADER_PATH = PROJECT_ROOT / "plugin" / "include" / "ForgePact" / "StatsManager.hpp"
+DENSITY_HEADER_PATH = PROJECT_ROOT / "plugin" / "include" / "ForgePact" / "DensityManager.hpp"
+
+
 class ReleaseHookContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.plugin = PLUGIN_PATH.read_text(encoding="utf-8")
+        cls.map_reveal_header = MAP_REVEAL_HEADER_PATH.read_text(encoding="utf-8")
+        cls.stats_header = STATS_HEADER_PATH.read_text(encoding="utf-8")
+        cls.density_header = DENSITY_HEADER_PATH.read_text(encoding="utf-8")
 
     def test_release_initialization_has_no_eager_gameplay_hook_group(self):
         body = function_body(self.plugin, "static void InstallHook()")
@@ -52,10 +60,14 @@ class ReleaseHookContractTests(unittest.TestCase):
         self.assertIn("InstallCreateHooks();", special)
         self.assertNotIn("InstallSpecialLifecycleHook();", special)
 
+        # The density command handler itself moved to
+        # ForgePact::DensityManager::HandleCommand (2026-09 class split).
         command = function_body(self.plugin, "static void RunCommand(")
-        density = command.split('else if (lc == "density")', 1)[1].split(
+        density_call = command.split('else if (lc == "density")', 1)[1].split(
             'else if (lc == "dropstats")', 1
         )[0]
+        self.assertIn("DensityManager::Instance().HandleCommand(rest);", density_call)
+        density = function_body(self.density_header, "void HandleCommand(const std::string& rest)")
         self.assertIn("if (d > 1.0)", density)
         self.assertIn("InstallCreateHooks();", density)
         self.assertIn("InstallDensityLifecycleHooks();", density)
@@ -68,8 +80,10 @@ class ReleaseHookContractTests(unittest.TestCase):
         )
         self.assertIsNotNone(macro)
         self.assertIn("BP_DIAG_INCREMENT(g_cnt_##NAME);", self.plugin)
-        self.assertIn("BP_DIAG_INCREMENT(g_StatSayac_##NAME);", self.plugin)
-        self.assertIn("BP_DIAG_INCREMENT(g_StatAddSayac_##NAME);", self.plugin)
+        # Stat hook telemetry moved to ForgePact::StatsManager (2026-09 class
+        # split): same BP_DIAG_INCREMENT macro, now on class members.
+        self.assertIn("BP_DIAG_INCREMENT(mgr.m_Calls_##NAME);", self.stats_header)
+        self.assertIn("BP_DIAG_INCREMENT(mgr.m_CallsAdd_StatFasterCastRate);", self.stats_header)
 
         create = function_body(self.plugin, "static void DoMultiCreate(")
         research_prefix = create.split("#endif", 1)[0]
@@ -100,10 +114,13 @@ class ReleaseHookContractTests(unittest.TestCase):
             )
 
     def test_repeated_frame_work_is_bounded(self):
-        reveal = function_body(self.plugin, "static void AutoRevealTick()")
-        self.assertIn("instanceKey == g_AutoRevealLastInstance", reveal)
-        self.assertIn("gridKey == g_AutoRevealLastGrid", reveal)
-        self.assertIn("roomKey == g_AutoRevealLastRoom", reveal)
+        # Migrated into ForgePact::MapRevealManager::Tick() (2026-09 class split);
+        # ModuleMain.cpp now only calls it via MapRevealManager::Instance().
+        self.assertIn("ForgePact::MapRevealManager::Instance().OnFrame(g_RuntimeFrame);", self.plugin)
+        reveal = function_body(self.map_reveal_header, "void Tick()")
+        self.assertIn("instanceKey == m_LastInstance", reveal)
+        self.assertIn("gridKey == m_LastGrid", reveal)
+        self.assertIn("roomKey == m_LastRoom", reveal)
 
         special = function_body(self.plugin, "static void SpecialRate(")
         self.assertIn("if (n > 1) SetObjectMultiplier(oi, n);", special)
@@ -159,22 +176,26 @@ class ReleaseHookContractTests(unittest.TestCase):
         self.assertLess(command_end, command.index('lc == "droprate"', socket_at))
 
     def test_all_off_runtime_is_native_pass_through(self):
-        self.assertIn("static double g_CreatorMult = 1.0;", self.plugin)
-        self.assertIn("static bool g_AutoReveal = false;", self.plugin)
+        # Migrated into ForgePact::DensityManager (2026-09 class split).
+        self.assertIn("double Mult{ 1.0 };", self.density_header)
+        # Migrated into ForgePact::MapRevealManager (2026-09 class split).
+        self.assertIn("bool m_Enabled{ false };", self.map_reveal_header)
 
         for signature, original in (
             ("static void HookICD(", "g_OrigICD(Result, S, O, argc, Args);"),
             ("static void HookICL(", "g_OrigICL(Result, S, O, argc, Args);"),
         ):
             hook = function_body(self.plugin, signature)
-            self.assertIn("g_CreatorMult <= 1.0", hook)
+            self.assertIn("ForgePact::DensityManager::Instance().Mult <= 1.0", hook)
             self.assertIn("g_ObjMult.empty()", hook)
             self.assertNotIn("g_NecroBalanceEnabled", hook)
             self.assertIn(original, hook)
 
-        stat = function_body(self.plugin, "static void StatCmd(")
-        native = stat.index("c == 1.0 && !*hedef->orij")
-        install = stat.index("HookOneScript(hedef->ad", native)
+        # StatCmd moved to ForgePact::StatsManager::HandleStatCommand (2026-09
+        # class split); same "x1.0 with no hook installed stays native" guard.
+        stat = function_body(self.stats_header, "void HandleStatCommand(const std::string& rest)")
+        native = stat.index("c == 1.0 && !*hedef->orig")
+        install = stat.index("HookOneScript(hedef->name", native)
         self.assertLess(native, install)
 
     def test_special_queue_is_not_cleared_during_zone_generation(self):

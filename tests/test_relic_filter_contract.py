@@ -10,6 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 FORGEPACT_DIR = REPO_ROOT / "ForgePact"
 SRC_DIR = FORGEPACT_DIR / "src"
 PLUGIN_SRC = FORGEPACT_DIR / "plugin" / "ModuleMain.cpp"
+FORGEPACT_INCLUDE_DIR = FORGEPACT_DIR / "plugin" / "include" / "ForgePact"
 
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
@@ -22,6 +23,7 @@ class TestRelicFilterContract(unittest.TestCase):
     def setUpClass(cls):
         cls.plugin_code = PLUGIN_SRC.read_text(encoding="utf-8")
         cls.panel_code = (SRC_DIR / "forgepact.py").read_text(encoding="utf-8")
+        cls.relic_filter_header = (FORGEPACT_INCLUDE_DIR / "RelicFilterMod.hpp").read_text(encoding="utf-8")
 
     def test_defaults_has_relic_filter(self):
         self.assertIn("mod_filter_max_relics", forgepact.DEFAULTS)
@@ -53,7 +55,9 @@ class TestRelicFilterContract(unittest.TestCase):
 
     def test_plugin_handles_relicfilter_command(self):
         self.assertIn('lc == "relicfilter"', self.plugin_code)
-        self.assertIn("g_FilterMaxRelics", self.plugin_code)
+        # Enabled-state moved into ForgePact::RelicFilterMod (2026-09 class split).
+        self.assertIn("std::atomic<bool> m_Enabled{ false };", self.relic_filter_header)
+        self.assertIn("RelicFilterMod::Instance().SetEnabled(", self.plugin_code)
 
     def test_plugin_implements_relic_filtering(self):
         self.assertIn("Hook_DropRelic", self.plugin_code)
@@ -90,11 +94,18 @@ class TestRelicFilterContract(unittest.TestCase):
     def test_relic_filter_hook_is_deferred_until_a_player_exists(self):
         # Sending relicfilter must only ARM the mod; hooking DropRelic while the
         # character screen runs stalls the runner for about a minute.
-        self.assertIn("g_RelicFilterPending", self.plugin_code)
+        # Migrated into ForgePact::RelicFilterMod (2026-09 class split): the
+        # pending flag is now m_Pending, exposed via IsPending()/ClearPending().
+        self.assertIn("m_Pending", self.relic_filter_header)
         armed = self.plugin_code.split('if (lc == "relicfilter")', 1)[1][:800]
         self.assertNotIn("HookOneScript(\"DropRelic\"", armed)
+        self.assertIn("RelicFilterMod::Instance().SetEnabled(enable, g_Orig_DropRelic != nullptr);", armed)
         # ...and the frame callback installs it once a player resolves.
-        self.assertIn("if (g_RelicFilterPending.load() && g_Setup", self.plugin_code)
+        self.assertIn(
+            "if (ForgePact::RelicFilterMod::Instance().IsPending() && g_Setup",
+            self.plugin_code,
+        )
+        self.assertIn("RelicFilterMod::Instance().ClearPending();", self.plugin_code)
 
     def test_relicfilter_has_exactly_one_command_branch(self):
         # A second, unreachable branch used to install a different hook set.

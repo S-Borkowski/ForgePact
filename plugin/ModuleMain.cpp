@@ -63,6 +63,19 @@ static YYTKInterface* g_Yytk = nullptr;
 #define BP_DIAG_INCREMENT(counter) InterlockedIncrement(&(counter))
 #endif
 
+// LogDrop's full body stays where it was (a general research/logging utility,
+// not drop-multiplier-specific); only forward-declared here, alongside its
+// macro, so ForgePact::DropManager's hook bodies can use BP_LOGDROP despite
+// being included well before LogDrop's definition. Preprocessor macros have
+// no forward-declaration equivalent - unlike a function, the #define itself
+// must move, or anything textually before it treats BP_LOGDROP as unknown.
+static void LogDrop(const char* fn, RValue& res, int argc, RValue** A);
+#ifdef FORGEPACT_RELEASE
+  #define BP_LOGDROP(a,b,c,d) ((void)0)
+#else
+  #define BP_LOGDROP(a,b,c,d) LogDrop(a,b,c,d)
+#endif
+
 // ===== Hook state =====
 static std::unordered_map<std::string, double> g_Config;   // modifier key -> value
 static PFUNC_YYGMLScript g_OrigGetInfo = nullptr;           // trampoline to original GetBloodPactInfo
@@ -219,6 +232,37 @@ static std::string FirstToken(const std::string& line, std::string& rest)
     while (!rest.empty() && (rest.back() == '\r' || rest.back() == '\n')) rest.pop_back();
     return tok;
 }
+
+// ===== ForgePact:: module includes ==========================================
+// Anchor point for the incremental class-based split of this file (2026-09).
+//
+// This has to sit here, this early, because DensityManager's own usage sites
+// (DensityWindowActive and friends, a few dozen lines below) are themselves
+// earlier in the file than several other modules' prerequisites - there is no
+// single later point that works for every module without forward-declaring
+// what is used before it is defined. The alternative (moving the anchor later
+// each time a module needs something not yet declared) ran out of room here;
+// forward-declaring is the sustainable fix for the remaining modules too.
+//
+// Only Out/Lower/FirstToken (just defined above) are needed unqualified by
+// the class bodies; everything else a class calls into ModuleMain for is
+// forward-declared right here, specifically so this include block can move
+// only forward from now on, never back:
+static bool HookOneScript(const char* shortName, const char* id, PVOID dest, PFUNC_YYGMLScript* origOut);
+static bool HhResolveLocalPlayer(RValue& out, std::string* how = nullptr);
+static void InstallCreateHooks();
+static void InstallDensityLifecycleHooks();
+static void OpenDensityWindow();
+static void RunCommand(const std::string& line);
+
+#include <ForgePact/Common.hpp>
+#include <ForgePact/MapRevealManager.hpp>
+#include <ForgePact/StatsManager.hpp>
+#include <ForgePact/RelicFilterMod.hpp>
+#include <ForgePact/DensityManager.hpp>
+#include <ForgePact/DropManager.hpp>
+#include <ForgePact/IpcServer.hpp>
+#include <ForgePact/ModManager.hpp>
 
 static void DoScriptLookup(const std::string& name)
 {
@@ -634,10 +678,10 @@ static void PerfReport()
 #define PERF_SCOPE(bucket)
 #endif
 
-static double g_CreatorMult = 1.0;          // ALL Enemy_Creator* spawners (density).  Kesirli olabilir: 1.5, 2.5 ...
+// Density multiplier + fractional carry moved to ForgePact::DensityManager
+// (Instance().Mult / .Frac) - module includes anchor above, after FirstToken.
 static bool g_CallerIsEnemy = false;                 // set while a monster's own instance_create runs (see EnemyBornScope)
 static volatile LONG g_DensitySkippedEnemyBorn = 0;
-static double g_CreatorFrac = 0.0;          // kesir birikimi - 1.5x'te her ikinci ureticiye bir fazla kopya
 static std::unordered_map<int, bool> g_IsEnemyCache;   // object index -> is enemy descendant
 static std::unordered_map<int, bool> g_IsCreatorCache; // object index -> name starts with "Enemy_Creator"
 static std::vector<int8_t> g_IsCreatorFast;
@@ -667,7 +711,7 @@ static void OpenDensityWindow()
 
 static bool DensityWindowActive()
 {
-    if (g_CreatorMult <= 1.0 || g_RuntimeFrame > g_DensityWindowHardEnd)
+    if (ForgePact::DensityManager::Instance().Mult <= 1.0 || g_RuntimeFrame > g_DensityWindowHardEnd)
         return false;
     return !g_DensityWindowSawCreator
         || g_RuntimeFrame <= g_DensityWindowLastCreator + kDensityWindowIdleFrames;
@@ -789,7 +833,7 @@ static void ForgetDensityPlacements()
 {
     std::lock_guard<std::mutex> lock(g_DensityPlacementMutex);
     g_DensityKnownPlacements.clear();
-    g_CreatorFrac = 0.0;
+    ForgePact::DensityManager::Instance().Frac = 0.0;
 }
 
 static size_t DensityPlacementCount()
@@ -991,7 +1035,7 @@ static void DoMultiCreate(TRoutine orig, RValue& Result, CInstance* S, CInstance
     const bool ozelIcerik = mult > 1;
     const bool specialChild = g_SpecialCreateDepth > 0;
     const bool knownCreator = IsCachedCreatorObject(objIdx);
-    const bool inspectCreator = g_CreatorMult > 1.0
+    const bool inspectCreator = ForgePact::DensityManager::Instance().Mult > 1.0
         && (knownCreator || DensityWindowActive() || specialChild);
     const bool isCreator = inspectCreator
         && (knownCreator || IsCreatorObject(objIdx));
@@ -1012,7 +1056,7 @@ static void DoMultiCreate(TRoutine orig, RValue& Result, CInstance* S, CInstance
     // density: multiply all Enemy_Creator* spawners (produces fully-configured enemies)
     if (g_CallerIsEnemy && isCreator) InterlockedIncrement(&g_DensitySkippedEnemyBorn);
 #ifndef FORGEPACT_RELEASE
-    if (g_CreatorMult > 1.0 && isCreator && !specialChild && !g_CallerIsEnemy && !densityAlreadyApplied && knownCreator && !DensityWindowActive()) {
+    if (ForgePact::DensityManager::Instance().Mult > 1.0 && isCreator && !specialChild && !g_CallerIsEnemy && !densityAlreadyApplied && knownCreator && !DensityWindowActive()) {
         static long s_LateLogs = 0;
         if (++s_LateLogs <= 60) {
             std::string who = "?"; try { RValue n = g_Yytk->CallBuiltin("object_get_name", { RValue((double)CallerObjectIndex(S)) }); who = n.ToString(); } catch (...) {}
@@ -1021,17 +1065,17 @@ static void DoMultiCreate(TRoutine orig, RValue& Result, CInstance* S, CInstance
         }
     }
 #endif
-    if (g_CreatorMult > 1.0 && isCreator && !specialChild && !g_CallerIsEnemy
+    if (ForgePact::DensityManager::Instance().Mult > 1.0 && isCreator && !specialChild && !g_CallerIsEnemy
         && !densityAlreadyApplied
         && (knownCreator || DensityWindowActive())) {
         // Tam kisim herkese; kesir kismi birikime yayilir ve 1'e ulasinca
         // O ureticiye bir fazla kopya dusar.  Rastgelelik yok, deterministik.
-        int tam = (int)g_CreatorMult;
-        double kesir = g_CreatorMult - (double)tam;
+        int tam = (int)ForgePact::DensityManager::Instance().Mult;
+        double kesir = ForgePact::DensityManager::Instance().Mult - (double)tam;
         int m = tam;
         if (kesir > 0.0) {
-            g_CreatorFrac += kesir;
-            if (g_CreatorFrac >= 1.0) { g_CreatorFrac -= 1.0; m += 1; }
+            ForgePact::DensityManager::Instance().Frac += kesir;
+            if (ForgePact::DensityManager::Instance().Frac >= 1.0) { ForgePact::DensityManager::Instance().Frac -= 1.0; m += 1; }
         }
         if (m > mult) mult = m;
     }
@@ -1261,7 +1305,7 @@ struct EnemyBornScope
     EnemyBornScope(RValue& r, CInstance* S, int argc, RValue* Args) : result(r)
     {
         try { if (argc >= 4) objIdx = (int)Args[3].ToDouble(); } catch (...) {}
-        if (!(RarityFloorActive() || TyrantActive() || g_CreatorMult > 1.0)) return;
+        if (!(RarityFloorActive() || TyrantActive() || ForgePact::DensityManager::Instance().Mult > 1.0)) return;
         if (!(IsEnemyObject(objIdx) || IsCachedCreatorObject(objIdx))) return;
         if (!CallerIsEnemyInstance(S)) return;   // only a real monster starts a chain
         active = true; prevCreating = g_CreatingFromEnemy; prevCaller = g_CallerIsEnemy;
@@ -1292,7 +1336,7 @@ static void HookICD(RValue& Result, CInstance* S, CInstance* O, int argc, RValue
     // A hook installed earlier in this process cannot be removed safely while
     // the game is running.  With every related feature Off, take a true native
     // pass-through path: no object lookup, cache access or post-create work.
-    if (g_CreatorMult <= 1.0 && g_EnemyMultAll <= 1 && g_ObjMult.empty()) {
+    if (ForgePact::DensityManager::Instance().Mult <= 1.0 && g_EnemyMultAll <= 1 && g_ObjMult.empty()) {
         if (g_OrigICD) g_OrigICD(Result, S, O, argc, Args);
         return;
     }
@@ -1306,7 +1350,7 @@ static void HookICD(RValue& Result, CInstance* S, CInstance* O, int argc, RValue
     // Special Content keeps the create hook installed, but ordinary combat
     // objects are not special markers. One indexed read is enough to return to
     // the original builtin without entering the multiplier machinery.
-    const bool densityCreate = g_CreatorMult > 1.0
+    const bool densityCreate = ForgePact::DensityManager::Instance().Mult > 1.0
         && (DensityWindowActive() || IsCachedCreatorObject(objIdx));
     if (!densityCreate && g_EnemyMultAll <= 1 && g_SpecialCreateDepth == 0
         && ObjectMultiplier(objIdx) <= 1) {
@@ -1325,7 +1369,7 @@ static void HookICL(RValue& Result, CInstance* S, CInstance* O, int argc, RValue
     EnemyBornScope _born(Result, S, argc, Args);
     if (argc >= 4 && HeadhunterRunning()) { try { HhDeathEffectTrigger(S, (int)Args[3].ToDouble()); } catch (...) {} }
 #ifdef FORGEPACT_RELEASE
-    if (g_CreatorMult <= 1.0 && g_EnemyMultAll <= 1 && g_ObjMult.empty()) {
+    if (ForgePact::DensityManager::Instance().Mult <= 1.0 && g_EnemyMultAll <= 1 && g_ObjMult.empty()) {
         if (g_OrigICL) g_OrigICL(Result, S, O, argc, Args);
         return;
     }
@@ -1336,7 +1380,7 @@ static void HookICL(RValue& Result, CInstance* S, CInstance* O, int argc, RValue
     int objIdx = -1;
     try { if (argc >= 4) objIdx = (int)Args[3].ToDouble(); } catch (...) {}
 #ifdef FORGEPACT_RELEASE
-    const bool densityCreate = g_CreatorMult > 1.0
+    const bool densityCreate = ForgePact::DensityManager::Instance().Mult > 1.0
         && (DensityWindowActive() || IsCachedCreatorObject(objIdx));
     if (!densityCreate && g_EnemyMultAll <= 1 && g_SpecialCreateDepth == 0
         && ObjectMultiplier(objIdx) <= 1) {
@@ -2602,11 +2646,8 @@ static void LogDrop(const char* fn, RValue& res, int argc, RValue** A)
 // ===== Drop-rate hooks (multiply drop calls = more items per drop event) =====
 // Gunluk yalnizca gelistirme derlemesinde: itemdrops.jsonl tek oturumda 8 MB'a
 // ulasiyordu.  Carpan mantigi her iki derlemede de calisir.
-#ifdef FORGEPACT_RELEASE
-  #define BP_LOGDROP(a,b,c,d) ((void)0)
-#else
-  #define BP_LOGDROP(a,b,c,d) LogDrop(a,b,c,d)
-#endif
+// (BP_LOGDROP itself is defined near BP_DIAG_INCREMENT, at the top of the
+// file - ForgePact::DropManager's hook bodies need it before this point.)
 
 // ===== Custom Item Forge ===================================================
 //
@@ -3477,45 +3518,11 @@ static bool TryApplyCustomForge(RValue* candidate, bool finalPass = false)
     return false;
 }
 
-// ===== Object-Oriented Mod Component: RelicFilterManager =====
-class RelicFilterManager {
-public:
-    static RelicFilterManager& Instance() {
-        static RelicFilterManager s_Instance;
-        return s_Instance;
-    }
-
-    bool IsEnabled() const { return m_Enabled.load(); }
-    void SetEnabled(bool enabled) { m_Enabled.store(enabled); }
-
-    void GetPlayerMaxedRelics(std::unordered_set<int>& outMaxed) const;
-
-private:
-    std::atomic<bool> m_Enabled{ false };
-};
-
-static std::atomic<bool> g_FilterMaxRelics{ false };
-// Set when `relicfilter 1` arrives before a player exists; the frame callback
-// installs the DropRelic hook later (see FrameCallback).
-static std::atomic<bool> g_RelicFilterPending{ false };
-static bool HhResolveLocalPlayer(RValue& out, std::string* how = nullptr);
-
-inline void RelicFilterManager::GetPlayerMaxedRelics(std::unordered_set<int>& outMaxed) const
-{
-    outMaxed.clear();
-    if (!m_Enabled.load()) return;
-    try {
-        RValue player;
-        if (!HhResolveLocalPlayer(player)) return;
-        outMaxed = HeroSiege::Player::GetMaxedRelicIds(g_Yytk, player);
-    } catch (...) {}
-}
-
-static void GetPlayerMaxedRelics(std::unordered_set<int>& outMaxed)
-{
-    RelicFilterManager::Instance().SetEnabled(g_FilterMaxRelics.load());
-    RelicFilterManager::Instance().GetPlayerMaxedRelics(outMaxed);
-}
+// Relic filter (RelicFilterManager, g_FilterMaxRelics, g_RelicFilterPending,
+// and the GetPlayerMaxedRelics wrapper) moved to ForgePact::RelicFilterMod
+// (module includes anchor near the top of the file, after FirstToken).
+// HhResolveLocalPlayer's `how = nullptr` default is declared there now, not
+// here - a default argument may only be specified once per translation unit.
 
 static void CustomForgePostProcess(RValue& result, int argc, RValue** args, bool finalPass)
 {
@@ -3943,6 +3950,7 @@ static bool HhResolveLocalPlayer(RValue& out, std::string* how)
     if (how) *how = "none";
     return false;
 }
+
 static long g_HhHudCalls = 0, g_HhLabelDraws = 0;
 static std::string g_HhLabelLastErr;
 // Draw GUI phase: project the player's position through the active camera and draw the
@@ -5462,123 +5470,9 @@ static void HeadhunterActivityTick()
         return _res; \
     }
 
-// ===== Oyuncu istatistigi carpanlari =====================================
-// Blood Pact'in Magic Find / Attack Speed / Cast Rate / Experience gain /
-// Movement Speed satirlari bir DEPODA durmuyor.  Oyuncunun
-// uzerinde boyle degiskenler yok (olculdu: iget magic_find -> "boyle bir
-// degisken yok"), pSt dizisi de deger degil tutamac tutuyor.
-//
-// Her stat icin bir Stat<Ad> betigi var ve oyun degeri her ihtiyac duydugunda
-// oradan okuyor.  O yuzden depoyu aramak yerine DONEN DEGERI carpiyoruz -
-// tek nokta, tum kullanicilari birden etkiliyor.
-//
-// Carpan 1.0 iken kanca hicbir sey yapmaz; vanilya davranis birebir korunur.
-
-// Carpan her kanca icin AYRI bir double.  Onceki surum std::map'te metin
-// anahtariyla ariyordu; bu her cagrida gecici bir std::string kurup bellek
-// ayiriyordu.  Bu fonksiyonlar oyunun en sicak yollarinda (olculdu: tek
-// oturumda StatMovementSpeed 6083, StatTotalDamage 2350 cagri), oraya
-// tahsis koymak dogru degil.
-// Stat* betikleri DIZI donduruyor - olculdu 2026-08-28:
-//     StatMovementSpeed -> [305.108..., 0, 0, 600]
-// ve ilk eleman karakter ekranindaki degerin ta kendisi (305).  Onceki surum
-// dizinin ToDouble()'ini carpiyordu; bu anlamsiz bir sayi uretiyordu.  Magic
-// Find'da hicbir etki gorulmemesinin ve hareket hizinda oyunun kasmasinin
-// sebebi buydu.
-//
-// Diziyi YERINDE degistirmiyoruz: oyun ayni diziyi her cagrida yeniden
-// kullaniyor olabilir, o zaman carpan her karede birikip patlardi.  Kopya
-// uretip yalnizca [0]'i olcekliyoruz.
-static RValue StatOlcekle(RValue& deger, double carpan)
-{
-    if (deger.m_Kind != VALUE_ARRAY)
-        return RValue(deger.ToDouble() * carpan);
-    int n = (int)g_Yytk->CallBuiltin("array_length", { deger }).ToDouble();
-    if (n <= 0) return deger;
-    RValue kopya = g_Yytk->CallBuiltin("array_create", { RValue((double)n) });
-    for (int i = 0; i < n; i++) {
-        RValue e = g_Yytk->CallBuiltin("array_get", { deger, RValue((double)i) });
-        if (i == 0) e = RValue(e.ToDouble() * carpan);
-        g_Yytk->CallBuiltin("array_set", { kopya, RValue((double)i), e });
-    }
-    return kopya;
-}
-
-// Faster Cast Rate'in vanilya tabani 0'dır.  Sifiri carpmak her zaman sifir
-// verdigi icin bu statta yuzde puani EKLEMEK gerekir (+50 -> FCR 0'dan 50'ye).
-// Diger statlar mevcut toplam uzerinden oransal olarak carpilir.
-static RValue StatEkle(RValue& deger, double ek)
-{
-    if (deger.m_Kind != VALUE_ARRAY)
-        return RValue(deger.ToDouble() + ek);
-    int n = (int)g_Yytk->CallBuiltin("array_length", { deger }).ToDouble();
-    if (n <= 0) return deger;
-    RValue kopya = g_Yytk->CallBuiltin("array_create", { RValue((double)n) });
-    for (int i = 0; i < n; i++) {
-        RValue e = g_Yytk->CallBuiltin("array_get", { deger, RValue((double)i) });
-        if (i == 0) e = RValue(e.ToDouble() + ek);
-        g_Yytk->CallBuiltin("array_set", { kopya, RValue((double)i), e });
-    }
-    return kopya;
-}
-
-#define STAT_HOOK(NAME) \
-    static PFUNC_YYGMLScript g_OrigStat_##NAME = nullptr; \
-    static volatile long g_StatSayac_##NAME = 0; \
-    static double g_StatCarpan_##NAME = 1.0; \
-    static RValue& HookStat_##NAME(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A) { \
-        BP_DIAG_INCREMENT(g_StatSayac_##NAME); \
-        RValue& _r = g_OrigStat_##NAME ? g_OrigStat_##NAME(S, O, R, argc, A) : R; \
-        if (g_StatCarpan_##NAME != 1.0) { \
-            try { _r = StatOlcekle(_r, g_StatCarpan_##NAME); } catch (...) {} \
-        } \
-        return _r; \
-    }
-
-#define STAT_ADD_HOOK(NAME) \
-    static PFUNC_YYGMLScript g_OrigStatAdd_##NAME = nullptr; \
-    static volatile long g_StatAddSayac_##NAME = 0; \
-    static double g_StatEk_##NAME = 0.0; \
-    static RValue& HookStatAdd_##NAME(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A) { \
-        BP_DIAG_INCREMENT(g_StatAddSayac_##NAME); \
-        RValue& _r = g_OrigStatAdd_##NAME ? g_OrigStatAdd_##NAME(S, O, R, argc, A) : R; \
-        if (g_StatEk_##NAME != 0.0) { \
-            try { _r = StatEkle(_r, g_StatEk_##NAME); } catch (...) {} \
-        } \
-        return _r; \
-    }
-
-STAT_HOOK(StatMagicFind)
-// The aggregate StatAttackSpeed result is the value consumed by the live
-// attack-timing path.  MainHand/OffHand are detail helpers used by the stat
-// query/UI path and can remain completely idle after the character is loaded.
-// Hooking the aggregate script also matches the previously live-verified
-// ForgePact implementation.
-STAT_HOOK(StatAttackSpeed)
-STAT_ADD_HOOK(StatFasterCastRate)
-STAT_HOOK(StatExperienceGain)
-STAT_HOOK(StatMovementSpeed)
-STAT_HOOK(StatExtraGold)
-STAT_HOOK(StatLifeReplenish)
-STAT_HOOK(StatManaReplenish)
-STAT_HOOK(StatDefense)
-STAT_HOOK(StatCritDamage)
-STAT_HOOK(StatCritRate)
-STAT_HOOK(StatSpellCritDamage)
-STAT_HOOK(StatSpellCritRate)
-// Gercek son vurus hasari.  StatTotalDamage yalnizca karakter istatistigi
-// hesap/arayuz yoludur; onu carpmak dusmana giden hasari degistirmedi.
-// Canli olcumde CalculateEndDamage her vurus icin 5645/5807/6007 gibi nihai
-// sayiyi dondurdu ve ayni sayi hemen RunDamageSync'e girdi.  Bu nedenle hasar
-// carpani tam burada, oyunun kendi hesaplamasi bittikten sonra uygulanir.
-STAT_HOOK(CalculateEndDamage)
-// XP carpani.  Hedef EnemyCalculateExperience'in DONUS degeri.
-// HSStatForge burayi degil, fonksiyonun icindeki bir `1.0` SABITINI
-// yamaliyordu (xmm11 basta .rdata'dan yukleniyor ve hic degismiyor),
-// o yuzden orada carpan hicbir sey yapmiyor.  Donus degeri ise tanimi
-// geregi hesaplanan deneyim - carpilacak dogru yer burasi.
-STAT_HOOK(EnemyCalculateExperience)
-
+// Player stat multipliers (stat/statadd commands) and the XP combat-text
+// display fix moved to ForgePact::StatsManager (module includes anchor
+// after HhResolveLocalPlayer, above).
 // ===== Enemy movement speed (World -> Enemy Movement Speed) =====
 // PathFindStartPath is the one place the game turns an enemy's base speed
 // into path speed:  moveSpeedCur = moveSpeed * movementSpdMultiplier
@@ -5665,118 +5559,16 @@ static void EnemySpeedCmd(const std::string& rest)
     Out(b);
 }
 
-// Yaratigin ustunde beliren "2 XP" baloncugu.
-//
-// Olculdu: oyuncuya verilen deger dogru carpiliyor
-// (EnemyGiveExperience 200, ExperienceUpdate 200) ama baloncuk sayiyi degil
-// ZATEN BICIMLENMIS bir metin aliyor - CombatText("2 XP", ...) - ve o metin
-// carpandan once uretiliyor.  Sonuc: oyuncu 200 aliyor, ekranda 2 yaziyor.
-//
-// Burada yalnizca METNI yeniden yaziyoruz.  Verilen XP'ye dokunulmuyor;
-// bu tamamen gorsel bir duzeltme.
-static PFUNC_YYGMLScript g_OrigCombatText = nullptr;
-static RValue& Hook_CombatText(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A)
-{
-    RValue yeni;
-    std::vector<RValue*> A2;
-    double c = g_StatCarpan_EnemyCalculateExperience;
-    if (c != 1.0 && A && argc > 0 && A[0] && A[0]->m_Kind == VALUE_STRING) {
-        try {
-            std::string s = A[0]->ToString();
-            static const std::string sonek = " XP";
-            if (s.size() > sonek.size() &&
-                s.compare(s.size() - sonek.size(), sonek.size(), sonek) == 0) {
-                std::string sayi = s.substr(0, s.size() - sonek.size());
-                size_t kac = 0;
-                double n = std::stod(sayi, &kac);
-                if (kac == sayi.size()) {          // tamami sayi olmali
-                    char b[64];
-                    sprintf_s(b, "%.0f XP", n * c);
-                    yeni = RValue(b);
-                    A2.assign(A, A + argc);
-                    A2[0] = &yeni;
-                }
-            }
-        } catch (...) {}
-    }
-    RValue** kullan = A2.empty() ? A : A2.data();
-    return g_OrigCombatText ? g_OrigCombatText(S, O, R, argc, kullan) : R;
-}
 
 // ===== Relic Drop Pool Filter Mod (Remove owned relics from drop pool) =====
 static PFUNC_YYGMLScript g_Orig_DropRelic = nullptr;
 static volatile long g_cnt_DropRelic = 0;
 static int g_mult_DropRelic = 1;
 
-static void ScanItemForMaxRelic(const RValue& item, std::unordered_set<int>& outMaxed)
-{
-    try {
-        if (item.m_Kind != VALUE_OBJECT || !item.m_Object) return;
-        RValue hasB = g_Yytk->CallBuiltin("variable_struct_exists", { item, RValue("b") });
-        if (!hasB.ToBoolean()) return;
-        RValue bVal = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("b") });
-        if (bVal.m_Kind != VALUE_REAL && bVal.m_Kind != VALUE_INT32 && bVal.m_Kind != VALUE_INT64) return;
-        int b = static_cast<int>(bVal.ToDouble());
-        if (b < 0 || b >= kSeason10RelicRepoCount) return;
-
-        bool isRelic = false;
-        double level = 0.0;
-
-        RValue hasCls = g_Yytk->CallBuiltin("variable_struct_exists", { item, RValue("cls") });
-        if (hasCls.ToBoolean()) {
-            RValue clsVal = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("cls") });
-            if (static_cast<int>(clsVal.ToDouble()) == 16) isRelic = true;
-        }
-
-        RValue hasG = g_Yytk->CallBuiltin("variable_struct_exists", { item, RValue("g") });
-        if (hasG.ToBoolean()) {
-            RValue gVal = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("g") });
-            int g = static_cast<int>(gVal.ToDouble());
-            if (g >= 10 && g <= 14) isRelic = true;
-        }
-
-        RValue hasO = g_Yytk->CallBuiltin("variable_struct_exists", { item, RValue("o") });
-        if (hasO.ToBoolean()) {
-            RValue oVal = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("o") });
-            level = oVal.ToDouble();
-        }
-        RValue hasRL = g_Yytk->CallBuiltin("variable_struct_exists", { item, RValue("relicLevel") });
-        if (hasRL.ToBoolean()) {
-            RValue rlVal = g_Yytk->CallBuiltin("variable_struct_get", { item, RValue("relicLevel") });
-            if (rlVal.ToDouble() > level) level = rlVal.ToDouble();
-            isRelic = true;
-        }
-
-        if (isRelic && level >= 10.0) {
-            outMaxed.insert(b);
-        }
-    } catch (...) {}
-}
-
-static void ScanContainerForMaxRelics(const RValue& container, std::unordered_set<int>& outMaxed, int depth = 0)
-{
-    if (depth > 5) return;
-    try {
-        if (container.m_Kind == VALUE_OBJECT && container.m_Object) {
-            ScanItemForMaxRelic(container, outMaxed);
-            RValue names = g_Yytk->CallBuiltin("variable_struct_get_names", { container });
-            if (names.m_Kind == VALUE_ARRAY) {
-                int count = static_cast<int>(g_Yytk->CallBuiltin("array_length", { names }).ToDouble());
-                for (int i = 0; i < count; ++i) {
-                    RValue key = g_Yytk->CallBuiltin("array_get", { names, RValue(static_cast<double>(i)) });
-                    RValue child = g_Yytk->CallBuiltin("variable_struct_get", { container, key });
-                    ScanContainerForMaxRelics(child, outMaxed, depth + 1);
-                }
-            }
-        } else if (container.m_Kind == VALUE_ARRAY) {
-            int len = static_cast<int>(g_Yytk->CallBuiltin("array_length", { container }).ToDouble());
-            for (int i = 0; i < len; ++i) {
-                RValue child = g_Yytk->CallBuiltin("array_get", { container, RValue(static_cast<double>(i)) });
-                ScanContainerForMaxRelics(child, outMaxed, depth + 1);
-            }
-        }
-    } catch (...) {}
-}
+// (An earlier container-walking maxed-relic scan lived here; it was never
+// actually called - GetPlayerMaxedRelics uses the SDK's own
+// HeroSiege::Player::GetMaxedRelicIds - and was deleted as dead code rather
+// than migrated into ForgePact::RelicFilterMod.)
 
 static RValue& Hook_DropRelic(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A) {
     BP_DIAG_INCREMENT(g_cnt_DropRelic);
@@ -5784,8 +5576,8 @@ static RValue& Hook_DropRelic(CInstance* S, CInstance* O, RValue& R, int argc, R
     std::unordered_set<int> maxedRelics;
     std::vector<std::pair<int, double>> modifiedBases;
 
-    if (g_FilterMaxRelics.load()) {
-        GetPlayerMaxedRelics(maxedRelics);
+    if (ForgePact::RelicFilterMod::Instance().IsEnabled()) {
+        ForgePact::RelicFilterMod::Instance().GetPlayerMaxedRelics(maxedRelics);
 
         if (!maxedRelics.empty() && maxedRelics.size() < static_cast<size_t>(kSeason10RelicRepoCount)) {
             for (int rId : maxedRelics) {
@@ -5823,7 +5615,7 @@ static RValue& Hook_DropRelic(CInstance* S, CInstance* O, RValue& R, int argc, R
     }
 
     // Secondary guarantee: If dropped result or instance is in maxedRelics, reroll to unmaxed relic
-    if (g_FilterMaxRelics.load() && !maxedRelics.empty() && maxedRelics.size() < static_cast<size_t>(kSeason10RelicRepoCount)) {
+    if (ForgePact::RelicFilterMod::Instance().IsEnabled() && !maxedRelics.empty() && maxedRelics.size() < static_cast<size_t>(kSeason10RelicRepoCount)) {
         std::vector<int> validRelics;
         for (int i = 0; i < kSeason10RelicRepoCount; ++i) {
             if (maxedRelics.find(i) == maxedRelics.end()) {
@@ -5848,55 +5640,12 @@ static RValue& Hook_DropRelic(CInstance* S, CInstance* O, RValue& R, int argc, R
     BP_LOGDROP("DropRelic", _res, argc, A);
     return _res;
 }
-DROP_HOOK(DropBossGems)
-DROP_HOOK(DropDungeonKeys)
-DROP_HOOK(DropBossRunes)
-DROP_HOOK(DropBattleFragments)
-DROP_HOOK(DropDimensionalShard)
-DROP_HOOK(DropBifrostKey)
-DROP_HOOK(DropGold)
-DROP_HOOK(DropItemBoss)
-DROP_HOOK(DropItem)
-DROP_HOOK(CreateItemDrop)
-DROP_HOOK(DropItemAngelic)
-DROP_HOOK(DropAngelicKey)
-DROP_HOOK(DropAngelicCharm)
-// Asil trafik bu yollardan geciyor - olculdu: DropGold 4 cagri, DropMonsterGold
-// yaratik basina.  DropDungeonKeys hic cagrilmiyor, anahtarlar DropKeys'ten.
-DROP_HOOK(DropMonsterGold)
-#ifdef FORGEPACT_RELEASE
-DROP_HOOK(DropKeys)
-#else
-static PFUNC_YYGMLScript g_Orig_DropKeys = nullptr; static volatile long g_cnt_DropKeys = 0; static int g_mult_DropKeys = 1;
-static RValue& Hook_DropKeys(CInstance* S, CInstance* O, RValue& R, int argc, RValue** A) {
-    InterlockedIncrement(&g_cnt_DropKeys);
-    for (int i = 1; i < g_mult_DropKeys; i++) { RValue t; if (g_Orig_DropKeys) g_Orig_DropKeys(S, O, t, argc, A); }
-    RValue& _res = g_Orig_DropKeys ? g_Orig_DropKeys(S, O, R, argc, A) : R;
-    BP_LOGDROP("DropKeys", _res, argc, A);
-    // Hangi anahtar secildi, neden - kullanici gozlemi: yalnizca Chaos/Basic/Crystal dusuyor.
-    try {
-        std::string ad = "?";
-        if (_res.m_Kind == VALUE_OBJECT) {
-            RValue info = g_Yytk->CallBuiltin("variable_struct_get", { _res, RValue("itemInfoStruct") });
-            if (info.m_Kind == VALUE_OBJECT) {
-                RValue nm = g_Yytk->CallBuiltin("variable_struct_get", { info, RValue("28") });
-                ad = nm.ToString();
-            }
-        }
-        RValue rm = g_Yytk->CallBuiltin("variable_global_get", { RValue("room") });
-        std::ofstream f(IPC_DIR + "\\keychoice.txt", std::ios::app);
-        f << "DropKeys -> " << ad << "   room=" << (int)rm.ToDouble() << "\n";
-        f.flush();
-    } catch (...) {}
-    return _res;
-}
-#endif
-DROP_HOOK(DropChaosKey)
-DROP_HOOK(DropRubyKey)
-// Ores: DropOres runs from DropItem (the plain monster drop, its own tiered dice),
-// DropOreMaterials is a LoadDrops type.  Mining nodes are a different system.
-DROP_HOOK(DropOres)
-DROP_HOOK(DropOreMaterials)
+// The 19 domain hooks above (DropBossGems .. DropOreMaterials, including
+// DropKeys' dev-only diagnostic variant) moved to ForgePact::DropManager
+// (module includes anchor near the top of the file, after FirstToken).
+// DropRelic stays here - shared chokepoint with RelicFilterMod, see its
+// own comment. LootGroundCreate/LootGroundCreateFromItem below are a
+// separate research-tracing feature, not part of dropmult, and stay too.
 // Esyayi YERE koyan fonksiyon - "yaratildi" ile "dustu" farkini olcmek icin.
 DROP_HOOK(LootGroundCreate)
 // LootGroundCreate calisma aninda HIC cagrilmadi (olculdu: 0).
@@ -6043,25 +5792,7 @@ static void InstallDropMultHooks()
     // cause duplicate MmCreateHook attempts on the hooks that did succeed.
     g_DropMultHooksInstalled = true;
     HookOneScript("DropRelic",           "bp_drelic",   (PVOID)Hook_DropRelic,           &g_Orig_DropRelic);
-    HookOneScript("DropBossGems",        "bp_dgems",    (PVOID)Hook_DropBossGems,        &g_Orig_DropBossGems);
-    HookOneScript("DropDungeonKeys",     "bp_ddkeys",   (PVOID)Hook_DropDungeonKeys,     &g_Orig_DropDungeonKeys);
-    HookOneScript("DropBossRunes",       "bp_drunes",   (PVOID)Hook_DropBossRunes,       &g_Orig_DropBossRunes);
-    HookOneScript("DropBattleFragments", "bp_dfrag",    (PVOID)Hook_DropBattleFragments, &g_Orig_DropBattleFragments);
-    HookOneScript("DropDimensionalShard","bp_dshard",   (PVOID)Hook_DropDimensionalShard,&g_Orig_DropDimensionalShard);
-    HookOneScript("DropBifrostKey",      "bp_dbifrost", (PVOID)Hook_DropBifrostKey,      &g_Orig_DropBifrostKey);
-    HookOneScript("DropGold",            "bp_dgold",    (PVOID)Hook_DropGold,            &g_Orig_DropGold);
-    HookOneScript("DropItemBoss",        "bp_dibos",    (PVOID)Hook_DropItemBoss,        &g_Orig_DropItemBoss);
-    HookOneScript("DropItem",            "bp_ditem",    (PVOID)Hook_DropItem,            &g_Orig_DropItem);
-    HookOneScript("CreateItemDrop",      "bp_citemd",   (PVOID)Hook_CreateItemDrop,      &g_Orig_CreateItemDrop);
-    HookOneScript("DropItemAngelic",     "bp_dangit",   (PVOID)Hook_DropItemAngelic,     &g_Orig_DropItemAngelic);
-    HookOneScript("DropAngelicKey",      "bp_dangkey",  (PVOID)Hook_DropAngelicKey,      &g_Orig_DropAngelicKey);
-    HookOneScript("DropAngelicCharm",    "bp_dangchm",  (PVOID)Hook_DropAngelicCharm,    &g_Orig_DropAngelicCharm);
-    HookOneScript("DropMonsterGold",     "bp_dmgold",   (PVOID)Hook_DropMonsterGold,     &g_Orig_DropMonsterGold);
-    HookOneScript("DropKeys",            "bp_dkeys",    (PVOID)Hook_DropKeys,            &g_Orig_DropKeys);
-    HookOneScript("DropChaosKey",        "bp_dckey",    (PVOID)Hook_DropChaosKey,        &g_Orig_DropChaosKey);
-    HookOneScript("DropRubyKey",         "bp_drkey",    (PVOID)Hook_DropRubyKey,         &g_Orig_DropRubyKey);
-    HookOneScript("DropOres",            "bp_dores",    (PVOID)Hook_DropOres,            &g_Orig_DropOres);
-    HookOneScript("DropOreMaterials",    "bp_doremat",  (PVOID)Hook_DropOreMaterials,    &g_Orig_DropOreMaterials);
+    ForgePact::DropManager::Instance().InstallHooks();
 }
 
 // ===== Forged tooltip rows (Custom Forge `affix=` / Headhunter) ==================
@@ -6338,27 +6069,9 @@ static void InstallCustomForgeItemHooks()
 static void DropStats()
 {
     char b[400];
-    sprintf_s(b, "dropstats: Relic c=%ld x%d | BossGems c=%ld x%d | DungeonKeys c=%ld x%d | BossRunes c=%ld x%d",
-        g_cnt_DropRelic, g_mult_DropRelic, g_cnt_DropBossGems, g_mult_DropBossGems,
-        g_cnt_DropDungeonKeys, g_mult_DropDungeonKeys, g_cnt_DropBossRunes, g_mult_DropBossRunes);
+    sprintf_s(b, "dropstats: Relic c=%ld x%d", g_cnt_DropRelic, g_mult_DropRelic);
     Out(b);
-    sprintf_s(b, "          BattleFrag c=%ld x%d | DimShard c=%ld x%d | Bifrost c=%ld x%d | Gold c=%ld x%d",
-        g_cnt_DropBattleFragments, g_mult_DropBattleFragments, g_cnt_DropDimensionalShard, g_mult_DropDimensionalShard,
-        g_cnt_DropBifrostKey, g_mult_DropBifrostKey, g_cnt_DropGold, g_mult_DropGold);
-    Out(b);
-    sprintf_s(b, "          ItemBoss c=%ld x%d | Item c=%ld x%d | CreateItemDrop c=%ld x%d",
-        g_cnt_DropItemBoss, g_mult_DropItemBoss, g_cnt_DropItem, g_mult_DropItem,
-        g_cnt_CreateItemDrop, g_mult_CreateItemDrop);
-    Out(b);
-    sprintf_s(b, "          Ores c=%ld x%d | OreMaterials c=%ld x%d",
-        g_cnt_DropOres, g_mult_DropOres, g_cnt_DropOreMaterials, g_mult_DropOreMaterials);
-    Out(b);
-    // Asil trafigin gectigi yollar - DropGold/DropDungeonKeys neredeyse hic
-    // cagrilmiyor, gercek altin ve anahtarlar buradan geliyor.
-    sprintf_s(b, "          MonsterGold c=%ld x%d | Keys c=%ld x%d | ChaosKey c=%ld x%d | RubyKey c=%ld x%d",
-        g_cnt_DropMonsterGold, g_mult_DropMonsterGold, g_cnt_DropKeys, g_mult_DropKeys,
-        g_cnt_DropChaosKey, g_mult_DropChaosKey, g_cnt_DropRubyKey, g_mult_DropRubyKey);
-    Out(b);
+    ForgePact::DropManager::Instance().PrintStats();
 }
 
 static void SetDropMult(const std::string& name, int n)
@@ -6367,28 +6080,12 @@ static void SetDropMult(const std::string& name, int n)
     if (n < 1) n = 1;
     // Shipped builds start without drop hooks. Install them only when a real
     // multiplier is requested; x1 is native behaviour and needs no interception.
+    // (Also installs the shared DropRelic hook - see InstallDropMultHooks.)
     if (n > 1) InstallDropMultHooks();
-    // Tek kaydirac, ilgili BUTUN yollari ayarlar (olculdu: tek fonksiyon yetmiyor).
-    if (l == "relic") { g_mult_DropRelic = n; }
-    else if (l == "bossgems" || l == "gems") { g_mult_DropBossGems = n; }
-    else if (l == "dungeonkeys" || l == "keys") {
-        g_mult_DropDungeonKeys = n; g_mult_DropKeys = n;
-        g_mult_DropChaosKey = n; g_mult_DropRubyKey = n;
-    }
-    else if (l == "bossrunes" || l == "runes") { g_mult_DropBossRunes = n; }
-    else if (l == "battlefragments" || l == "frags") { g_mult_DropBattleFragments = n; }
-    else if (l == "dimshard" || l == "shards") { g_mult_DropDimensionalShard = n; }
-    else if (l == "bifrost") { g_mult_DropBifrostKey = n; }
-    else if (l == "gold") { g_mult_DropGold = n; g_mult_DropMonsterGold = n; }
-    else if (l == "bossitem" || l == "itemboss") { g_mult_DropItemBoss = n; }
-    else if (l == "item") { g_mult_DropItem = n; }
-    else if (l == "createitem") { g_mult_CreateItemDrop = n; }
-    else if (l == "angelic" || l == "angelicitem") { g_mult_DropItemAngelic = n; }
-    else if (l == "angelickey") { g_mult_DropAngelicKey = n; }
-    else if (l == "angeliccharm") { g_mult_DropAngelicCharm = n; }
-    else if (l == "ore" || l == "ores") { g_mult_DropOres = n; g_mult_DropOreMaterials = n; }
-    else { Out("dropmult: unknown '" + name + "' (relic|gems|keys|runes|frags|shards|bifrost|gold|bossitem|item|createitem|angelic|angelickey|angeliccharm|ore)"); return; }
-    Out("dropmult " + name + " -> " + std::to_string(n));
+    // "relic" is the one target ForgePact::DropManager doesn't own - see its
+    // class comment (Hook_DropRelic is shared with RelicFilterMod).
+    if (l == "relic") { g_mult_DropRelic = n; Out("dropmult " + name + " -> " + std::to_string(n)); return; }
+    ForgePact::DropManager::Instance().SetMultiplier(name, n);
 }
 
 // ===== Chaos Tower spawn-rate hooks (instrument + force) =====
@@ -6953,56 +6650,9 @@ static void PlayerVarSet(const std::string& var, double val)
     } catch (...) { Out("iset EXCEPTION"); }
 }
 
-// Auto map-reveal: fill each zone's discovered grid once.  The previous version
-// cleared the already-revealed grid every 20 frames for the entire session,
-// producing avoidable GameMaker calls during dense combat.
-static bool g_AutoReveal = false;
-static int64_t g_AutoRevealLastInstance = INT64_MIN;
-static int64_t g_AutoRevealLastGrid = INT64_MIN;
-static int64_t g_AutoRevealLastRoom = INT64_MIN;
-
-static void ResetAutoRevealIdentity()
-{
-    g_AutoRevealLastInstance = INT64_MIN;
-    g_AutoRevealLastGrid = INT64_MIN;
-    g_AutoRevealLastRoom = INT64_MIN;
-}
-
-static void AutoRevealTick()
-{
-    try {
-        RValue oi = g_Yytk->CallBuiltin("asset_get_index", { RValue("objMinimap") });
-        RValue id = g_Yytk->CallBuiltin("instance_find", { oi, RValue(0.0) });
-        if (id.ToDouble() < 0) { ResetAutoRevealIdentity(); return; }
-        RValue ex0 = g_Yytk->CallBuiltin("variable_instance_exists", { id, RValue("minimapDiscoveredGrid") });
-        if (!ex0.ToBoolean()) { ResetAutoRevealIdentity(); return; }
-        RValue grid = g_Yytk->CallBuiltin("variable_instance_get", { id, RValue("minimapDiscoveredGrid") });
-        double gid = grid.ToDouble();
-        if (gid < 0) { ResetAutoRevealIdentity(); return; }
-        RValue ex = g_Yytk->CallBuiltin("ds_exists", { RValue(gid), RValue(1.0) });
-        if (!ex.ToBoolean()) { ResetAutoRevealIdentity(); return; }
-
-        int64_t roomKey = INT64_MIN;
-        CInstance* global = nullptr;
-        if (AurieSuccess(g_Yytk->GetGlobalInstance(&global)) && global) {
-            RValue* room = nullptr;
-            if (AurieSuccess(g_Yytk->GetInstanceMember(RValue(global), "room", room)) && room) {
-                try { roomKey = static_cast<int64_t>(std::llround(room->ToDouble())); } catch (...) {}
-            }
-        }
-
-        const int64_t instanceKey = static_cast<int64_t>(std::llround(id.ToDouble()));
-        const int64_t gridKey = static_cast<int64_t>(std::llround(gid));
-        if (instanceKey == g_AutoRevealLastInstance &&
-            gridKey == g_AutoRevealLastGrid && roomKey == g_AutoRevealLastRoom)
-            return;
-
-        g_Yytk->CallBuiltin("ds_grid_clear", { RValue(gid), RValue(1.0) });
-        g_AutoRevealLastInstance = instanceKey;
-        g_AutoRevealLastGrid = gridKey;
-        g_AutoRevealLastRoom = roomKey;
-    } catch (...) {}
-}
+// Auto map-reveal moved to ForgePact::MapRevealManager (see the module
+// includes anchor after HhResolveLocalPlayer, above). CompSetBuffs and
+// RunCommand's "reveal" handler below call it directly.
 
 // naddr <ScriptName> -- print a gml script's native function address + containing module base + RVA,
 // so we can decompile JUST that function in Ghidra (no full-exe analysis needed).
@@ -7837,106 +7487,7 @@ static void RareDropCmd(const std::string& rest)
     Out("raredrop: unknown '" + a1 + "'  (heroic | ceiling | satanic | angelic | list)");
 }
 
-static void StatCmd(const std::string& rest)
-{
-    std::string a1, a2; a1 = FirstToken(rest, a2);
-    while (!a1.empty() && std::isspace((unsigned char)a1.back())) a1.pop_back();
-    while (!a2.empty() && std::isspace((unsigned char)a2.back())) a2.pop_back();
-
-    struct Kayit { const char* ad; const char* kimlik; PVOID kanca; PFUNC_YYGMLScript* orij; volatile long* sayac; double* carpan; const char* takma; };
-    static const Kayit kTablo[] = {
-        { "StatMagicFind", "fp_st_mf",      (PVOID)HookStat_StatMagicFind,      &g_OrigStat_StatMagicFind, &g_StatSayac_StatMagicFind, &g_StatCarpan_StatMagicFind, "magicfind" },
-        { "StatAttackSpeed", "fp_st_as", (PVOID)HookStat_StatAttackSpeed, &g_OrigStat_StatAttackSpeed, &g_StatSayac_StatAttackSpeed, &g_StatCarpan_StatAttackSpeed, "attackspeed" },
-        { "StatExperienceGain", "fp_st_xp", (PVOID)HookStat_StatExperienceGain, &g_OrigStat_StatExperienceGain, &g_StatSayac_StatExperienceGain, &g_StatCarpan_StatExperienceGain, "expgain" },
-        { "StatMovementSpeed", "fp_st_ms",  (PVOID)HookStat_StatMovementSpeed,  &g_OrigStat_StatMovementSpeed, &g_StatSayac_StatMovementSpeed, &g_StatCarpan_StatMovementSpeed, "movespeed" },
-        { "CalculateEndDamage", "fp_st_td", (PVOID)HookStat_CalculateEndDamage, &g_OrigStat_CalculateEndDamage, &g_StatSayac_CalculateEndDamage, &g_StatCarpan_CalculateEndDamage, "damage" },
-        { "StatExtraGold", "fp_st_eg",      (PVOID)HookStat_StatExtraGold,      &g_OrigStat_StatExtraGold, &g_StatSayac_StatExtraGold, &g_StatCarpan_StatExtraGold, "extragold" },
-        { "StatLifeReplenish", "fp_st_lr",  (PVOID)HookStat_StatLifeReplenish,  &g_OrigStat_StatLifeReplenish, &g_StatSayac_StatLifeReplenish, &g_StatCarpan_StatLifeReplenish, "lifereplenish" },
-        { "StatManaReplenish", "fp_st_mr",  (PVOID)HookStat_StatManaReplenish,  &g_OrigStat_StatManaReplenish, &g_StatSayac_StatManaReplenish, &g_StatCarpan_StatManaReplenish, "manareplenish" },
-        { "StatDefense", "fp_st_def",        (PVOID)HookStat_StatDefense,        &g_OrigStat_StatDefense, &g_StatSayac_StatDefense, &g_StatCarpan_StatDefense, "defense" },
-        { "StatCritDamage", "fp_st_cd",      (PVOID)HookStat_StatCritDamage,     &g_OrigStat_StatCritDamage, &g_StatSayac_StatCritDamage, &g_StatCarpan_StatCritDamage, "critdamage" },
-        { "StatCritRate", "fp_st_cr",        (PVOID)HookStat_StatCritRate,       &g_OrigStat_StatCritRate, &g_StatSayac_StatCritRate, &g_StatCarpan_StatCritRate, "critchance" },
-        { "StatSpellCritDamage", "fp_st_scd", (PVOID)HookStat_StatSpellCritDamage, &g_OrigStat_StatSpellCritDamage, &g_StatSayac_StatSpellCritDamage, &g_StatCarpan_StatSpellCritDamage, "spellcritdamage" },
-        { "StatSpellCritRate", "fp_st_scr",  (PVOID)HookStat_StatSpellCritRate,  &g_OrigStat_StatSpellCritRate, &g_StatSayac_StatSpellCritRate, &g_StatCarpan_StatSpellCritRate, "spellcritchance" },
-        { "EnemyCalculateExperience", "fp_st_xpc", (PVOID)HookStat_EnemyCalculateExperience, &g_OrigStat_EnemyCalculateExperience, &g_StatSayac_EnemyCalculateExperience, &g_StatCarpan_EnemyCalculateExperience, "exp" },
-    };
-
-    if (Lower(a1) == "list" || a1.empty()) {
-        for (const auto& k : kTablo) {
-            char b[160];
-            sprintf_s(b, "  %-26s (%-11s) x%.2f  %-12s cagri=%ld", k.ad, k.takma ? k.takma : "-", *k.carpan,
-                      *k.orij ? "kanca kurulu" : "kanca yok", *k.sayac);
-            Out(b);
-        }
-        return;
-    }
-
-    // Kisa ad da kabul et: "magicfind" -> "StatMagicFind"
-    std::string ara = Lower(a1);
-    const Kayit* hedef = nullptr;
-    for (const auto& k : kTablo) {
-        std::string tam = Lower(k.ad);
-        if (ara == tam || ara == tam.substr(4)
-            || (k.takma && ara == Lower(k.takma))) { hedef = &k; break; }
-    }
-    if (!hedef) { Out("stat: bilinmeyen ad '" + a1 + "'  (stat list ile bak)"); return; }
-
-    double c = 1.0;
-    try { c = std::stod(a2); } catch (...) { Out("stat: carpan sayi olmali"); return; }
-    if (c < 0.0) c = 0.0;
-
-    if (c == 1.0 && !*hedef->orij) {
-        *hedef->carpan = 1.0;
-        Out(std::string("stat ") + hedef->ad + " -> x1.00 (native, no hook)");
-        return;
-    }
-    if (!*hedef->orij) {
-        // Betik adindaki "gml_Script_" onekini HookOneScript kendisi ekliyor.
-        HookOneScript(hedef->ad, hedef->kimlik, hedef->kanca, hedef->orij);
-        if (!*hedef->orij) { Out(std::string("stat: ") + hedef->ad + " kancasi kurulamadi"); return; }
-    }
-    *hedef->carpan = c;
-    // XP carpani acilinca baloncuk metnini de duzelt (yalnizca gorsel).
-    if (c != 1.0 && std::string(hedef->ad) == "EnemyCalculateExperience" && !g_OrigCombatText)
-        HookOneScript("CombatText", "fp_ctext", (PVOID)Hook_CombatText, &g_OrigCombatText);
-    char b[160];
-    sprintf_s(b, "stat %s -> x%.2f", hedef->ad, c);
-    Out(b);
-}
-
-static void StatAddCmd(const std::string& rest)
-{
-    std::string ad, deger; ad = FirstToken(rest, deger);
-    while (!ad.empty() && std::isspace((unsigned char)ad.back())) ad.pop_back();
-    while (!deger.empty() && std::isspace((unsigned char)deger.back())) deger.pop_back();
-    std::string ara = Lower(ad);
-    if (ara != "castrate" && ara != "statfastercastrate" && ara != "fastercastrate") {
-        Out("statadd: unknown '" + ad + "' (castrate)");
-        return;
-    }
-    double ek = 0.0;
-    try { ek = std::stod(deger); } catch (...) { Out("statadd: bonus sayi olmali"); return; }
-    if (ek < 0.0) ek = 0.0;
-    if (ek == 0.0 && !g_OrigStatAdd_StatFasterCastRate) {
-        g_StatEk_StatFasterCastRate = 0.0;
-        Out("statadd StatFasterCastRate -> +0.00 (native, no hook)");
-        return;
-    }
-    if (!g_OrigStatAdd_StatFasterCastRate) {
-        HookOneScript("StatFasterCastRate", "fp_sta_fcr",
-                      (PVOID)HookStatAdd_StatFasterCastRate,
-                      &g_OrigStatAdd_StatFasterCastRate);
-        if (!g_OrigStatAdd_StatFasterCastRate) {
-            Out("statadd: StatFasterCastRate kancasi kurulamadi");
-            return;
-        }
-    }
-    g_StatEk_StatFasterCastRate = ek;
-    char b[128];
-    sprintf_s(b, "statadd StatFasterCastRate -> +%.2f", ek);
-    Out(b);
-}
-
+// StatCmd/StatAddCmd moved to ForgePact::StatsManager (see the module includes anchor above).
 // itemjson <path> -- json_parse file -> InitItemFromJson -> json_stringify result to bp_ipc\iteminfo.json
 static void ItemJson(const std::string& path)
 {
@@ -8786,13 +8337,13 @@ static int g_CompObjIdx = -1;
 // Beneficial "buffs" granted while the companion is out (all proven-safe multiplier hooks).
 static void CompSetBuffs(bool on)
 {
-    g_mult_DropItem      = on ? 3 : 1;
-    g_mult_DropItemBoss  = on ? 3 : 1;
-    g_mult_DropGold      = on ? 3 : 1;
+    ForgePact::DropManager::Instance().SetDropItemMultRaw(on ? 3 : 1);
+    ForgePact::DropManager::Instance().SetDropItemBossMultRaw(on ? 3 : 1);
+    ForgePact::DropManager::Instance().SetDropGoldMultRaw(on ? 3 : 1);
     g_mult_DropRelic     = on ? 2 : 1;
-    g_mult_DropBossGems  = on ? 2 : 1;
-    g_mult_DropDungeonKeys = on ? 2 : 1;
-    g_AutoReveal = on;
+    ForgePact::DropManager::Instance().SetDropBossGemsMultRaw(on ? 2 : 1);
+    ForgePact::DropManager::Instance().SetDropDungeonKeysMultRaw(on ? 2 : 1);
+    ForgePact::MapRevealManager::Instance().SetEnabled(on);
 }
 static void CompDespawn()
 {
@@ -10544,15 +10095,11 @@ static void RunCommand(const std::string& line)
     if (HandleHeadhunterCommand(lc, rest)) return;
     if (lc == "relicfilter") {
         bool enable = (rest == "1" || rest == "true" || rest == "on");
-        g_FilterMaxRelics.store(enable);
-        RelicFilterManager::Instance().SetEnabled(enable);
         // Hooking DropRelic while character selection is still running stalls the
         // runner.  Arm it instead: the frame callback installs the hook once the
         // setup gate has passed and a real player instance exists, so the panel
         // can send this at launch (build_cmds) and it still applies in-game.
-        if (enable && !g_Orig_DropRelic) g_RelicFilterPending.store(true);
-        if (!enable) g_RelicFilterPending.store(false);
-        Out(std::string("relicfilter -> ") + (enable ? (g_Orig_DropRelic ? "ON" : "ON (armed, applies once you are in-game)") : "OFF"));
+        ForgePact::RelicFilterMod::Instance().SetEnabled(enable, g_Orig_DropRelic != nullptr);
     } else if (lc == "orbpickup") {
         std::string ov = Lower(rest);
         while (!ov.empty() && std::isspace((unsigned char)ov.back())) ov.pop_back();
@@ -10725,20 +10272,7 @@ static void RunCommand(const std::string& line)
         try { g_EnemyMultAll = std::stoi(rest); Out("enemyall -> " + std::to_string(g_EnemyMultAll)); }
         catch (...) { Out("enemyall: bad value"); }
     } else if (lc == "density") {
-        try {
-            double d = std::stod(rest);
-            if (d < 1.0) d = 1.0;
-            if (d > 1.0) {
-                InstallCreateHooks();
-                InstallDensityLifecycleHooks();
-            }
-            g_CreatorMult = d;
-            g_CreatorFrac = 0.0;          // kademe degisince birikim sifirlanir
-            if (d > 1.0) OpenDensityWindow();
-            char db[64]; sprintf_s(db, "%.2g", g_CreatorMult);
-            Out(std::string("density (creator mult) -> ") + db);
-        }
-        catch (...) { Out("density: bad value"); }
+        ForgePact::DensityManager::Instance().HandleCommand(rest);
     } else if (lc == "dropstats") {
         DropStats();
     } else if (lc == "dropmult") {
@@ -10813,7 +10347,7 @@ static void RunCommand(const std::string& line)
     } else if (lc == "proof") {
         char b[280];
         sprintf_s(b, "PROOF: density=x%g | extra spawners created=%ld | revisit expansions blocked=%ld | tracked placements=%llu | extra enemies created=%ld",
-            g_CreatorMult, g_ExtraCreators, g_DensityRevisitSkips,
+            ForgePact::DensityManager::Instance().Mult, g_ExtraCreators, g_DensityRevisitSkips,
             (unsigned long long)DensityPlacementCount(), g_ExtraEnemies);
         Out(b);
     } else if (lc == "clearlog") {
@@ -10904,8 +10438,7 @@ static void RunCommand(const std::string& line)
     } else if (lc == "reveal") {
         std::string v = Lower(rest);
         while (!v.empty() && (v.back()=='\r'||v.back()=='\n'||v.back()==' ')) v.pop_back();
-        g_AutoReveal = !(v == "0" || v == "off" || v == "false");
-        Out(std::string("reveal: ") + (g_AutoReveal ? "ACIK" : "KAPALI"));
+        ForgePact::MapRevealManager::Instance().SetEnabled(!(v == "0" || v == "off" || v == "false"));
     } else if (lc == "census") {
 #ifdef FORGEPACT_RELEASE
         Out("census: yayin derlemesinde yok");
@@ -10936,9 +10469,9 @@ static void RunCommand(const std::string& line)
             + " | su an=" + std::to_string(ToplamOrnek())
             + " | butce yuzunden atilan=" + std::to_string(g_ButceIptal));
     } else if (lc == "stat") {
-        StatCmd(rest);
+        ForgePact::StatsManager::Instance().HandleStatCommand(rest);
     } else if (lc == "statadd") {
-        StatAddCmd(rest);
+        ForgePact::StatsManager::Instance().HandleStatAddCommand(rest);
     } else if (lc == "angelicwatch") {
         // Research: observe the game's own angelic rolls without touching the gate.
         std::string v = Lower(TrimCopy(rest));
@@ -11090,29 +10623,9 @@ static void RunCommand(const std::string& line)
     }
 }
 
-static void PollCommands()
-{
-    std::string cmdPath = CmdPath();
-    std::ifstream in(cmdPath, std::ios::binary);
-    if (!in.good()) return;
-    std::stringstream ss; ss << in.rdbuf();
-    std::string content = ss.str();
-    in.close();
-    if (content.empty()) return;
-
-    // delete immediately so we don't reprocess
-    DeleteFileA(cmdPath.c_str());
-
-    Out("---- running command file ----");
-    std::stringstream ls(content);
-    std::string line;
-    while (std::getline(ls, line)) {
-        if (line.empty()) continue;
-        try { RunCommand(line); }
-        catch (...) { Out("command threw: " + line); }
-    }
-    Out("---- done ----");
-}
+// PollCommands moved to ForgePact::IpcServer::PollCommands (2026-09 class
+// split) - it proxies every line to RunCommand() unchanged, see the header's
+// own comment for why RunCommand itself stays here.
 
 // ===== stall watchdog =======================================================
 // A multi-second freeze on the character screen was reported three times and
@@ -11298,10 +10811,10 @@ void FrameCallback(FWFrame& FrameContext)
     // character selection stalled the game for about a minute, which is why the
     // panel used to withhold the command entirely and the mod never applied
     // after a restart (user report 2026-09-09).  Checked once a second at most.
-    if (g_RelicFilterPending.load() && g_Setup && (fc % 60) == 0) {
+    if (ForgePact::RelicFilterMod::Instance().IsPending() && g_Setup && (fc % 60) == 0) {
         RValue player;
         if (HhResolveLocalPlayer(player)) {
-            g_RelicFilterPending.store(false);
+            ForgePact::RelicFilterMod::Instance().ClearPending();
             HookOneScript("DropRelic", "bp_drelic", (PVOID)Hook_DropRelic, &g_Orig_DropRelic);
             Out(std::string("relicfilter: hook installed -> ") + (g_Orig_DropRelic ? "ON" : "FAILED (DropRelic not found)"));
         }
@@ -11324,16 +10837,16 @@ void FrameCallback(FWFrame& FrameContext)
     }
     f6p = f6;
     if (f8 && !f8p) {
-        g_CreatorMult = (g_CreatorMult > 1.0) ? 1.0 : 3.0;
-        if (g_Yytk) g_Yytk->Print(CM_LIGHTGREEN, "[BloodPact] Monster density x%g", g_CreatorMult);
+        ForgePact::DensityManager::Instance().Mult = (ForgePact::DensityManager::Instance().Mult > 1.0) ? 1.0 : 3.0;
+        if (g_Yytk) g_Yytk->Print(CM_LIGHTGREEN, "[BloodPact] Monster density x%g", ForgePact::DensityManager::Instance().Mult);
     }
     if (f9 && !f9p) {
-        if (g_CreatorMult < 20.0) g_CreatorMult += 0.5;
-        if (g_Yytk) g_Yytk->Print(CM_LIGHTGREEN, "[BloodPact] Monster density x%g", g_CreatorMult);
+        if (ForgePact::DensityManager::Instance().Mult < 20.0) ForgePact::DensityManager::Instance().Mult += 0.5;
+        if (g_Yytk) g_Yytk->Print(CM_LIGHTGREEN, "[BloodPact] Monster density x%g", ForgePact::DensityManager::Instance().Mult);
     }
     if (f7 && !f7p) {
-        if (g_CreatorMult > 1.0) g_CreatorMult -= 0.5;
-        if (g_Yytk) g_Yytk->Print(CM_LIGHTGREEN, "[BloodPact] Monster density x%g", g_CreatorMult);
+        if (ForgePact::DensityManager::Instance().Mult > 1.0) ForgePact::DensityManager::Instance().Mult -= 0.5;
+        if (g_Yytk) g_Yytk->Print(CM_LIGHTGREEN, "[BloodPact] Monster density x%g", ForgePact::DensityManager::Instance().Mult);
     }
     f8p = f8; f9p = f9; f7p = f7;
 
@@ -11356,17 +10869,15 @@ void FrameCallback(FWFrame& FrameContext)
     f11p = f11;
 
 #endif
-    // auto map reveal (every ~20 frames so each new map clears quickly)
-    if (g_AutoReveal && (fc % 20) == 0) {
-        try { AutoRevealTick(); } catch (...) {}
-    }
+    // auto map reveal (throttled internally to every ~20 frames)
+    ForgePact::MapRevealManager::Instance().OnFrame(g_RuntimeFrame);
 
 #ifndef FORGEPACT_RELEASE
     static bool f5p = false;
     bool f5 = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
     if (f5 && !f5p) {
-        g_AutoReveal = !g_AutoReveal;
-        if (g_Yytk) g_Yytk->Print(CM_LIGHTGREEN, "[BloodPact] Auto map-reveal: %s", g_AutoReveal ? "ON" : "OFF");
+        ForgePact::MapRevealManager::Instance().Toggle();
+        if (g_Yytk) g_Yytk->Print(CM_LIGHTGREEN, "[BloodPact] Auto map-reveal: %s", ForgePact::MapRevealManager::Instance().IsEnabled() ? "ON" : "OFF");
     }
     f5p = f5;
 #endif
@@ -11402,7 +10913,7 @@ void FrameCallback(FWFrame& FrameContext)
     // Two IPC checks per second are enough for a settings panel and avoid five
     // filesystem probes per second during gameplay.
     if (((fc++) % 30) == 0 && g_Setup) {
-        if ((g_RuntimeFrame % 6) == 0) { PERF_SCOPE(g_PerfPoll); try { PollCommands(); } catch (...) {} }
+        if ((g_RuntimeFrame % 6) == 0) { PERF_SCOPE(g_PerfPoll); try { ForgePact::IpcServer::Instance().PollCommands(); } catch (...) {} }
     }
 }
 
@@ -11467,8 +10978,10 @@ EXPORTED AurieStatus ModuleInitialize(
         return AURIE_MODULE_DEPENDENCY_NOT_RESOLVED;
     }
 
-    CreateDirectoryA(IPC_DIR.c_str(), nullptr);
-    Out("==== BloodPact plugin loaded ====");
+    // Startup bookkeeping moved to ForgePact::ModManager::Initialize (2026-09
+    // class split) - see the header's own comment for why ModuleInitialize
+    // itself stays here.
+    ForgePact::ModManager::Instance().Initialize();
     LoadStartup();   // oyun kodu calismadan once uygulanmasi gereken ayarlar
 #ifdef FORGEPACT_RELEASE
     KonsoluGizle();
