@@ -5389,8 +5389,39 @@ static RValue& Hook_HhDeathEffects(CInstance* S, CInstance* O, RValue& R, int ar
 static void InstallHeadhunterHook()
 {
     if (g_HhHookInstalled) return;
-    if (HookOneScript("EnemyDestroyKillProc", "fp_headhunter_kill", (PVOID)Hook_EnemyDestroyKillProc, &g_Orig_EnemyDestroyKillProc))
+    if (HookOneScript("EnemyDestroyKillProc", "fp_headhunter_kill", (PVOID)Hook_EnemyDestroyKillProc, &g_Orig_EnemyDestroyKillProc)) {
         g_HhHookInstalled = true;
+
+        // Supplemental native detour (2026-09 review follow-up, PR #2 issue
+        // #1): HookOneScript's table-pointer swap only intercepts calls made
+        // through this script's own GameMaker dispatch entry, not a compiled
+        // call straight to the function's address. A review reported exactly
+        // such a call reaching EnemyDestroyKillProc directly; confirmed live
+        // (naddrorig) that this function's real address is
+        // Hero_Siege.exe+0x189A070, matching the reviewer's reported target
+        // exactly. Unlike DropRelic (see DropManager.hpp's comment on
+        // Hook_DropRelic) or the custom-forge item hooks, this target has
+        // exactly one install call site - guarded above - so it never needs
+        // the table swap's idempotent-re-install behavior, making a native
+        // inline detour safe to layer on top here without touching the
+        // shared mechanism every other hook still relies on.
+        //
+        // MmCreateHook patches the address itself, so Hook_EnemyDestroyKillProc
+        // must not call back through it directly (infinite recursion) - repoint
+        // g_Orig_EnemyDestroyKillProc at the trampoline MmCreateHook returns
+        // (the real, unpatched original code) instead. That is exactly what
+        // Hook_EnemyDestroyKillProc already calls through, so no other change
+        // is needed for the chain to stay correct.
+        PVOID nativeTramp = nullptr;
+        AurieStatus ns = MmCreateHook(g_ArSelfModule, "fp_headhunter_kill_native",
+            (PVOID)g_Orig_EnemyDestroyKillProc, (PVOID)Hook_EnemyDestroyKillProc, &nativeTramp);
+        if (AurieSuccess(ns)) {
+            g_Orig_EnemyDestroyKillProc = reinterpret_cast<PFUNC_YYGMLScript>(nativeTramp);
+            Out("headhunter: native detour installed on EnemyDestroyKillProc (direct-call coverage)");
+        } else {
+            Out("headhunter: native detour on EnemyDestroyKillProc failed st=" + std::to_string((int)ns) + " (script-table hook still active)");
+        }
+    }
 }
 
 static void EnableHeadhunter()
