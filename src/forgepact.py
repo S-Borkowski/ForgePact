@@ -173,11 +173,21 @@ DEFAULTS = {
     "density_on": False,
     "auto_apply": True,
     "map_reveal": False,
+    # Sub-toggle of map_reveal.  Only meaningful while map_reveal is on, and
+    # separate from it because it is the half that costs frame time: revealing
+    # the fog is free, populating the map is not.
+    "map_reveal_packs": True,
     "headhunter": False,
     "tyrant": False,
     "beacon": False,
     "mod_filter_max_relics": False,
     "mod_orb_pickup_radius": False,
+    # Pet collects quest items on screen without hovering + pressing interact.
+    # Scaffolding only as of 2026-09-10: the toggle/tick exist and count
+    # candidates, but the actual collect call is pending live research (see
+    # ForgePact/docs/pet-quest-collector-plan.md). Off by default like the
+    # other mod toggles.
+    "mod_pet_quest_pickup": False,
     # Monster Rarity: the share of normal monsters raised to Rare and to Ancient
     # (percent each, together at most 100; the rest stay normal).
     "rarity_rare": 0,
@@ -569,6 +579,11 @@ def build_cmds(cfg: dict) -> list:
         out.append(f"density {d:g}")
     if cfg.get("map_reveal", False):
         out.append("reveal 1")
+        # Only emitted to turn the pack pass OFF: the plugin defaults it on, so
+        # the common case sends nothing extra (same rule as the rest of this
+        # function - emit only what is actually needed).
+        if not cfg.get("map_reveal_packs", True):
+            out.append("reveal packs 0")
     if cfg.get("headhunter", False):
         # Custom Forge Headhunter item: rare kills grant the monster's affixes as buffs.
         # "force" also covers the not-yet-finished equipped-belt check (see plugin notes).
@@ -587,6 +602,10 @@ def build_cmds(cfg: dict) -> list:
         out.append("relicfilter 1")
     if cfg.get("mod_orb_pickup_radius", False):
         out.append("orbpickup 10")
+    if cfg.get("mod_pet_quest_pickup", False):
+        # Safe to send at launch: no hook is installed, so unlike relicfilter
+        # there is no arm/defer lifecycle to worry about.
+        out.append("petquest 1")
     rare, ancient = rarity_setting(cfg)
     if rare > 0 or ancient > 0:
         out.append(f"rarity {rare} {ancient}")
@@ -1391,7 +1410,7 @@ class H(BaseHTTPRequestHandler):
                     # moved wins and the other gives way
                     other = "rarity_ancient" if key == "rarity_rare" else "rarity_rare"
                     cfg[other] = min(_pct(cfg.get(other, 0)), 100 - cfg[key])
-                elif key in ("density_on", "auto_apply", "map_reveal", "headhunter", "tyrant", "beacon", "mod_filter_max_relics", "mod_orb_pickup_radius"):
+                elif key in ("density_on", "auto_apply", "map_reveal", "map_reveal_packs", "headhunter", "tyrant", "beacon", "mod_filter_max_relics", "mod_orb_pickup_radius", "mod_pet_quest_pickup"):
                     cfg[key] = bool(val)
                 save_cfg(cfg)
                 live = ""
@@ -1418,7 +1437,16 @@ class H(BaseHTTPRequestHandler):
                     elif key in ("density", "density_on"):
                         send_cmds([f"density {cfg['density'] if cfg['density_on'] else 1}"], cfg)
                     elif key == "map_reveal":
-                        send_cmds([f"reveal {1 if cfg['map_reveal'] else 0}"], cfg)
+                        cmds = [f"reveal {1 if cfg['map_reveal'] else 0}"]
+                        # Turning the parent back on has to restate the child:
+                        # `reveal 1` does not reset the plugin's pack flag, so
+                        # without this a player who turned packs off, toggled
+                        # the parent, and came back would silently get them on.
+                        if cfg["map_reveal"]:
+                            cmds.append(f"reveal packs {1 if cfg.get('map_reveal_packs', True) else 0}")
+                        send_cmds(cmds, cfg)
+                    elif key == "map_reveal_packs":
+                        send_cmds([f"reveal packs {1 if cfg['map_reveal_packs'] else 0}"], cfg)
                     elif key == "headhunter":
                         send_cmds(["headhunter force" if cfg["headhunter"] else "headhunter off"], cfg)
                     elif key == "tyrant":
@@ -1429,6 +1457,8 @@ class H(BaseHTTPRequestHandler):
                         send_cmds([f"relicfilter {1 if cfg['mod_filter_max_relics'] else 0}"], cfg)
                     elif key == "mod_orb_pickup_radius":
                         send_cmds([f"orbpickup {10 if cfg['mod_orb_pickup_radius'] else 0}"], cfg)
+                    elif key == "mod_pet_quest_pickup":
+                        send_cmds([f"petquest {1 if cfg['mod_pet_quest_pickup'] else 0}"], cfg)
                     elif key in ("rarity_rare", "rarity_ancient"):
                         # Always explicit: "rarity off" returns a live hook to vanilla.
                         send_cmds([rarity_cmd(cfg)], cfg)
@@ -1808,9 +1838,19 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;heigh
         <span class="val" id="morval">off</span>
     </div>
     <div class="row" style="border:none">
-        <span class="lbl" style="width:auto;flex:1">Reveal full map<br><span style="font-size:11px;color:#8f816e;font-weight:normal">Reveals the full minimap in every zone (removes fog of war).</span></span>
+        <span class="lbl" style="width:auto;flex:1">Reveal full map<br><span style="font-size:11px;color:#8f816e;font-weight:normal">Reveals the full minimap in every zone (removes fog of war). Waypoints, dungeon entrances, chests, shrines and mining nodes come with it - they are hidden by the fog, not by anything else.</span></span>
         <label class="switch"><input type="checkbox" id="map_reveal"><span class="sl"></span></label>
         <span class="val" id="mapval">on</span>
+    </div>
+    <div class="row" id="map_reveal_packs_row" style="border:none;margin-left:22px;border-left:1px solid #33261c;padding-left:14px">
+        <span class="lbl" style="width:auto;flex:1">&#8627; Also fill the map with monsters<br><span style="font-size:11px;color:#8f816e;font-weight:normal">Most mob packs do not exist until you walk near them, so a revealed map still shows no monsters. This makes each new zone create its packs on arrival, so they appear on the minimap right away. It is the only part of this mod that adds work for the game - turn it off if a zone feels heavy.</span></span>
+        <label class="switch"><input type="checkbox" id="map_reveal_packs"><span class="sl"></span></label>
+        <span class="val" id="mrpval">on</span>
+    </div>
+    <div class="row" style="border:none">
+        <span class="lbl" style="width:auto;flex:1">Pet collects quest items<br><span style="font-size:11px;color:#8f816e;font-weight:normal">While your pet is out, it walks to quest items on screen and picks them up for you - one at a time, crediting the quest objective exactly as collecting it by hand does. Only applies to pick-up quest items; things you activate, break or talk to are left alone.</span></span>
+        <label class="switch"><input type="checkbox" id="mod_pet_quest_pickup"><span class="sl"></span></label>
+        <span class="val" id="mpqpval">off</span>
     </div>
 </div>
 
@@ -1865,6 +1905,18 @@ function rarityLoad(c){
   document.getElementById('rarity_rare').value=+(c.rarity_rare||0);
   document.getElementById('rarity_ancient').value=+(c.rarity_ancient||0);
   rarityPaint();
+}
+// The monster half only does anything while the parent reveal is on, so the
+// row greys out and reads "n/a" rather than silently claiming to be on.
+function syncRevealPacks(parentOn,packsOn){
+  const row=document.getElementById('map_reveal_packs_row');
+  const box=document.getElementById('map_reveal_packs');
+  const val=document.getElementById('mrpval');
+  if(!row||!box||!val)return;
+  box.disabled=!parentOn;
+  row.style.opacity=parentOn?'1':'0.45';
+  val.textContent=parentOn?(packsOn?'on':'off'):'n/a';
+  val.className='val '+(parentOn&&packsOn?'':'off');
 }
 function sliderOff(sec,v){return sec==='percent_stats'?v<=0:v<=1}
 function sliderText(sec,v){return sliderOff(sec,v)?'off':(sec==='percent_stats'?'+'+v+'%':'x'+v)}
@@ -1991,6 +2043,9 @@ async function boot(){
   document.getElementById('map_reveal').checked=mr;
   document.getElementById('mapval').textContent=mr?'on':'off';
   document.getElementById('mapval').className='val '+(mr?'':'off');
+  const mrp=c.map_reveal_packs!==false;
+  document.getElementById('map_reveal_packs').checked=mrp;
+  syncRevealPacks(mr,mrp);
   const hh=!!c.headhunter;
   document.getElementById('headhunter').checked=hh;
   document.getElementById('hhval').textContent=hh?'on':'off';
@@ -2010,6 +2065,10 @@ async function boot(){
     document.getElementById('mod_orb_pickup_radius').checked=mor;
     document.getElementById('morval').textContent=mor?'on':'off';
     document.getElementById('morval').className='val '+(mor?'':'off');
+    const mpqp=!!c.mod_pet_quest_pickup;
+    document.getElementById('mod_pet_quest_pickup').checked=mpqp;
+    document.getElementById('mpqpval').textContent=mpqp?'on':'off';
+    document.getElementById('mpqpval').className='val '+(mpqp?'':'off');
   rarityLoad(c);
   document.getElementById('hhval').className='val '+(hh?'':'off');
   document.getElementById('exepath').value=c.game_exe||'';
@@ -2112,10 +2171,20 @@ function bind(){
     toast('enemy speed scope: '+(e.target.checked?'Chaos Tower only':'all zones')+' - '+(res.ok||res.err));
   };
   document.getElementById('map_reveal').onchange=async(e)=>{
-    const res=await j('/api/set',{method:'POST',body:JSON.stringify({key:'map_reveal',value:e.target.checked})});
+    // Repaint the pair BEFORE awaiting the POST. If the panel's server is
+    // gone the fetch throws, and anything after the await never runs - which
+    // left the child row enabled and reading "on" under a switched-off
+    // parent, inviting a click that could do nothing.
     document.getElementById('mapval').textContent=e.target.checked?'on':'off';
     document.getElementById('mapval').className='val '+(e.target.checked?'':'off');
+    syncRevealPacks(e.target.checked,document.getElementById('map_reveal_packs').checked);
+    const res=await j('/api/set',{method:'POST',body:JSON.stringify({key:'map_reveal',value:e.target.checked})});
     toast('map reveal '+(e.target.checked?'ON':'OFF')+' - '+(res.ok||res.err));
+  };
+  document.getElementById('map_reveal_packs').onchange=async(e)=>{
+    syncRevealPacks(document.getElementById('map_reveal').checked,e.target.checked);
+    const res=await j('/api/set',{method:'POST',body:JSON.stringify({key:'map_reveal_packs',value:e.target.checked})});
+    toast('map monsters '+(e.target.checked?'ON':'OFF')+' - '+(res.ok||res.err));
   };
   document.getElementById('headhunter').onchange=async(e)=>{
     const res=await j('/api/set',{method:'POST',body:JSON.stringify({key:'headhunter',value:e.target.checked})});
@@ -2144,6 +2213,11 @@ function bind(){
         const res=await j('/api/set',{method:'POST',body:JSON.stringify({key:'mod_orb_pickup_radius',value:e.target.checked})});
         const v=document.getElementById('morval');v.textContent=e.target.checked?'on':'off';v.className='val '+(e.target.checked?'':'off');
         toast('Orb pickup radius '+(e.target.checked?'10x ON':'OFF')+' - '+(res.ok||res.err));
+    };
+    document.getElementById('mod_pet_quest_pickup').onchange=async(e)=>{
+        const res=await j('/api/set',{method:'POST',body:JSON.stringify({key:'mod_pet_quest_pickup',value:e.target.checked})});
+        const v=document.getElementById('mpqpval');v.textContent=e.target.checked?'on':'off';v.className='val '+(e.target.checked?'':'off');
+        toast('Pet collects quest items '+(e.target.checked?'ON':'OFF')+' - '+(res.ok||res.err));
     };
   { const el=document.getElementById('angelic_items');
     el.oninput=angelicPaint;

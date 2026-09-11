@@ -73,7 +73,16 @@ class TestRelicFilterContract(unittest.TestCase):
         # numeric kinds and verifies the resolved instance is the one asked for.
         self.assertIn("static CInstance* HhResolveInstance(", self.plugin_code)
         self.assertIn("if (HhResolveLocalPlayer(p, nullptr)) player = HhResolveInstance(p);", self.plugin_code)
-        resolver = self.plugin_code.split("static CInstance* HhResolveInstance(", 1)[1][:1200]
+        # Find the definition, not merely the first mention: the pet quest
+        # collector forward-declares this so it can call it from a tick
+        # defined earlier in the file, and a forward declaration has no body
+        # to inspect.
+        resolver = ""
+        for part in self.plugin_code.split("static CInstance* HhResolveInstance(")[1:]:
+            if part.lstrip().startswith("const RValue& value)\n{"):
+                resolver = part[:1200]
+                break
+        self.assertTrue(resolver, "no definition of HhResolveInstance found (only declarations)")
         self.assertIn("VALUE_REF", resolver)
         self.assertNotIn('GetInstanceObject((int32_t)p.ToDouble(), player)', self.plugin_code)
 
