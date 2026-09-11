@@ -9,15 +9,33 @@ namespace ForgePact {
 // each one and pressing the interact key. See
 // `ForgePact/docs/pet-quest-collector-plan.md` for the full design.
 //
-// STATUS (2026-09-11): WORKING. The collect mechanism is confirmed live -
+// STATUS (2026-09-11): WORKING, and re-confirmed live after the call route
+// was rewritten to use no game addresses - the quest counter advanced on a
+// pet collect, with `petquest 0` reporting
+// `call route=script_execute (name-resolved, no layout)`,
+// `dispatched-but-item-remained=0` and zero structural refusals.
+//
+// The mechanism, confirmed live -
 // a plugin-invoked collect advanced a quest counter 7/15 -> 8/15, which is
 // the pass condition the plan set (the objective credited, not merely the
 // item removed). The call, every part of it measured rather than inferred:
 // with the quest item as `self` and `Loot_Manager_obj` as `other`, invoke the
-// item's own `m_Questpickup` method value with one real argument, through the
-// runtime's call-a-method-value helper. It calls update_quest(questIndex,
-// questObjectiveNumber, questValue) and QuestSaveUpdate internally, so the
-// credit is inside the call and nothing here has to fake it.
+// item's own `m_Questpickup` method value with one real argument. It calls
+// update_quest(questIndex, questObjectiveNumber, questValue) and
+// QuestSaveUpdate internally, so the credit is inside the call and nothing
+// here has to fake it.
+//
+// REVISED the same day, twice. That call originally went through the
+// runtime's call-a-method-value helper at a fixed address, which would have
+// jumped into unrelated bytes on the next game build - `relicgate`'s defect,
+// shipped again. Reading the callable off the value's own CScriptRef needs no
+// address but was then measured wrong for this runner (the `m_Quest*` values
+// are not CScriptRefs here). What ships is `script_execute`, resolved by
+// name, with self/other supplied through CallBuiltinEx: no address, and no
+// struct layout either. The call shape never changed across any of it.
+// `InvokeMethodValue` keeps the CScriptRef route as a validated fallback, and
+// `petquest 0` reports which route ran. See agents.md, "Never Call an Address
+// You Resolved by Hand", and docs/pet-quest-collector-c-research.md.
 //
 // Three earlier mechanisms were closed by measurement and one turned out to
 // be an artefact:

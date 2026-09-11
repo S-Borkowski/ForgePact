@@ -4861,26 +4861,248 @@ static volatile long g_PetQuestTravelTimeouts = 0;    // pet never reached the t
 // This lives outside the research guard because the shipped mod needs it;
 // `citrace collect` (dev only) routes through the same helper so there is one
 // call shape in this file, not two.
-static constexpr unsigned long long kQuestPickupCallFnRva = 0xB489070ull;
-typedef void (*QuestPickupCallFn)(CInstance*, CInstance*, RValue*, int, RValue*, RValue**);
+//
+// ---- HOW THE CALL IS REACHED --------------------------------------------
+// CONFIRMED LIVE 2026-09-11: quest counter advanced, via `script_execute`.
+//
+// This took three attempts and the first two are worth keeping, because both
+// failures were the same mistake wearing different clothes.
+//
+// 1. A fixed game address (exe+0xB489070, the runtime's call-a-method-value
+//    dispatcher, read off one build's decompiled body), validated against
+//    nothing. Shipped. That is the defect that already killed `relicgate`
+//    (see SetRelicGate): a constant RVA names unrelated bytes the moment the
+//    game is rebuilt, and here it would have transferred control into them
+//    on a player's machine.
+//
+// 2. Reading the callable off the value's own CScriptRef - correct in
+//    principle, since a GML method value normally *is* one, and it needs no
+//    address. MEASURED, and wrong for this runner: `m_Questpickup` comes back
+//    VALUE_OBJECT with m_ObjectKind = 0 (OBJECT_KIND_YYOBJECTBASE, not
+//    SCRIPTREF), m_CallScript and m_CallYYC both reading 0, and
+//    `method_get_index` returns nothing for it - while a sibling variable on
+//    the same instance (`s_lootDrawData`) does resolve to script #105134.
+//    This game's runner boxes these values in a shape YYToolkit's CScriptRef
+//    does not describe. 309 refusals, 0 collects, 0 crashes.
+//
+//    Note what 1 and 2 have in common: a layout somebody wrote down was
+//    trusted without a positive control on THIS target. An address is the
+//    loud version of that error; a struct field is the quiet one.
+//
+// 3. What ships: let the runtime dispatch it. `script_execute`, resolved by
+//    name, through CallBuiltinEx, which supplies self and other. Nothing
+//    here depends on the value's shape or on any address - only on a builtin
+//    the runner exposes by name, the same contract every other shipped
+//    mechanism in this file already relies on. The call shape is the one
+//    measured on a real collect and never changed across all three attempts:
+//    self = the item, other = Loot_Manager_obj, one real argument.
+//
+// The CScriptRef path stays as a fallback for a runner where that layout
+// does hold, reached only when route A fails to dispatch at all - never as a
+// retry of a call that already ran, so "one item, one call" holds. It is
+// fully validated before use (readable as a CScriptRef, kind is SCRIPTREF, a
+// callable field landing in executable memory inside Hero_Siege.exe) and a
+// failed proof refuses, bumps a counter, and logs one line naming the field
+// that was wrong. Whether the method is bound to the instance we were handed
+// is counted but deliberately NOT enforced - see MethodValueBindsTo.
+//
+// See agents.md, "Never Call an Address You Resolved by Hand".
+static volatile long g_PetQuestNoMethodFn = 0;   // method value carried nothing callable (collect refused)
+static volatile long g_PetQuestBadBind = 0;      // bound to a different instance (observed, not enforced)
+static volatile long g_PetQuestNoEffect = 0;     // call dispatched and returned, but the item was still there
 static CInstance* HhResolveInstance(const RValue& value);   // defined below; ships in both builds
 
-static bool InvokeMethodValueNative(CInstance* selfInst, CInstance* otherInst, const RValue& methodValue,
-                                    const std::vector<RValue>& args, RValue& resultOut)
+// True when addr is committed, executable, and part of mod's loaded image.
+// This cannot prove a pointer is the *right* function - nothing can, cheaply -
+// but it does prove we are not about to jump into data, into another module,
+// or into unmapped space, which is exactly how a stale fixed address fails.
+static bool AddrIsExecutableInModule(HMODULE mod, const void* addr)
+{
+    if (!mod || !addr) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(addr, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.AllocationBase != (PVOID)mod) return false;
+    const DWORD executable = PAGE_EXECUTE | PAGE_EXECUTE_READ
+                           | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    return (mbi.Protect & executable) != 0;
+}
+
+// Safe to read `bytes` at `p`? A wrong struct layout must produce a refusal
+// and a log line, never an access violation inside a frame callback.
+static bool ReadablePtr(const void* p, size_t bytes)
+{
+    return p && !IsBadReadPtr(p, bytes);
+}
+
+// Which check stopped a collect, so the log can name it instead of the mod
+// going quiet. Kept as a value rather than a bool so the refusal message is
+// specific enough to act on without another research session.
+enum class MethodRefFault { None, NotAnObject, NotAScriptRef, Unreadable, NoCallable };
+
+// The callable inside a GML method value, or nullptr - never a guess.
+//
+// FIXED 2026-09-11 (third pass). The first version took m_CallYYC and only
+// consulted m_CallScript if m_CallYYC was *null* - so a non-null m_CallYYC
+// that failed validation refused the whole call instead of trying the other
+// field. It also had the preference backwards. m_CallScript's script function
+// is the field this plugin already proves on this runtime: HookOneScript
+// swaps exactly that pointer, and `citrace nativetrace` resolved
+// m_Questpickup to exe+0x98732C0 through it. That is a positive control;
+// m_CallYYC has none here. So: try the proven field first, validate each
+// candidate independently, take the first that passes.
+static PFUNC_YYGMLScript MethodValueFunction(const RValue& methodValue, MethodRefFault* whyOut = nullptr)
+{
+    auto fail = [&](MethodRefFault why) -> PFUNC_YYGMLScript {
+        if (whyOut) *whyOut = why;
+        return nullptr;
+    };
+    if (whyOut) *whyOut = MethodRefFault::None;
+    if (methodValue.m_Kind != VALUE_OBJECT || !methodValue.m_Object) return fail(MethodRefFault::NotAnObject);
+    if (!ReadablePtr(methodValue.m_Object, sizeof(CScriptRef))) return fail(MethodRefFault::Unreadable);
+    if (methodValue.m_Object->m_ObjectKind != OBJECT_KIND_SCRIPTREF) return fail(MethodRefFault::NotAScriptRef);
+    const CScriptRef* ref = reinterpret_cast<const CScriptRef*>(methodValue.m_Object);
+
+    HMODULE game = GetModuleHandleA(nullptr);
+    PFUNC_YYGMLScript candidates[2] = { nullptr, nullptr };
+    if (ReadablePtr(ref->m_CallScript, sizeof(CScript)) && ReadablePtr(ref->m_CallScript->m_Functions, sizeof(YYGMLFuncs)))
+        candidates[0] = ref->m_CallScript->m_Functions->m_ScriptFunction;
+    candidates[1] = ref->m_CallYYC;
+    for (PFUNC_YYGMLScript fn : candidates)
+        if (fn && AddrIsExecutableInModule(game, (const void*)fn)) return fn;
+    return fail(MethodRefFault::NoCallable);
+}
+
+// Whether the method is bound to `expected`. An m_BoundThis we cannot read as
+// an instance is a binding we failed to inspect, not a wrong one.
+//
+// This is an OBSERVATION, not a gate - see InvokeMethodValue. It was written
+// as a gate on the assumption that m_BoundThis is always the very CInstance
+// we were handed, and that assumption has never been measured on this
+// runtime.
+static bool MethodValueBindsTo(const RValue& methodValue, CInstance* expected)
+{
+    if (methodValue.m_Kind != VALUE_OBJECT || !methodValue.m_Object) return false;
+    if (!ReadablePtr(methodValue.m_Object, sizeof(CScriptRef))) return false;
+    if (methodValue.m_Object->m_ObjectKind != OBJECT_KIND_SCRIPTREF) return false;
+    const CScriptRef* ref = reinterpret_cast<const CScriptRef*>(methodValue.m_Object);
+    const RValue& bound = ref->m_BoundThis;
+    if (bound.m_Kind == VALUE_OBJECT && ReadablePtr(bound.m_Object, sizeof(YYObjectBase))
+        && bound.m_Object->m_ObjectKind == OBJECT_KIND_CINSTANCE)
+        return reinterpret_cast<CInstance*>(bound.m_Object) == expected;
+    return true;
+}
+
+// One line, once per session, when a collect refuses on structural grounds.
+// A mod that silently does nothing costs a research session to diagnose; a
+// mod that says which field was wrong costs a read. Ships in both builds
+// deliberately - this is the failure a future game or YYToolkit update will
+// produce, and the player's own out.txt should explain it.
+static volatile long g_MethodRefFaultLogged = 0;
+static void LogMethodRefFaultOnce(const RValue& methodValue, MethodRefFault why)
+{
+    if (InterlockedCompareExchange(&g_MethodRefFaultLogged, 1, 0) != 0) return;
+    const char* name = "?";
+    switch (why) {
+    case MethodRefFault::NotAnObject:   name = "the value is not an object (not a method at all)"; break;
+    case MethodRefFault::Unreadable:    name = "the object is not readable as a CScriptRef"; break;
+    case MethodRefFault::NotAScriptRef: name = "the object is not OBJECT_KIND_SCRIPTREF"; break;
+    case MethodRefFault::NoCallable:    name = "neither m_CallScript's script function nor m_CallYYC is executable code inside Hero_Siege.exe"; break;
+    default: name = "none"; break;
+    }
+    std::string msg = "petquest: COLLECT REFUSED - ";
+    msg += name;
+    msg += ". Nothing was called.";
+    // The raw fields, so the next step is a read rather than a session.
+    try {
+        msg += " [kind=" + std::to_string((int)methodValue.m_Kind);
+        if (methodValue.m_Kind == VALUE_OBJECT && ReadablePtr(methodValue.m_Object, sizeof(YYObjectBase))) {
+            msg += " objectKind=" + std::to_string((int)methodValue.m_Object->m_ObjectKind);
+            if (ReadablePtr(methodValue.m_Object, sizeof(CScriptRef))) {
+                const CScriptRef* ref = reinterpret_cast<const CScriptRef*>(methodValue.m_Object);
+                HMODULE game = GetModuleHandleA(nullptr);
+                char b[192];
+                PFUNC_YYGMLScript viaScript = nullptr;
+                if (ReadablePtr(ref->m_CallScript, sizeof(CScript)) && ReadablePtr(ref->m_CallScript->m_Functions, sizeof(YYGMLFuncs)))
+                    viaScript = ref->m_CallScript->m_Functions->m_ScriptFunction;
+                sprintf_s(b, " m_CallScript=%p scriptFn=%p(inImage=%d) m_CallYYC=%p(inImage=%d) boundKind=%d",
+                          (void*)ref->m_CallScript, (void*)viaScript,
+                          AddrIsExecutableInModule(game, (const void*)viaScript) ? 1 : 0,
+                          (void*)ref->m_CallYYC,
+                          AddrIsExecutableInModule(game, (const void*)ref->m_CallYYC) ? 1 : 0,
+                          (int)ref->m_BoundThis.m_Kind);
+                msg += b;
+            }
+        }
+        msg += "]";
+    } catch (...) { msg += " [field dump failed]"; }
+    Out(msg);
+    Out("  This is a structural mismatch, not a missing address - see agents.md"
+        " \"Never Call an Address You Resolved by Hand\" and re-check CScriptRef"
+        " against the YYToolkit headers this was built with.");
+}
+
+// Which route actually made the last call, for `petquest stat`.
+static const char* g_PetQuestPathUsed = "(none yet)";
+
+// Route A is `script_execute` by name; route B is the value's own CScriptRef.
+// See the HOW THE CALL IS REACHED block above for why that order, and for
+// what was measured on this runner. CONFIRMED LIVE 2026-09-11 through route
+// A: one collect, item removed, quest counter advanced.
+static bool InvokeMethodValue(CInstance* selfInst, CInstance* otherInst, const RValue& methodValue,
+                              const std::vector<RValue>& args, RValue& resultOut)
 {
     if (!selfInst) return false;
-    HMODULE mod = GetModuleHandleA(nullptr);
-    if (!mod) return false;
-    QuestPickupCallFn fn = (QuestPickupCallFn)((char*)mod + kQuestPickupCallFnRva);
-    // The helper copies what it needs onto its own stack and does not write
-    // back through the method or argument pointers, so const_cast here is
-    // borrowing - and it avoids RValue copy semantics on a value that owns a
-    // reference to the method object.
+    if (methodValue.m_Kind != VALUE_OBJECT || !methodValue.m_Object) {
+        InterlockedIncrement(&g_PetQuestNoMethodFn);
+        LogMethodRefFaultOnce(methodValue, MethodRefFault::NotAnObject);
+        return false;
+    }
+
+    // --- Route A: the runtime's own dispatcher, reached by name ------------
+    // script_execute(target, args...) - the method value goes first.
+    {
+        std::vector<RValue> callArgs;
+        callArgs.reserve(args.size() + 1);
+        callArgs.push_back(methodValue);
+        for (const RValue& a : args) callArgs.push_back(a);
+        RValue res;
+        AurieStatus st = AURIE_EXTERNAL_ERROR;
+        try { st = g_Yytk->CallBuiltinEx(res, "script_execute", selfInst, otherInst, callArgs); }
+        catch (...) { st = AURIE_EXTERNAL_ERROR; }
+        if (AurieSuccess(st)) {
+            resultOut = res;
+            g_PetQuestPathUsed = "script_execute (name-resolved, no layout)";
+            return true;
+        }
+    }
+
+    // --- Route B: the value's own CScriptRef, where the layout does hold ---
+    // Only reached when route A could not dispatch at all - never as a retry
+    // of a call that already ran, so "one item, one call" still holds.
+    MethodRefFault why = MethodRefFault::None;
+    PFUNC_YYGMLScript fn = MethodValueFunction(methodValue, &why);
+    if (!fn) {
+        InterlockedIncrement(&g_PetQuestNoMethodFn);
+        LogMethodRefFaultOnce(methodValue, why);
+        return false;
+    }
+    // The bind check is counted, not enforced. The property that protects the
+    // process is "the pointer is executable code inside the game's image",
+    // and that one does gate, above. "m_BoundThis is this exact CInstance" is
+    // a consistency expectation nobody has measured on this runtime, and the
+    // game's own call site supplies `self` explicitly anyway - so a mismatch
+    // is worth knowing about, not worth refusing a measured-correct call for.
+    if (!MethodValueBindsTo(methodValue, selfInst)) InterlockedIncrement(&g_PetQuestBadBind);
+    // The callee copies what it needs onto its own stack and does not write
+    // back through the argument pointers, so const_cast here is borrowing -
+    // and it avoids RValue copy semantics on values the caller still owns.
     std::vector<RValue*> argPtrs;
     argPtrs.reserve(args.size());
     for (const RValue& a : args) argPtrs.push_back(const_cast<RValue*>(&a));
-    fn(selfInst, otherInst, &resultOut, (int)argPtrs.size(),
-       const_cast<RValue*>(&methodValue), argPtrs.empty() ? nullptr : argPtrs.data());
+    fn(selfInst, otherInst, resultOut, (int)argPtrs.size(),
+       argPtrs.empty() ? nullptr : argPtrs.data());
+    g_PetQuestPathUsed = "CScriptRef callable (struct-resolved)";
     return true;
 }
 
@@ -4979,8 +5201,19 @@ static bool PetQuestCollectOne(const RValue& inst)
         RValue method = g_Yytk->CallBuiltin("variable_instance_get", { inst, RValue("m_Questpickup") });
         RValue result;
         std::vector<RValue> args{ RValue(g_PetQuestArg.load()) };
-        if (!InvokeMethodValueNative(item, lootMgr, method, args, result)) return false;
+        if (!InvokeMethodValue(item, lootMgr, method, args, result)) return false;
         InterlockedIncrement(&g_PetQuestCollected);
+        // Did the call actually do anything? m_Questpickup removes the item,
+        // so an instance that is still there afterwards means the call
+        // dispatched and returned without effect - the failure mode the plan
+        // warned about for script_execute on a method value ("quietly no-ops
+        // instead of rejecting"). This is NOT proof of objective credit (plan
+        // §4 rule 3 still stands); it only separates "nothing ran" from "ran
+        // and did nothing", which are otherwise identical from outside.
+        try {
+            if (g_Yytk->CallBuiltin("instance_exists", { inst }).ToBoolean())
+                InterlockedIncrement(&g_PetQuestNoEffect);
+        } catch (...) {}
         return true;
     } catch (...) { return false; }
 }
@@ -5119,6 +5352,22 @@ static void PetQuestCollectorStats()
               g_PetQuestTargetLost, g_PetQuestTravelTimeouts,
               (g_PetQuestPhase == PetQuestPhase::Travel ? "travel" : "idle"), g_PetQuestArg.load());
     Out(c);
+    // Structural refusals, reported separately from gameplay ones: these two
+    // are the only counters that can mean "the runtime is not shaped the way
+    // this build assumes". Nonzero here on a new game build is the signal to
+    // re-check CScriptRef against the YYToolkit headers - not to go hunting
+    // for an address.
+    char e[288];
+    sprintf_s(e, "  call route=%s | dispatched-but-item-remained=%ld", g_PetQuestPathUsed, g_PetQuestNoEffect);
+    Out(e);
+    if (g_PetQuestNoMethodFn || g_PetQuestBadBind) {
+        char d[288];
+        sprintf_s(d, "  REFUSED (structural): no callable on the method value=%ld (collect did NOT run)"
+                     " | bound to another instance=%ld (counted only, the call still ran)"
+                     " - the first refusal of the session is logged above with the raw fields",
+                  g_PetQuestNoMethodFn, g_PetQuestBadBind);
+        Out(d);
+    }
 }
 
 // ---- interaction/pickup trace (Phase 0.1 research, dev build only) --------
@@ -7181,19 +7430,45 @@ static void CiReportMethods()
 // is the one the game makes: self = the item, other = Loot_Manager_obj, one
 // real argument. Every shape C0.2 tried faulted; none of them was this.
 //
-// The address is a constant for this build, as kCiDispatchFnRvaDefault
-// already is. `citrace nativetrace` trampolined through this exact function
-// ten times in the confirming session, so it is known-good here - but it is
-// printed on every call so a build mismatch shows up as a wrong address
-// rather than as a crash.
+// DEMOTED 2026-09-11, second pass. This address shipped for exactly one
+// build before the same review that wrote agents.md's "Never Call an Address
+// You Resolved by Hand" caught it. The mod no longer uses it: InvokeMethodValue
+// (next to PetQuestCollectorTick) reads the callable straight off the method
+// value's CScriptRef, which is what this dispatcher looks up anyway, and needs
+// no address at all.
 //
-// The constant and the call itself live with the shipped mod
-// (kQuestPickupCallFnRva / InvokeMethodValueNative, next to
-// PetQuestCollectorTick); this alias exists so the research command reads the
-// same way it always did while making exactly the mod's call.
-static constexpr unsigned long long kCiCallMethodFnRva = kQuestPickupCallFnRva;
+// What survives here, dev build only, is the A/B comparison: a researcher can
+// still run the original shape against the address-free one on the same item
+// in the same session and see they do the same thing. It is validated before
+// being called now too - a wrong RVA on a future build must report a wrong
+// address, not crash the game - and the address is printed on every call.
+static constexpr unsigned long long kCiCallMethodFnRva = 0xB489070ull;
+typedef void (*QuestPickupCallFn)(CInstance*, CInstance*, RValue*, int, RValue*, RValue**);
+
+static bool InvokeMethodValueNative(CInstance* selfInst, CInstance* otherInst, const RValue& methodValue,
+                                    const std::vector<RValue>& args, RValue& resultOut)
+{
+    if (!selfInst) return false;
+    HMODULE mod = GetModuleHandleA(nullptr);
+    if (!mod) return false;
+    void* target = (void*)((char*)mod + kCiCallMethodFnRva);
+    // The check the first version of this function did not have.
+    if (!AddrIsExecutableInModule(mod, target)) return false;
+    QuestPickupCallFn fn = (QuestPickupCallFn)target;
+    // The helper copies what it needs onto its own stack and does not write
+    // back through the method or argument pointers, so const_cast here is
+    // borrowing - and it avoids RValue copy semantics on a value that owns a
+    // reference to the method object.
+    std::vector<RValue*> argPtrs;
+    argPtrs.reserve(args.size());
+    for (const RValue& a : args) argPtrs.push_back(const_cast<RValue*>(&a));
+    fn(selfInst, otherInst, &resultOut, (int)argPtrs.size(),
+       const_cast<RValue*>(&methodValue), argPtrs.empty() ? nullptr : argPtrs.data());
+    return true;
+}
 
 enum class CiInvokePath {
+    ScriptRef,          // the method value's own CScriptRef callable - what the mod ships
     NativeMethodValue,  // exe+0xB489070(self, other, &result, argc, &method, args) - the measured shape
     WithBuiltin,        // InvokeWithObject(item) { CallBuiltin  script_execute(method, args...) }
     WithBuiltinEx,      // InvokeWithObject(item) { CallBuiltinEx script_execute(method, args...) }
@@ -7210,14 +7485,23 @@ struct CiInvokePathInfo { CiInvokePath path; const char* key; const char* label;
 
 // `key` is what a tester types as the optional [path] argument.
 //
-// `native` comes first because it is the only shape ever observed to work:
-// MEASURED 2026-09-11 on a real collect, the game itself calls the method
-// value through exe+0xB489070 with self = the item and one real argument.
-// The nine shapes after it are all measured negative (C0.2) and are kept only
-// so a future session can re-run them without rebuilding; an `auto` run must
-// reach the measured shape before spending faults on the disproven ones.
+// `scriptref` comes first because it is what the mod ships: the measured call
+// shape (self = the item, other = Loot_Manager_obj, one real argument) reached
+// through the method value's own CScriptRef rather than through a fixed
+// address. `native` is second and is the same call made the old way, kept as
+// an A/B check that the two really are one mechanism - nothing else should
+// use it.
+//
+// The nine shapes after those are measured negative (C0.2) and are kept only
+// so a future session can re-run them without rebuilding. Note what the
+// research doc concluded later (pet-quest-collector-c-research.md, "This
+// explains every C0.2 access violation"): they were swept with no argument
+// and no way to set `self`, both of which `collect` now supplies - so those
+// negatives were measured under conditions that no longer hold, and are
+// "not observed", not "does not work".
 static const CiInvokePathInfo kCiInvokePaths[] = {
-    { CiInvokePath::NativeMethodValue, "native", "exe+0xB489070 call-a-method-value (the shape the game uses)" },
+    { CiInvokePath::ScriptRef,       "scriptref", "the method value's own CScriptRef callable (what the mod ships - no fixed address)" },
+    { CiInvokePath::NativeMethodValue, "native", "exe+0xB489070 call-a-method-value (the old fixed-address shape, A/B only)" },
     { CiInvokePath::WithBuiltin,     "with",      "InvokeWithObject + CallBuiltin script_execute" },
     { CiInvokePath::WithBuiltinEx,   "withex",    "InvokeWithObject + CallBuiltinEx script_execute" },
     { CiInvokePath::BuiltinMethod,   "builtin",   "CallBuiltin script_execute(method)" },
@@ -7270,18 +7554,33 @@ static CiPathResult CiRunInvokePath(CiInvokePath path, const RValue& methodValue
 
     try {
         switch (path) {
-        case CiInvokePath::NativeMethodValue: {
+        case CiInvokePath::ScriptRef: {
             if (!selfInst) { detail = std::string(label) + " - no self instance to call with"; return CiPathResult::Failed; }
-            HMODULE mod = GetModuleHandleA(nullptr);
-            if (!mod) { detail = std::string(label) + " - no main module"; return CiPathResult::Failed; }
             // Routed through the shipped helper deliberately: the research
             // command and the mod must make the identical call, or a green
             // `citrace collect` would stop being evidence about the mod.
             RValue res;
+            if (!InvokeMethodValue(selfInst, otherInst, methodValue, extraArgs, res)) {
+                detail = std::string(label) + " - refused: the value is not a script reference, carries no"
+                         " callable inside Hero_Siege.exe, or is bound to a different instance."
+                         " Nothing was called. Check CScriptRef against the YYToolkit headers this was built with.";
+                return CiPathResult::Failed;
+            }
+            resultOut = Describe(res);
+            detail = std::string(label) + " - called with argc=" + std::to_string((int)extraArgs.size());
+            return CiPathResult::Invoked;
+        }
+        case CiInvokePath::NativeMethodValue: {
+            if (!selfInst) { detail = std::string(label) + " - no self instance to call with"; return CiPathResult::Failed; }
+            HMODULE mod = GetModuleHandleA(nullptr);
+            if (!mod) { detail = std::string(label) + " - no main module"; return CiPathResult::Failed; }
+            // A/B comparison against `scriptref` only. Never the mod's path.
+            RValue res;
             char addr[64];
             sprintf_s(addr, " at exe+0x%llX", kCiCallMethodFnRva);
             if (!InvokeMethodValueNative(selfInst, otherInst, methodValue, extraArgs, res)) {
-                detail = std::string(label) + addr + " - call refused (no self, or no main module)";
+                detail = std::string(label) + addr + " - call refused (no self, or that address is not executable"
+                         " code in Hero_Siege.exe on this build - which is exactly why the mod no longer uses it)";
                 return CiPathResult::Failed;
             }
             resultOut = Describe(res);
@@ -7558,6 +7857,10 @@ static void CiInvokeItemMethod(const std::string& varName, const std::string& pa
 //   method= the item's own m_Questpickup
 //   args  = one real, observed as 1   (the game's own call site passes its
 //                                      caller's argument0, or undefined)
+//
+// How that call is *reached* is no longer measured off an address: the
+// default path is `scriptref`, the same InvokeMethodValue the mod ships.
+// `native` reproduces the original fixed-address shape for comparison.
 //
 // m_Questpickup then calls update_quest(questIndex, questObjectiveNumber,
 // questValue) and QuestSaveUpdate, so the objective credit is inside the
@@ -14067,7 +14370,7 @@ static void RunCommand(const std::string& line)
         if (subLc == "invoke") {
             // citrace invoke item|global <name> confirm [path] [args...]
             static const char* const kInvokeUsage =
-                "citrace invoke item|global <name> confirm [auto|all|with|withex|builtin|builtinex|index|indexex|methodcall|script|scriptex] [args...]"
+                "citrace invoke item|global <name> confirm [scriptref|native|auto|all|with|withex|builtin|builtinex|index|indexex|methodcall|script|scriptex] [args...]"
                 "   (args: numbers, or player|item|noone|true|false)";
             std::string kind, r1; kind = FirstToken(subRest, r1);
             std::string nameTok, r2; nameTok = FirstToken(r1, r2);
@@ -14084,12 +14387,13 @@ static void RunCommand(const std::string& line)
             // Phase C2 gate: the measured call shape, on the nearest quest item.
             // citrace collect confirm [path] [args...]
             static const char* const kCollectUsage =
-                "citrace collect confirm [native|auto|all|with|withex|builtin|builtinex|index|indexex|methodcall|script|scriptex] [args...]"
-                "   (default path native, default arg 1 - both as measured on a real collect)";
+                "citrace collect confirm [scriptref|native|auto|all|with|withex|builtin|builtinex|index|indexex|methodcall|script|scriptex] [args...]"
+                "   (default path scriptref - the shipped one; `native` is the old fixed-address shape, A/B only."
+                "    default arg 1, as measured on a real collect)";
             std::string confirmTok, r1; confirmTok = FirstToken(subRest, r1);
             std::string pathTok, argTokens; pathTok = FirstToken(r1, argTokens);
             if (!CiConfirmed(confirmTok, kCollectUsage)) return;
-            CiCollectNearestQuestItem(pathTok.empty() ? std::string("native") : pathTok, argTokens);
+            CiCollectNearestQuestItem(pathTok.empty() ? std::string("scriptref") : pathTok, argTokens);
             return;
         }
         if (subLc == "event") {

@@ -28,6 +28,36 @@ def function_body(source: str, signature: str) -> str:
     raise AssertionError(f"unterminated body for {signature}")
 
 
+def strip_research_blocks(source: str) -> str:
+    """What the player build compiles: `#ifndef FORGEPACT_RELEASE` bodies removed.
+
+    Nesting-aware, so a research block containing its own `#if` does not end
+    early and leak dev-only code into what this file treats as shipped.
+    """
+    kept, depth, dropping_at = [], 0, None
+    for line in source.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("#if"):
+            depth += 1
+            if dropping_at is None and stripped.startswith("#ifndef FORGEPACT_RELEASE"):
+                dropping_at = depth
+        elif stripped.startswith("#endif"):
+            if dropping_at == depth:
+                dropping_at = None
+                depth -= 1
+                continue
+            depth -= 1
+        if dropping_at is None:
+            kept.append(line)
+    return "\n".join(kept)
+
+
+def strip_comments(source: str) -> str:
+    """Code only. Research notes name plenty of addresses; comments are fine."""
+    source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+    return re.sub(r"//[^\n]*", "", source)
+
+
 MAP_REVEAL_HEADER_PATH = PROJECT_ROOT / "plugin" / "include" / "ForgePact" / "MapRevealManager.hpp"
 STATS_HEADER_PATH = PROJECT_ROOT / "plugin" / "include" / "ForgePact" / "StatsManager.hpp"
 DENSITY_HEADER_PATH = PROJECT_ROOT / "plugin" / "include" / "ForgePact" / "DensityManager.hpp"
@@ -231,6 +261,31 @@ class ReleaseHookContractTests(unittest.TestCase):
         native = stat.index("c == 1.0 && !*hedef->orig")
         install = stat.index("HookOneScript(hedef->name", native)
         self.assertLess(native, install)
+
+    def test_player_binary_calls_no_hand_resolved_game_address(self):
+        # The defect that killed `relicgate` and nearly shipped in the pet
+        # quest collector: a constant RVA read off one build's decompiled body
+        # points at unrelated bytes the moment the game is rebuilt, and a call
+        # through it transfers control into whatever is there. Everything in
+        # the player binary must resolve by name (GetNamedRoutinePointer,
+        # asset_get_index, CallBuiltin) or off a runtime struct YYToolkit
+        # defines - never off an address anybody typed in.
+        #
+        # See agents.md, "Never Call an Address You Resolved by Hand".
+        shipped = strip_comments(strip_research_blocks(self.plugin))
+        offender = re.search(r"\bk\w*Rva\w*\b", shipped)
+        self.assertIsNone(
+            offender,
+            "fixed game-address constant reachable from the player build: "
+            + (offender.group(0) if offender else ""),
+        )
+        call_target = re.search(
+            r"\(\s*char\s*\*\s*\)\s*\w+\s*\+\s*(?:0x[0-9A-Fa-f]+|k\w*Rva\w*)", shipped)
+        self.assertIsNone(
+            call_target,
+            "player build computes a call target from a module base plus a literal offset: "
+            + (call_target.group(0) if call_target else ""),
+        )
 
     def test_special_queue_is_not_cleared_during_zone_generation(self):
         self.assertNotIn("HookZoneStateResetSingleSpecial", self.plugin)

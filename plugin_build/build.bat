@@ -29,7 +29,14 @@ if /I "%~1"=="dev" (
     set "OBJDIR=obj_ship"
 )
 if not exist "%OBJDIR%" mkdir "%OBJDIR%"
-cl /nologo /std:c++20 /EHsc /MD /LD /O2 /DNDEBUG %FLAGS% /I "include" /I "%~dp0..\plugin\include" /I "%~dp0..\..\hs-game-sdk\cpp\include" "%SOURCE%" "include\YYToolkit\YYTK_Shared_Types.cpp" /Fe:%OUTPUT% /Fo:%OBJDIR%\ /link /DLL user32.lib
+REM YYTK_DEFINE_INTERNAL exposes YYToolkit's real struct bodies (CScriptRef,
+REM YYObjectBase, CInstance) instead of the opaque stand-ins.  InvokeMethodValue
+REM needs CScriptRef to read a method value's own callable, which is what lets
+REM the quest collect run without a hardcoded game address.  It MUST be on the
+REM whole command line, not a #define in ModuleMain.cpp: YYTK_Shared_Types.cpp
+REM is a separate translation unit and the two must agree on the layouts, or
+REM they disagree about sizeof(CInstance) and the link is quietly wrong.
+cl /nologo /std:c++20 /EHsc /MD /LD /O2 /DNDEBUG /DYYTK_DEFINE_INTERNAL=1 %FLAGS% /I "include" /I "%~dp0..\plugin\include" /I "%~dp0..\..\hs-game-sdk\cpp\include" "%SOURCE%" "include\YYToolkit\YYTK_Shared_Types.cpp" /Fe:%OUTPUT% /Fo:%OBJDIR%\ /link /DLL user32.lib
 if errorlevel 1 ( echo BUILD FAILED & exit /b 1 )
 if not "%OUTPUT%"=="BloodPactPlugin_rel.dll" (
     copy /y "%OUTPUT%" "..\modfiles_shipped\BloodPactPlugin.dll"

@@ -219,7 +219,8 @@ class TestPetQuestCollectorContract(unittest.TestCase):
         self.assertNotIn("instance_deactivate", tick)
         self.assertNotIn("CallGameScriptEx", tick)
         body = self._function_body("PetQuestCollectOne")
-        self.assertIn("InvokeMethodValueNative", body)
+        self.assertIn("InvokeMethodValue(", body)
+        self.assertNotIn("InvokeMethodValueNative", body)   # the fixed-address shape is research-only
         self.assertIn("m_Questpickup", body)
 
     def test_tick_reapplies_the_games_own_gates_per_item(self):
@@ -440,20 +441,22 @@ class TestPetQuestCollectorContract(unittest.TestCase):
         self.assertIn("CiPathResult::AccessViolation", runner)
 
     def test_the_measured_call_shape_is_offered_first(self):
-        # Superseded test_with_context_path_is_offered_first. That one pinned
-        # InvokeWithObject first because it was the last *untried* shape; it
-        # has since been tried and is negative, and a live round (citrace
-        # nativetrace, 2026-09-11) measured what the game actually does -
-        # the runtime's call-a-method-value helper, with the item as self.
-        # An `auto` run must reach the shape known to work before spending
-        # faults on the nine measured-negative ones.
+        # Superseded test_with_context_path_is_offered_first, then superseded
+        # again. A live round (citrace nativetrace, 2026-09-11) measured what
+        # the game actually does - self = the item, other = Loot_Manager_obj,
+        # one real argument - and the second pass that day changed how that
+        # call is *reached*, from a fixed address to the method value's own
+        # CScriptRef. An `auto` run must therefore reach `scriptref`, the
+        # shipped path, before anything else.
         table = self.plugin_code.split("kCiInvokePaths[] = {", 1)[1]
         table = table[: table.index("};")]
         first = table.strip().splitlines()[0]
-        self.assertIn('"native"', first)
-        self.assertIn("NativeMethodValue", first)
-        # The disproven shapes stay available so a future session can re-run
-        # them without a rebuild - they are demoted, not deleted.
+        self.assertIn('"scriptref"', first)
+        self.assertIn("CiInvokePath::ScriptRef", first)
+        # The fixed-address shape stays reachable as an A/B comparison, and
+        # the disproven shapes stay available so a future session can re-run
+        # them without a rebuild - all demoted, none deleted.
+        self.assertIn('"native"', table)
         self.assertIn('"with"', table)
         self.assertIn('"scriptex"', table)
 
@@ -548,11 +551,14 @@ class TestPetQuestCollectorContract(unittest.TestCase):
         self.assertNotIn("other=player", body)
 
     def test_collect_defaults_to_the_measured_path_and_argument(self):
-        # Default path `native` and default argument 1, both as measured. A
-        # tester can override either, but the default must not drift to an
-        # untested shape.
+        # Default path `scriptref` - the one the mod ships, so a green
+        # `collect` is evidence about the mod - and default argument 1, as
+        # measured. A tester can override either, but the default must not
+        # drift to an untested shape, and must never default to `native`:
+        # that is the fixed-address comparison, not the mechanism.
         block = self._citrace_subcommand("collect")
-        self.assertIn('"native"', block)
+        self.assertIn('std::string("scriptref")', block)
+        self.assertNotIn('std::string("native")', block)
         body = self._function_body("CiCollectNearestQuestItem")
         self.assertIn("args.push_back(RValue(1.0))", body)
 
@@ -576,19 +582,160 @@ class TestPetQuestCollectorContract(unittest.TestCase):
                 f"{helper} is outside the FORGEPACT_RELEASE guard",
             )
 
-    def test_native_path_uses_the_measured_helper_address(self):
-        # The call goes to the runtime helper the live round trampolined
-        # through, at the RVA read off its decompiled body - and the address
-        # is printed on every call so a build mismatch surfaces as a wrong
-        # address rather than a crash.
-        self.assertIn("kQuestPickupCallFnRva = 0xB489070ull", self.plugin_code)
-        paths = self._function_body("CiRunInvokePath")
-        self.assertIn("kCiCallMethodFnRva", paths)
-        self.assertIn("exe+0x%llX", paths)
+    # ---- the collect call reaches the method without a fixed game address --
+
+    def _guard_depth_of(self, name):
+        """`#ifndef FORGEPACT_RELEASE` nesting depth at `name`'s definition."""
+        body = self._function_body(name)
+        before = self.plugin_code[: self.plugin_code.index(body)]
+        depth = 0
+        for line in before.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("#if"):
+                depth += 1
+            elif stripped.startswith("#endif"):
+                depth -= 1
+        return depth
+
+    def test_collect_resolves_the_callable_off_the_method_value(self):
+        # The shipped collect must not jump to an address anybody read out of
+        # a decompiler. A GML method value IS a CScriptRef, and it carries the
+        # function pointer the runtime's own dispatcher would have looked up
+        # (m_CallYYC on this YYC build, m_CallScript's script function
+        # otherwise) - so the callable is reachable through YYToolkit's struct
+        # layout, which everything else in this file already depends on.
+        body = self._function_body("MethodValueFunction")
+        self.assertIn("OBJECT_KIND_SCRIPTREF", body)
+        self.assertIn("m_CallYYC", body)
+        self.assertIn("m_CallScript", body)
+        self.assertNotIn("GetModuleHandleA", self._function_body("InvokeMethodValue"))
+
+    def test_collect_validates_the_pointer_before_calling_it(self):
+        # relicgate's defect, stated as a check: a pointer we did not get from
+        # a name is only called after it is proven to land in executable
+        # memory inside the game's own image, and a failed proof refuses
+        # rather than falling through to the call.
+        resolve = self._function_body("MethodValueFunction")
+        self.assertIn("AddrIsExecutableInModule", resolve)
+        self.assertIn("MethodRefFault::NoCallable", resolve)
+        checker = self._function_body("AddrIsExecutableInModule")
+        self.assertIn("VirtualQuery", checker)
+        self.assertIn("AllocationBase", checker)
+        self.assertIn("PAGE_EXECUTE", checker)
+        invoke = self._function_body("InvokeMethodValue")
+        # Refusals are counted, so a build that breaks this shows up in
+        # `petquest stat` as a number rather than as silence.
+        self.assertIn("g_PetQuestNoMethodFn", invoke)
+        self.assertIn("g_PetQuestBadBind", invoke)
+        self.assertIn("MethodValueBindsTo", invoke)
+        # ...and the first refusal of the session names the field, in both
+        # builds. A mod that quietly does nothing costs a research session to
+        # diagnose; one that says which field was wrong costs a read.
+        self.assertIn("LogMethodRefFaultOnce", invoke)
+        self.assertIn("m_CallYYC", self._function_body("LogMethodRefFaultOnce"))
+
+    def test_the_primary_route_needs_no_struct_layout(self):
+        # MEASURED 2026-09-11, live: on this runner `m_Questpickup` is
+        # VALUE_OBJECT with m_ObjectKind=0, not OBJECT_KIND_SCRIPTREF, and
+        # both callable fields read as 0 - 309 refusals, 0 collects. Reading
+        # the callable out of the struct cannot work here, so the primary
+        # route must be the one that assumes nothing about the value's shape:
+        # `script_execute` resolved by name, with self/other supplied by
+        # CallBuiltinEx. The struct route stays as a fallback, after it.
+        invoke = self._function_body("InvokeMethodValue")
+        self.assertIn('CallBuiltinEx(res, "script_execute", selfInst, otherInst, callArgs)', invoke)
+        self.assertLess(
+            invoke.index("script_execute"), invoke.index("MethodValueFunction"),
+            "the layout-free route must be tried before the struct-resolved one",
+        )
+        # ...and the fallback must not be a retry of a call that already ran.
+        self.assertIn("if (AurieSuccess(st))", invoke)
+
+    def test_a_dispatched_call_with_no_effect_is_counted(self):
+        # `script_execute` was flagged in the plan as liable to quietly no-op
+        # on a method value rather than reject it. m_Questpickup removes the
+        # item, so an instance still present afterwards separates "nothing
+        # ran" from "ran and did nothing" - which are otherwise identical from
+        # outside. Not proof of credit; §4 rule 3 still stands.
+        body = self._function_body("PetQuestCollectOne")
+        after = body[body.index("InvokeMethodValue("):]
+        self.assertIn("instance_exists", after)
+        self.assertIn("g_PetQuestNoEffect", after)
+        self.assertIn("g_PetQuestNoEffect", self._function_body("PetQuestCollectorStats"))
+        self.assertIn("g_PetQuestPathUsed", self._function_body("PetQuestCollectorStats"))
+
+    def test_both_callable_fields_are_tried_before_refusing(self):
+        # The bug that broke the first build of this: m_CallYYC was taken
+        # first and m_CallScript consulted only when m_CallYYC was *null*, so
+        # a non-null m_CallYYC that failed validation refused the call instead
+        # of falling through to the other field. Each candidate must be
+        # validated on its own, and m_CallScript's script function must be
+        # tried first - it is the field HookOneScript already proves on this
+        # runtime, where m_CallYYC has no positive control.
+        resolve = self._function_body("MethodValueFunction")
+        self.assertLess(
+            resolve.index("m_CallScript"), resolve.index("m_CallYYC"),
+            "the field with a positive control on this runtime must be tried first",
+        )
+        self.assertIn("for (PFUNC_YYGMLScript fn : candidates)", resolve)
+
+    def test_the_bind_check_is_counted_not_enforced(self):
+        # "m_BoundThis is this exact CInstance" was asserted as a gate without
+        # ever being measured on this runtime, while the game's own call site
+        # supplies `self` explicitly. Counting a mismatch is useful; refusing
+        # a measured-correct call over an unmeasured assumption is the same
+        # class of mistake as trusting an address.
+        invoke = self._function_body("InvokeMethodValue")
+        gate = invoke[invoke.index("MethodValueBindsTo"):]
+        gate = gate[: gate.index("\n")]
+        self.assertNotIn("return false", gate)
+        self.assertIn("InterlockedIncrement(&g_PetQuestBadBind)", gate)
+
+    def test_layout_reads_cannot_fault(self):
+        # A wrong struct layout must produce a refusal and a log line, never
+        # an access violation inside a frame callback.
+        for name in ("MethodValueFunction", "MethodValueBindsTo", "LogMethodRefFaultOnce"):
+            self.assertIn("ReadablePtr", self._function_body(name))
+        self.assertIn("IsBadReadPtr", self._function_body("ReadablePtr"))
+
+    def test_collect_call_path_ships(self):
+        for helper in ("AddrIsExecutableInModule", "ReadablePtr", "MethodValueFunction",
+                       "MethodValueBindsTo", "LogMethodRefFaultOnce", "InvokeMethodValue"):
+            self.assertEqual(
+                self._guard_depth_of(helper), 0,
+                f"{helper} must be in the player build - it is the collect call",
+            )
+
+    def test_the_fixed_address_path_is_research_only(self):
+        # The measured RVA is kept as an A/B comparison for a research
+        # session, never as something a player's game can jump through.
+        self.assertNotIn("kQuestPickupCallFnRva", self.plugin_code)
+        self.assertIn("kCiCallMethodFnRva = 0xB489070ull", self.plugin_code)
+        self.assertGreater(
+            self._guard_depth_of("InvokeMethodValueNative"), 0,
+            "the fixed-address invoke must not be in the player build",
+        )
+        # Even the research path checks the address before calling it: a wrong
+        # RVA on a future build must report a wrong address, not crash.
+        native = self._function_body("InvokeMethodValueNative")
+        self.assertIn("AddrIsExecutableInModule", native)
+
+    def test_citrace_prefers_the_shipped_path(self):
         # The research command and the shipped mod must make the identical
         # call, or a green `citrace collect` stops being evidence about the
-        # mod - so the research path routes through the shipped helper.
+        # mod - so `scriptref` routes through the shipped helper, and is what
+        # `collect` runs unless a tester names something else.
+        paths = self._function_body("CiRunInvokePath")
+        self.assertIn("InvokeMethodValue(", paths)
         self.assertIn("InvokeMethodValueNative", paths)
+        self.assertIn("exe+0x%llX", paths)
+        table = self.plugin_code.split("kCiInvokePaths[] = {", 1)[1]
+        table = table[: table.index("};")]
+        self.assertLess(
+            table.index('"scriptref"'), table.index('"native"'),
+            "the address-free path must come before the fixed-address one",
+        )
+        self.assertIn('std::string("scriptref")', self._citrace_subcommand("collect"))
 
     # ---- citrace nativetrace: the instrument the table hooks could not be --
 

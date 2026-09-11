@@ -1942,8 +1942,189 @@ where a player's own collect plays one. Cosmetic, and known.
   item is not written to the inventory/loot log the way a hand-collected one
   is. Not quest state, so it does not affect the objective.
 - **No accepted-quest gate**, as above.
-- **`kQuestPickupCallFnRva` is a hardcoded address** (`exe+0xB489070`) and it
-  ships in the player build. It is correct for the Season 10 build this was
-  measured against and is not validated at call time — see
-  `docs/submodules/ForgePact/instructions.md` Known Limitations for why that
-  is a standing hazard in this codebase specifically.
+- ~~**`kQuestPickupCallFnRva` is a hardcoded address** (`exe+0xB489070`) and it
+  ships in the player build.~~ **CLOSED 2026-09-11, second pass** — see below.
+
+---
+
+## Second pass: the collect call, minus the address
+
+The open item above was the right one to close first. `PetQuestCollectOne`
+shipped a call through `GetModuleHandleA(nullptr) + 0xB489070` that validated
+nothing — not the module, not the bytes, not the build. Everything else in the
+plugin resolves by name and fails harmlessly; this one would have transferred
+control into whatever a future build put at that offset. It is `relicgate`'s
+defect (a fixed RVA inside `DropItem`, long since pointing elsewhere, feature
+silently dead) with a worse failure mode, because `relicgate` only ever read.
+
+### The attempt: read the callable off the value itself
+
+`exe+0xB489070` is the runtime's call-a-method-value dispatcher. What it does
+is look up the callable behind a method value and call it with the supplied
+self/other. A GML method value normally **is** a `CScriptRef`, and YYToolkit
+defines that struct: it carries the compiled function (`m_CallScript`'s script
+function, or `m_CallYYC`) and the instance the method is bound to
+(`m_BoundThis`). So the thing the dispatcher goes to find looked like it was
+already in our hand — no address needed.
+
+`InvokeMethodValue` was written to read it directly. The call shape was
+unchanged and still the measured one — `self` = the item, `other` =
+`Loot_Manager_obj`, one real argument. Only the route changed, moving the
+dependency from *this month's `Hero_Siege.exe`* to *YYToolkit's struct
+layout*.
+
+Requires `/DYYTK_DEFINE_INTERNAL=1` on the compile line (the opaque
+`CScriptRef` stand-in has no members) — see `plugin/BUILD.md`.
+
+**This did not work on this runner** — see "Third pass" below. It is kept as a
+validated fallback, not as the shipped mechanism, and the reason it failed is
+the most useful thing in this whole section.
+
+### Checks instead of a jump
+
+Before anything is called: the value is `VALUE_OBJECT` and
+`OBJECT_KIND_SCRIPTREF`; it is readable as a `CScriptRef`; and a callable
+field is committed, executable, and inside `Hero_Siege.exe`'s image
+(`AddrIsExecutableInModule`, via `VirtualQuery`). Every layout read is
+`IsBadReadPtr`-guarded. Any failure returns `false`, bumps a counter, and logs
+one line naming the field — so a build where this does not hold says so
+instead of crashing or going quiet.
+
+That design is what made the next two rounds cheap: the wrong hypothesis
+produced 309 counted refusals and a field dump, not 309 jumps into zero.
+
+### What survives of the old path
+
+`citrace collect`'s `native` path, dev build only, now itself address-checked.
+It exists so a session can run the old shape and the shipped one against the
+same item and confirm they are one mechanism. `scriptref` is the default and
+is what the mod runs, so a green `collect` remains evidence about the mod.
+
+### Third pass: the first build of this did not collect
+
+Reported live the same day: **the pet selects and flies to the nearest quest
+item correctly, and then nothing happens.** Travel working narrows it to
+`PetQuestCollectOne` → `InvokeMethodValue`; the deployed DLL was confirmed by
+hash to be that build.
+
+One flaw found by re-reading, and it is mine, not the runtime's:
+`MethodValueFunction` took `m_CallYYC` first and consulted `m_CallScript` only
+when `m_CallYYC` was **null** — so a non-null `m_CallYYC` that failed the
+executable-in-image check refused the whole call rather than falling through
+to the other field. The preference was also backwards. `m_CallScript`'s script
+function is the field this plugin already proves on this runtime:
+`HookOneScript` swaps exactly that pointer, and this document's own
+`nativetrace` round resolved `m_Questpickup` to `exe+0x98732C0` through it.
+That is a positive control; `m_CallYYC` has none here. Fixed: both candidates
+are validated independently, proven field first.
+
+Two other changes, both about not repeating the original mistake in a new
+shape:
+
+- **The bind check is counted, not enforced.** "`m_BoundThis` is this exact
+  `CInstance`" was written as a *gate* on an assumption never measured on this
+  runtime, while the game's own call site supplies `self` explicitly anyway.
+  The check that protects the process is the executable-in-image one, and that
+  still gates. Refusing a measured-correct call over an unmeasured assumption
+  is the same class of error as trusting an address.
+- **A refusal now names itself.** The first structural refusal of a session
+  logs one line to `out.txt` with `m_Kind`, `m_ObjectKind`, `m_CallScript`,
+  the resolved script function, `m_CallYYC`, whether each is in-image, and the
+  `m_BoundThis` kind — in **both** builds, because this is the failure a
+  future game or YYToolkit update will produce and the player's own log should
+  explain it. Every layout read is `IsBadReadPtr`-guarded, so a wrong layout
+  refuses instead of faulting inside a frame callback.
+
+That fix was real but it was **not** the cause. Measured, one launch later:
+
+```
+petquest stat: family objs seen=2590 excluded=0 on-screen=615 | pet-seen ticks=12046
+  collected=0 | skipped(gate)=0 skipped(no Loot_Manager)=0 | target lost=0 travel timeouts=0
+  REFUSED (structural): no callable on the method value=309 (collect did NOT run)
+
+petquest: COLLECT REFUSED - the object is not OBJECT_KIND_SCRIPTREF.
+  [kind=6 objectKind=0 m_CallScript=0000000000000000 scriptFn=0000000000000000(inImage=0)
+   m_CallYYC=0000000000000000(inImage=0) boundKind=496]
+```
+
+**On this runner the `m_Quest*` values are not `CScriptRef`s.** `m_Questpickup`
+is `VALUE_OBJECT` with `m_ObjectKind = 0` (`OBJECT_KIND_YYOBJECTBASE`, not
+`SCRIPTREF`), both callable fields read as 0, and `method_get_index` returns
+nothing for it — while a sibling variable on the same instance,
+`s_lootDrawData`, *does* resolve, to script `#105134` (that contrast is
+visible in this document's own `citrace item` dump). This game boxes these
+values in a shape YYToolkit's `CScriptRef` does not describe. Reading the
+callable out of the struct cannot work here, and no reordering of the fields
+would have changed that.
+
+Note what the first and second attempts have in common: **a layout somebody
+wrote down was trusted without a positive control on this target.** An address
+is the loud version of that mistake. A struct field is the quiet one. Both
+were wrong for the same reason, and the second one was written *while fixing*
+the first.
+
+## Fourth pass: `script_execute` — CONFIRMED
+
+What ships. The route that assumes nothing about the value's shape is to let
+the runtime dispatch it:
+
+```cpp
+g_Yytk->CallBuiltinEx(res, "script_execute", item, lootManager, { methodValue, arg })
+```
+
+A builtin resolved **by name**, with `self` and `other` supplied by
+`CallBuiltinEx`. No address, and no struct layout either — strictly more
+version-proof than both earlier attempts. The call shape is the one measured
+on a real collect and never changed across any of the three rounds: `self` =
+the item, `other` = `Loot_Manager_obj`, one real argument.
+
+Confirmed live 2026-09-11, plan §4 rule 3 satisfied — **the quest counter
+advanced**, not merely the item vanishing:
+
+```
+collected=1 | skipped(gate)=0 skipped(no Loot_Manager)=0 | target lost=0 travel timeouts=0
+call route=script_execute (name-resolved, no layout) | dispatched-but-item-remained=0
+```
+
+Zero structural refusals. `dispatched-but-item-remained=0` is a new counter
+added for this round: §2 of the plan warned `script_execute` may *quietly
+no-op* on a method value rather than reject it, and since `m_Questpickup`
+removes the item, an instance still present after the call would have caught
+exactly that. It is not proof of credit — rule 3 still stands, and the UI
+counter is what confirmed this — it only separates "nothing ran" from "ran and
+did nothing", which are identical from outside.
+
+The `CScriptRef` route remains as a fallback for a runner where that layout
+holds, reached only when `script_execute` fails to dispatch at all — never as
+a retry of a call that already ran, so "one item, one call" holds.
+
+### Irony worth recording
+
+`script_execute` was one of the nine shapes `kCiInvokePaths` had written off
+as "measured negative (C0.2)". It was on the list the whole time. See the
+loose end below for why those negatives were never fair tests — the same
+`argc = 0` / no-`self` problem §7 identified — and note that closing this took
+*three* rounds of chasing call machinery when the working answer was sitting in
+a table of already-implemented paths.
+
+### The loose end, now partly pulled
+
+The nine name-resolved shapes in `kCiInvokePaths` were labelled "measured
+negative (C0.2)". They were swept with **no argument and no way to set
+`self`** — the same conditions §7 above later explains away ("This explains
+every C0.2 access violation"). One of them, `CallBuiltinEx` +
+`script_execute`, is now the shipped mechanism, which retroactively proves the
+label wrong for at least that one.
+
+The other eight remain **not observed**, not **does not work**. `citrace
+collect confirm <path> 1` supplies an argument and a real `self` to every one
+of them, so any of the eight can be re-tested in one line with no rebuild —
+§4 rules still bind if anyone runs them.
+
+**The lesson that cost three rounds:** a negative result is only as good as
+the conditions it was measured under, and those conditions have to be written
+down *next to* the result. "Measured negative" sat in a table for weeks while
+the thing it described was the answer. This document's own "Prove the
+Instrument Before Trusting a Negative Result" rule (now in the repo-root
+`agents.md`) was written about hooks that could not fire; it applies just as
+much to call shapes that were never given their arguments.

@@ -14,6 +14,22 @@ controls over a small file-based IPC channel that the ForgePact panel writes to.
 The plugin must be built against the **same** YYToolkit headers as the `YYToolkit.dll`
 you ship, or you will get crashes at load time — the interface is a raw vtable.
 
+### `YYTK_DEFINE_INTERNAL` is required
+
+`build.bat` passes `/DYYTK_DEFINE_INTERNAL=1`. This is not optional and not a debug
+flag: it exposes YYToolkit's real struct bodies (`CScriptRef`, `YYObjectBase`,
+`CInstance`) in place of the opaque stand-ins. `InvokeMethodValue` — the Pet Quest
+Collector's collect call — reads a GML method value's own callable off its
+`CScriptRef`, which is what lets it invoke `m_Questpickup` **without a hardcoded game
+address** (see `agents.md`, "Never Call an Address You Resolved by Hand"). Without the
+define the plugin does not compile.
+
+It must be on the **whole** compile command, not a `#define` in `ModuleMain.cpp`:
+`YYTK_Shared_Types.cpp` is a separate translation unit, and if the two disagree about
+`sizeof(CInstance)` the link is quietly wrong rather than loudly broken. The header's
+own `static_assert(sizeof(YYObjectBase) == 0x88)` is the compile-time check that the
+headers still match the runtime.
+
 ## Build
 
 ```
