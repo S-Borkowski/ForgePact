@@ -122,6 +122,66 @@ class TestMapRevealContract(unittest.TestCase):
         self.assertIn("if (!ready) return;", body)
         self.assertLess(body.index("if (!ready) return;"), body.index("m_SpawnWindow.store"))
 
+    def test_window_does_not_survive_a_zone_transition(self):
+        # REPORTED 2026-09-12 (origin's review of PR #2, issue 2): neither
+        # ResetIdentity() nor the new-zone branch cleared an already-open
+        # window, so walking to another zone mid-window left WantsPackSpawn()
+        # true while the next zone was still loading - the readiness gate
+        # bypassed, and the inert-creator damage above reachable by a second
+        # route. Losing the map, changing identity, or changing room all have
+        # to shut the window.
+        self.assertIn("void CloseSpawnWindow()", self.header)
+        closer = self.header[self.header.index("void CloseSpawnWindow()"):][:400]
+        self.assertIn("m_SpawnWindow.store(0", closer)
+        self.assertIn("m_PacksPending = false", closer)
+
+        reset = self.header[self.header.index("void ResetIdentity()"):][:400]
+        self.assertIn("CloseSpawnWindow();", reset)
+
+        # The new-zone branch must drop the previous zone's window before
+        # arming the next one.
+        tick = self.header[self.header.index("void Tick()"):]
+        tick = tick[: tick.index("void TryOpenSpawnWindow")]
+        self.assertIn("CloseSpawnWindow();", tick)
+        self.assertLess(tick.index("CloseSpawnWindow();"), tick.index("m_PacksPending = true"))
+
+    def test_window_is_checked_every_frame_not_only_when_throttled(self):
+        # Same report: the identity work runs one tick in 20, so a transition
+        # between checks could hand up to 20 frames of an open window to the
+        # next zone's loading creators. While a window is open the room is
+        # verified every frame instead.
+        frame = self.header[self.header.index("void OnFrame("):]
+        frame = frame[: frame.index("private:")]
+        self.assertIn("RoomKey() != m_WindowRoom", frame)
+        # ...and the check must come before the countdown, so a stale window
+        # cannot serve even one more frame.
+        self.assertLess(frame.index("RoomKey() != m_WindowRoom"),
+                        frame.index("m_SpawnWindow.store(w - 1"))
+        self.assertLess(frame.index("RoomKey() != m_WindowRoom"), frame.index("% 20"))
+        # An unreadable room must read as "not our room" (closes the window),
+        # never as "same room" (keeps lying).
+        room = self.header[self.header.index("int64_t RoomKey()"):][:600]
+        self.assertEqual(room.count("return INT64_MIN;"), 3)
+        # The window records which room it belongs to when it opens.
+        opener = self.header[self.header.index("void TryOpenSpawnWindow"):][:2200]
+        self.assertIn("m_WindowRoom = RoomKey();", opener)
+        self.assertLess(opener.index("m_WindowRoom = RoomKey();"), opener.index("m_SpawnWindow.store(kSpawnWindowFrames"))
+
+    def test_enabling_packs_applies_to_the_current_zone(self):
+        # REPORTED 2026-09-12 (issue 3): SetPacks(true) only flipped the flag.
+        # Tick() returns early while the zone identity is unchanged, so the
+        # zone the player was standing in never got armed - the checkbox said
+        # it applied live and nothing happened until the next zone change or a
+        # reveal off/on cycle.
+        setter = self.header[self.header.index("void SetPacks(bool on)"):][:900]
+        self.assertIn("m_PacksPending = true", setter)
+        # It must ARM the readiness-gated pass, not open the window directly -
+        # skipping the gate would reintroduce the inert-creator bug.
+        self.assertNotIn("m_SpawnWindow.store(kSpawnWindowFrames", setter)
+        # Only on an off->on edge, and only while the parent is on.
+        self.assertIn("!was", setter)
+        self.assertIn("m_Enabled", setter)
+
     def test_zone_with_no_creators_is_left_alone(self):
         idx = self.header.index("void TryOpenSpawnWindow")
         body = self.header[idx:idx + 1800]

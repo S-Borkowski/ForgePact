@@ -396,6 +396,56 @@ Commands: `reveal 1|0`, `reveal packs 1|0`, and `reveal stat` (research build)
 which reports both flags, zones populated, window frames left, creator lies,
 and a live creator/enemy census for the current zone.
 
+### Two more ways into the same damage, found by review (2026-09-12)
+
+Origin's review of PR #2 pointed out that the readiness gate above only
+protects the moment the window *opens*. Two paths reached the same
+lie-to-an-uninitialised-creator state without ever going through it. Neither
+was reproduced as an empty zone in live gameplay — they were found by
+compiling the class against controlled API responses — but both are the exact
+mechanism proven destructive above, so they are treated as real.
+
+**1. The window outlived its zone.** Neither `ResetIdentity()` nor the
+new-zone branch cleared an open `m_SpawnWindow`. Walking to another zone
+mid-window left `WantsPackSpawn()` true while the next zone was still loading:
+
+```text
+ready_zone            window=900
+loading_no_minimap    window=899 wants=1
+unready_new_zone      window=898 wants=1 pending=1
+```
+
+`ResetIdentity()` is what `Tick()` calls when the minimap object, its grid or
+the `ds_grid` behind it is missing — i.e. precisely during a room load — so
+"we cannot see the map any more" now means "the window is void", via a single
+`CloseSpawnWindow()` that every such path routes through. The new-zone branch
+closes the old window before arming the next pass.
+
+**2. The 20-frame throttle left a hole.** The identity work runs one tick in
+20, so even with the fix above a transition could hand up to 20 frames of open
+window to the next zone. While a window is open the room is now verified
+**every** frame — one member read, only for the few seconds a window lasts —
+against the room the window was opened for (`m_WindowRoom`, recorded in
+`TryOpenSpawnWindow`). An unreadable room reads as "not our room" and closes
+the window, which is the safe direction.
+
+### `reveal packs` on did not apply to the zone you were standing in
+
+Same review, lower severity. `SetPacks(true)` set the flag and nothing else;
+`Tick()` returns early while the zone identity is unchanged, so the current
+zone was never armed and the checkbox did nothing until the next zone change
+or a `reveal` off/on cycle:
+
+```text
+enable_packs_current_zone   window=0 pending=0
+```
+
+It now arms the current zone on an off→on edge (and only while `reveal`
+itself is on). Deliberately `m_PacksPending = true` rather than opening the
+window directly — the readiness gate is the whole reason the pass is safe, and
+short-circuiting it here would have reintroduced the original bug by a third
+route.
+
 ## What this changes about the original plan
 
 The original design (a per-object "discovery sweep" writing `isDiscovered`

@@ -44,7 +44,7 @@ public:
     bool IsEnabled() const { return m_Enabled; }
     void SetEnabled(bool enabled) {
         m_Enabled = enabled;
-        if (!m_Enabled) { m_SpawnWindow.store(0, std::memory_order_relaxed); m_PacksPending = false; }
+        if (!m_Enabled) { CloseSpawnWindow(); }
         else ResetIdentity();   // re-arm: the current zone gets a pass too
         Out(std::string("reveal: ") + (m_Enabled ? "ACIK" : "KAPALI"));
     }
@@ -57,8 +57,20 @@ public:
     // `map_reveal_packs` checkbox under "Reveal full map".
     bool PacksEnabled() const { return m_Packs; }
     void SetPacks(bool on) {
+        const bool was = m_Packs;
         m_Packs = on;
-        if (!m_Packs) { m_SpawnWindow.store(0, std::memory_order_relaxed); m_PacksPending = false; }
+        if (!m_Packs) { CloseSpawnWindow(); }
+        // REPORTED 2026-09-12 (PR #2 issue 3): turning packs on used to set
+        // this flag and nothing else. Tick() returns early while the zone
+        // identity is unchanged, so the zone the player is standing in was
+        // never armed - the checkbox claimed to apply live and then did
+        // nothing until the next zone change or a reveal off/on cycle.
+        //
+        // Arm the current zone instead of opening the window directly: the
+        // readiness gate in TryOpenSpawnWindow is the whole reason the pack
+        // pass is safe, and skipping it here would reintroduce the inert-
+        // creator bug by a new route.
+        if (m_Packs && !was && m_Enabled) { m_PacksPending = true; m_PendingTicks = 0; }
         Out(std::string("reveal packs: ") + (m_Packs ? "ACIK" : "KAPALI"));
     }
 
@@ -79,7 +91,20 @@ public:
     void OnFrame(uint64_t frameCount) {
         if (!m_Enabled) return;
         int w = m_SpawnWindow.load(std::memory_order_relaxed);
-        if (w > 0) m_SpawnWindow.store(w - 1, std::memory_order_relaxed);
+        if (w > 0) {
+            // REPORTED 2026-09-12 (PR #2 issue 2): the identity work below is
+            // throttled to one tick in 20, so a zone change could hand up to
+            // 20 frames of an open window to the *next* zone's creators while
+            // it was still loading - answering distance_to_object with 0
+            // before a creator has initialised, which is precisely what
+            // leaves spawners spent and inert (see TryOpenSpawnWindow).
+            //
+            // While a window is open, check the room every frame instead. It
+            // is one member read, it only runs for the few seconds a window
+            // lasts, and being wrong here is the expensive direction.
+            if (RoomKey() != m_WindowRoom) { CloseSpawnWindow(); return; }
+            m_SpawnWindow.store(w - 1, std::memory_order_relaxed);
+        }
         if ((frameCount % 20) != 0) return;
         try { Tick(); } catch (...) {}
         // Separate from Tick() on purpose: Tick() returns early once the zone
@@ -104,14 +129,44 @@ private:
     // zone is written off as one whose creators never initialise.
     static constexpr int kPendingGiveUpTicks = 1800;
     std::atomic<int> m_SpawnWindow{ 0 };
+    int64_t m_WindowRoom{ INT64_MIN };   // the room the open window belongs to
     bool m_PacksPending{ false };
     int  m_PendingTicks{ 0 };
     long m_ZonesPopulated{ 0 };
 
+    // Shutting the window is always safe - the pack pass re-arms on the next
+    // identity change - so everything that means "the zone we opened this for
+    // is gone or unverifiable" routes through here rather than each caller
+    // remembering two fields.
+    void CloseSpawnWindow() {
+        m_SpawnWindow.store(0, std::memory_order_relaxed);
+        m_PacksPending = false;
+        m_PendingTicks = 0;
+        m_WindowRoom = INT64_MIN;
+    }
+
+    // REPORTED 2026-09-12 (PR #2 issue 2): ResetIdentity is what Tick() calls
+    // when the minimap object, its grid, or the ds_grid behind it is missing -
+    // i.e. exactly while a room is loading. It used to forget the identity and
+    // leave an open spawn window counting down into the new zone, so
+    // WantsPackSpawn() stayed true through the transition and the readiness
+    // gate was bypassed. Losing the map means losing the window too.
     void ResetIdentity() {
         m_LastInstance = INT64_MIN;
         m_LastGrid = INT64_MIN;
         m_LastRoom = INT64_MIN;
+        CloseSpawnWindow();
+    }
+
+    // The `room` global, or INT64_MIN when it cannot be read. An unreadable
+    // room reads as "not the room the window was opened for", which closes the
+    // window - the safe direction.
+    int64_t RoomKey() const {
+        CInstance* global = nullptr;
+        if (!AurieSuccess(g_Yytk->GetGlobalInstance(&global)) || !global) return INT64_MIN;
+        RValue* room = nullptr;
+        if (!AurieSuccess(g_Yytk->GetInstanceMember(RValue(global), "room", room)) || !room) return INT64_MIN;
+        try { return static_cast<int64_t>(std::llround(room->ToDouble())); } catch (...) { return INT64_MIN; }
     }
 
     void Tick() {
@@ -126,14 +181,7 @@ private:
         RValue ex = g_Yytk->CallBuiltin("ds_exists", { RValue(gid), RValue(1.0) });
         if (!ex.ToBoolean()) { ResetIdentity(); return; }
 
-        int64_t roomKey = INT64_MIN;
-        CInstance* global = nullptr;
-        if (AurieSuccess(g_Yytk->GetGlobalInstance(&global)) && global) {
-            RValue* room = nullptr;
-            if (AurieSuccess(g_Yytk->GetInstanceMember(RValue(global), "room", room)) && room) {
-                try { roomKey = static_cast<int64_t>(std::llround(room->ToDouble())); } catch (...) {}
-            }
-        }
+        const int64_t roomKey = RoomKey();
 
         const int64_t instanceKey = static_cast<int64_t>(std::llround(id.ToDouble()));
         const int64_t gridKey = static_cast<int64_t>(std::llround(gid));
@@ -147,6 +195,11 @@ private:
         // New zone: arm the pack pass, but do NOT start lying yet - see
         // TryOpenSpawnWindow.  The zone-identity change fires while the new
         // room is still loading, and lying that early does real damage.
+        //
+        // Any window still open belongs to the zone we just left, so it goes
+        // first (PR #2 issue 2) - the new zone gets one only once its own
+        // creators pass the readiness gate.
+        CloseSpawnWindow();
         if (m_Packs) { m_PacksPending = true; m_PendingTicks = 0; }
     }
 
@@ -182,8 +235,13 @@ private:
         const bool ready = (t.m_Kind == VALUE_REAL || t.m_Kind == VALUE_INT32 || t.m_Kind == VALUE_INT64);
         if (!ready) return;   // creators still initialising - check again next tick
 
+        // Remember which room this window was opened for, so OnFrame can shut
+        // it the moment the player leaves rather than at the next throttled
+        // identity check (PR #2 issue 2).
+        m_WindowRoom = RoomKey();
         m_SpawnWindow.store(kSpawnWindowFrames, std::memory_order_relaxed);
         m_PacksPending = false;
+        m_PendingTicks = 0;
         ++m_ZonesPopulated;
     }
 };

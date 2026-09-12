@@ -261,6 +261,7 @@ static std::string FirstToken(const std::string& line, std::string& rest)
 // forward-declared right here, specifically so this include block can move
 // only forward from now on, never back:
 static bool HookOneScript(const char* shortName, const char* id, PVOID dest, PFUNC_YYGMLScript* origOut);
+static bool AddrIsExecutableInModule(HMODULE mod, const void* addr);   // defined with the pet-quest collect call
 static bool HhResolveLocalPlayer(RValue& out, std::string* how = nullptr);
 static void InstallCreateHooks();
 static void InstallDensityLifecycleHooks();
@@ -1491,7 +1492,21 @@ static RValue& HookElite(CInstance* S, CInstance* O, RValue& R, int argc, RValue
     return g_OrigElite ? g_OrigElite(S, O, R, argc, A) : R;
 }
 
-static bool HookOneScript(const char* shortName, const char* id, PVOID dest, PFUNC_YYGMLScript* origOut)
+// Table-only install: swaps the pointer inside the script-table entry.
+//
+// This is BLIND to compiled GML's direct calls. This build's YYC code calls
+// another script with a `call rel32` bound at compile time, which never reads
+// the script table - the finding that invalidated 34 hooked call sites'
+// worth of "0 calls" results (see agents.md, "Prove the Instrument Before
+// Trusting a Negative Result").
+//
+// So this is NOT the installer gameplay hooks should use; HookOneScript below
+// is. It stays because the `citrace` research commands need a deliberately
+// table-only hook: `citrace nativetrace`'s whole purpose is to run a native
+// detour alongside a table hook on the same target and print both counters,
+// and that comparison only means anything while one of them really is
+// table-only.
+static bool HookOneScriptTable(const char* shortName, const char* id, PVOID dest, PFUNC_YYGMLScript* origOut)
 {
     UNREFERENCED_PARAMETER(id);
     std::string full = std::string("gml_Script_") + shortName;
@@ -1502,6 +1517,83 @@ static bool HookOneScript(const char* shortName, const char* id, PVOID dest, PFU
     if (!sc || !sc->m_Functions) { Out(std::string("hook ") + shortName + ": null functions"); return false; }
     if (origOut && !*origOut) {
         *origOut = sc->m_Functions->m_ScriptFunction;
+    }
+    sc->m_Functions->m_ScriptFunction = reinterpret_cast<PFUNC_YYGMLScript>(dest);
+    Out(std::string("HOOK INSTALLED on ") + shortName);
+    return true;
+}
+
+// The installer every shipped gameplay hook uses. Installs BOTH:
+//
+//   - the script-table swap, which catches calls routed through the table;
+//   - an inline detour at the function's own address (MmCreateHook), which
+//     catches compiled GML's direct `call rel32` - the ones the table swap
+//     cannot see.
+//
+// REPORTED 2026-09-12 by origin's review of PR #2, and it is the same defect
+// this branch had already found and fixed for exactly one hook: a table-only
+// install reports "HOOK INSTALLED" and then silently does nothing on the
+// paths the game actually uses. Read-only inspection of the shipped exe found
+// direct native callers for StatMovementSpeed, StatAttackSpeed, DropRelic,
+// DropMonsterGold and DropGold among others - so stat scaling, drop
+// multipliers and the max-level relic filter could all report installed while
+// the game ran straight past them. Rather than layer a second detour onto the
+// five names that happened to get verified, the interception belongs in the
+// installer, where every present and future gameplay hook gets it.
+//
+// `*origOut` becomes the TRAMPOLINE, so a hook body that calls through it
+// reaches the real original from either route and never re-enters itself.
+//
+// Three things make repeat installation safe - it matters, because shared
+// chokepoints like DropRelic are installed from more than one call site
+// (RelicFilterMod's max-relic exclusion and the panel's dropmult both want
+// it), and re-install is how this file has always made that idempotent:
+//
+//   1. The detour is attempted only on the FIRST install (`!*origOut`), the
+//      one moment the table is guaranteed to still hold the game's own
+//      function. A later install would read our own detour out of the table
+//      and patch that, which is an infinite loop.
+//   2. The target must lie inside Hero_Siege.exe. If some other hook already
+//      swapped this entry, the table holds a pointer into THIS module, and
+//      patching it would detour our own code instead of the game's.
+//   3. A failed detour is not fatal: `*origOut` falls back to the table entry
+//      and the hook stays table-only, exactly as it behaved before. It says
+//      so in the log rather than pretending.
+static bool HookOneScript(const char* shortName, const char* id, PVOID dest, PFUNC_YYGMLScript* origOut)
+{
+    std::string full = std::string("gml_Script_") + shortName;
+    PVOID p = nullptr;
+    AurieStatus st = g_Yytk->GetNamedRoutinePointer(full.c_str(), &p);
+    if (!AurieSuccess(st) || !p) { Out(std::string("hook ") + shortName + ": not found st=" + std::to_string((int)st)); return false; }
+    CScript* sc = reinterpret_cast<CScript*>(p);
+    if (!sc || !sc->m_Functions) { Out(std::string("hook ") + shortName + ": null functions"); return false; }
+
+    PFUNC_YYGMLScript tableEntry = sc->m_Functions->m_ScriptFunction;
+    const bool firstInstall = (origOut && !*origOut);
+    if (firstInstall) {
+        bool native = false;
+        std::string why;
+        if (!id || !*id) {
+            why = "no hook id";
+        } else if (!AddrIsExecutableInModule(GetModuleHandleA(nullptr), (const void*)tableEntry)) {
+            // Already detoured by something in this module, or not code at
+            // all. Either way the address is not the game's to patch.
+            why = "table entry is not code inside Hero_Siege.exe";
+        } else {
+            PVOID tramp = nullptr;
+            AurieStatus ns = MmCreateHook(g_ArSelfModule, id, (PVOID)tableEntry, dest, &tramp);
+            if (AurieSuccess(ns) && tramp) {
+                *origOut = reinterpret_cast<PFUNC_YYGMLScript>(tramp);
+                native = true;
+            } else {
+                why = "MmCreateHook st=" + std::to_string((int)ns);
+            }
+        }
+        if (!native) {
+            *origOut = tableEntry;
+            Out(std::string("hook ") + shortName + ": TABLE-ONLY (" + why
+                + ") - direct compiled-GML calls will bypass this hook");
+        }
     }
     sc->m_Functions->m_ScriptFunction = reinterpret_cast<PFUNC_YYGMLScript>(dest);
     Out(std::string("HOOK INSTALLED on ") + shortName);
@@ -4359,9 +4451,9 @@ static bool g_AggroHooksInstalled = false;
 static void InstallAggroTraceHooks()
 {
     if (g_AggroHooksInstalled) return; g_AggroHooksInstalled = true;
-    HookOneScript("PathFindTakeTarget",     "bp_tr_take",  (PVOID)Hook_TracePathFindTakeTarget,     &g_OrigAggro_PathFindTakeTarget);
-    HookOneScript("SocketSetTarget",        "bp_tr_sst",   (PVOID)Hook_TraceSocketSetTarget,        &g_OrigAggro_SocketSetTarget);
-    HookOneScript("PathFindAggroBroadcast", "bp_tr_bc",    (PVOID)Hook_TracePathFindAggroBroadcast, &g_OrigAggro_PathFindAggroBroadcast);
+    HookOneScriptTable("PathFindTakeTarget",     "bp_tr_take",  (PVOID)Hook_TracePathFindTakeTarget,     &g_OrigAggro_PathFindTakeTarget);
+    HookOneScriptTable("SocketSetTarget",        "bp_tr_sst",   (PVOID)Hook_TraceSocketSetTarget,        &g_OrigAggro_SocketSetTarget);
+    HookOneScriptTable("PathFindAggroBroadcast", "bp_tr_bc",    (PVOID)Hook_TracePathFindAggroBroadcast, &g_OrigAggro_PathFindAggroBroadcast);
 }
 #endif
 // ===== Beacon amulet mechanic =====================================================
@@ -6138,39 +6230,39 @@ static void InstallCiTraceHooks()
     HookBuiltin("instance_deactivate_all",    "fp_ci_ida", (PVOID)Hook_Ci_InstanceDeactivateAll,    &g_OrigCi_InstanceDeactivateAll);
     HookBuiltin("instance_change",            "fp_ci_ic",  (PVOID)Hook_Ci_InstanceChange,           &g_OrigCi_InstanceChange);
     HookBuiltin("variable_instance_set",      "fp_ci_vis", (PVOID)Hook_Ci_VariableInstanceSet,      &g_OrigCi_VariableInstanceSet);
-    HookOneScript("CheckPlayerInteraction", "fp_ci_cpi",  (PVOID)Hook_Ci_CheckPlayerInteraction, &g_OrigCi_CheckPlayerInteraction);
-    HookOneScript("CheckUseKey",            "fp_ci_cuk",  (PVOID)Hook_Ci_CheckUseKey,            &g_OrigCi_CheckUseKey);
-    HookOneScript("PlayerInteracting",      "fp_ci_pi",   (PVOID)Hook_Ci_PlayerInteracting,      &g_OrigCi_PlayerInteracting);
-    HookOneScript("LootBlocksUseKey",       "fp_ci_lbuk", (PVOID)Hook_Ci_LootBlocksUseKey,       &g_OrigCi_LootBlocksUseKey);
-    HookOneScript("PickupLoot",             "fp_ci_pl",   (PVOID)Hook_Ci_PickupLoot,             &g_OrigCi_PickupLoot);
-    HookOneScript("GetMouseTarget",         "fp_ci_gmt",  (PVOID)Hook_Ci_GetMouseTarget,         &g_OrigCi_GetMouseTarget);
-    HookOneScript("PlayerGetMouseTarget",   "fp_ci_pgmt", (PVOID)Hook_Ci_PlayerGetMouseTarget,   &g_OrigCi_PlayerGetMouseTarget);
-    HookOneScript("GetMouseDisabledTarget", "fp_ci_gmdt", (PVOID)Hook_Ci_GetMouseDisabledTarget, &g_OrigCi_GetMouseDisabledTarget);
-    HookOneScript("CanISeeTarget",          "fp_ci_cist", (PVOID)Hook_Ci_CanISeeTarget,          &g_OrigCi_CanISeeTarget);
-    HookOneScript("PlayerMouseAction",      "fp_ci_pma",  (PVOID)Hook_Ci_PlayerMouseAction,      &g_OrigCi_PlayerMouseAction);
-    HookOneScript("GetPlayerMouseDisabled", "fp_ci_gpmd", (PVOID)Hook_Ci_GetPlayerMouseDisabled, &g_OrigCi_GetPlayerMouseDisabled);
-    HookOneScript("KeyboardMouseInput",     "fp_ci_kmi",  (PVOID)Hook_Ci_KeyboardMouseInput,     &g_OrigCi_KeyboardMouseInput);
-    HookOneScript("RefreshMouseMove",       "fp_ci_rmm",  (PVOID)Hook_Ci_RefreshMouseMove,       &g_OrigCi_RefreshMouseMove);
-    HookOneScript("GetQuestHoverDescription", "fp_ci_gqhd", (PVOID)Hook_Ci_GetQuestHoverDescription, &g_OrigCi_GetQuestHoverDescription);
-    HookOneScript("anon@1400@gml_Object_Quest_Object_Parent_obj_Create_0", "fp_ci_a1400", (PVOID)Hook_Ci_Anon1400, &g_OrigCi_Anon1400);
-    HookOneScript("anon@1584@gml_Object_Quest_Object_Parent_obj_Create_0", "fp_ci_a1584", (PVOID)Hook_Ci_Anon1584, &g_OrigCi_Anon1584);
-    HookOneScript("anon@2113@gml_Object_Quest_Object_Parent_obj_Create_0", "fp_ci_a2113", (PVOID)Hook_Ci_Anon2113, &g_OrigCi_Anon2113);
-    HookOneScript("anon@2786@gml_Object_Quest_Object_Parent_obj_Create_0", "fp_ci_a2786", (PVOID)Hook_Ci_Anon2786, &g_OrigCi_Anon2786);
-    HookOneScript("anon@3858@gml_Object_Quest_Object_Parent_obj_Create_0", "fp_ci_a3858", (PVOID)Hook_Ci_Anon3858, &g_OrigCi_Anon3858);
-    HookOneScript("anon@4737@gml_Object_Quest_Object_Parent_obj_Create_0", "fp_ci_a4737", (PVOID)Hook_Ci_Anon4737, &g_OrigCi_Anon4737);
-    HookOneScript("anon@5164@gml_Object_Quest_Object_Parent_obj_Create_0", "fp_ci_a5164", (PVOID)Hook_Ci_Anon5164, &g_OrigCi_Anon5164);
+    HookOneScriptTable("CheckPlayerInteraction", "fp_ci_cpi",  (PVOID)Hook_Ci_CheckPlayerInteraction, &g_OrigCi_CheckPlayerInteraction);
+    HookOneScriptTable("CheckUseKey",            "fp_ci_cuk",  (PVOID)Hook_Ci_CheckUseKey,            &g_OrigCi_CheckUseKey);
+    HookOneScriptTable("PlayerInteracting",      "fp_ci_pi",   (PVOID)Hook_Ci_PlayerInteracting,      &g_OrigCi_PlayerInteracting);
+    HookOneScriptTable("LootBlocksUseKey",       "fp_ci_lbuk", (PVOID)Hook_Ci_LootBlocksUseKey,       &g_OrigCi_LootBlocksUseKey);
+    HookOneScriptTable("PickupLoot",             "fp_ci_pl",   (PVOID)Hook_Ci_PickupLoot,             &g_OrigCi_PickupLoot);
+    HookOneScriptTable("GetMouseTarget",         "fp_ci_gmt",  (PVOID)Hook_Ci_GetMouseTarget,         &g_OrigCi_GetMouseTarget);
+    HookOneScriptTable("PlayerGetMouseTarget",   "fp_ci_pgmt", (PVOID)Hook_Ci_PlayerGetMouseTarget,   &g_OrigCi_PlayerGetMouseTarget);
+    HookOneScriptTable("GetMouseDisabledTarget", "fp_ci_gmdt", (PVOID)Hook_Ci_GetMouseDisabledTarget, &g_OrigCi_GetMouseDisabledTarget);
+    HookOneScriptTable("CanISeeTarget",          "fp_ci_cist", (PVOID)Hook_Ci_CanISeeTarget,          &g_OrigCi_CanISeeTarget);
+    HookOneScriptTable("PlayerMouseAction",      "fp_ci_pma",  (PVOID)Hook_Ci_PlayerMouseAction,      &g_OrigCi_PlayerMouseAction);
+    HookOneScriptTable("GetPlayerMouseDisabled", "fp_ci_gpmd", (PVOID)Hook_Ci_GetPlayerMouseDisabled, &g_OrigCi_GetPlayerMouseDisabled);
+    HookOneScriptTable("KeyboardMouseInput",     "fp_ci_kmi",  (PVOID)Hook_Ci_KeyboardMouseInput,     &g_OrigCi_KeyboardMouseInput);
+    HookOneScriptTable("RefreshMouseMove",       "fp_ci_rmm",  (PVOID)Hook_Ci_RefreshMouseMove,       &g_OrigCi_RefreshMouseMove);
+    HookOneScriptTable("GetQuestHoverDescription", "fp_ci_gqhd", (PVOID)Hook_Ci_GetQuestHoverDescription, &g_OrigCi_GetQuestHoverDescription);
+    HookOneScriptTable("anon@1400@gml_Object_Quest_Object_Parent_obj_Create_0", "fp_ci_a1400", (PVOID)Hook_Ci_Anon1400, &g_OrigCi_Anon1400);
+    HookOneScriptTable("anon@1584@gml_Object_Quest_Object_Parent_obj_Create_0", "fp_ci_a1584", (PVOID)Hook_Ci_Anon1584, &g_OrigCi_Anon1584);
+    HookOneScriptTable("anon@2113@gml_Object_Quest_Object_Parent_obj_Create_0", "fp_ci_a2113", (PVOID)Hook_Ci_Anon2113, &g_OrigCi_Anon2113);
+    HookOneScriptTable("anon@2786@gml_Object_Quest_Object_Parent_obj_Create_0", "fp_ci_a2786", (PVOID)Hook_Ci_Anon2786, &g_OrigCi_Anon2786);
+    HookOneScriptTable("anon@3858@gml_Object_Quest_Object_Parent_obj_Create_0", "fp_ci_a3858", (PVOID)Hook_Ci_Anon3858, &g_OrigCi_Anon3858);
+    HookOneScriptTable("anon@4737@gml_Object_Quest_Object_Parent_obj_Create_0", "fp_ci_a4737", (PVOID)Hook_Ci_Anon4737, &g_OrigCi_Anon4737);
+    HookOneScriptTable("anon@5164@gml_Object_Quest_Object_Parent_obj_Create_0", "fp_ci_a5164", (PVOID)Hook_Ci_Anon5164, &g_OrigCi_Anon5164);
     HookBuiltin("keyboard_check_pressed",     "fp_ci_kcp",  (PVOID)Hook_Ci_KeyboardCheckPressed,     &g_OrigCi_KeyboardCheckPressed);
     HookBuiltin("mouse_check_button_pressed", "fp_ci_mcbp", (PVOID)Hook_Ci_MouseCheckButtonPressed,  &g_OrigCi_MouseCheckButtonPressed);
-    HookOneScript("anon@1940@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p1940", (PVOID)Hook_Ci_PmAnon1940, &g_OrigCi_PmAnon1940);
-    HookOneScript("anon@2426@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p2426", (PVOID)Hook_Ci_PmAnon2426, &g_OrigCi_PmAnon2426);
-    HookOneScript("anon@3331@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p3331", (PVOID)Hook_Ci_PmAnon3331, &g_OrigCi_PmAnon3331);
-    HookOneScript("anon@5032@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p5032", (PVOID)Hook_Ci_PmAnon5032, &g_OrigCi_PmAnon5032);
-    HookOneScript("anon@5174@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p5174", (PVOID)Hook_Ci_PmAnon5174, &g_OrigCi_PmAnon5174);
-    HookOneScript("anon@5646@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p5646", (PVOID)Hook_Ci_PmAnon5646, &g_OrigCi_PmAnon5646);
-    HookOneScript("anon@6344@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p6344", (PVOID)Hook_Ci_PmAnon6344, &g_OrigCi_PmAnon6344);
-    HookOneScript("anon@6662@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p6662", (PVOID)Hook_Ci_PmAnon6662, &g_OrigCi_PmAnon6662);
-    HookOneScript("anon@7920@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p7920", (PVOID)Hook_Ci_PmAnon7920, &g_OrigCi_PmAnon7920);
-    HookOneScript("anon@9698@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p9698", (PVOID)Hook_Ci_PmAnon9698, &g_OrigCi_PmAnon9698);
+    HookOneScriptTable("anon@1940@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p1940", (PVOID)Hook_Ci_PmAnon1940, &g_OrigCi_PmAnon1940);
+    HookOneScriptTable("anon@2426@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p2426", (PVOID)Hook_Ci_PmAnon2426, &g_OrigCi_PmAnon2426);
+    HookOneScriptTable("anon@3331@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p3331", (PVOID)Hook_Ci_PmAnon3331, &g_OrigCi_PmAnon3331);
+    HookOneScriptTable("anon@5032@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p5032", (PVOID)Hook_Ci_PmAnon5032, &g_OrigCi_PmAnon5032);
+    HookOneScriptTable("anon@5174@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p5174", (PVOID)Hook_Ci_PmAnon5174, &g_OrigCi_PmAnon5174);
+    HookOneScriptTable("anon@5646@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p5646", (PVOID)Hook_Ci_PmAnon5646, &g_OrigCi_PmAnon5646);
+    HookOneScriptTable("anon@6344@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p6344", (PVOID)Hook_Ci_PmAnon6344, &g_OrigCi_PmAnon6344);
+    HookOneScriptTable("anon@6662@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p6662", (PVOID)Hook_Ci_PmAnon6662, &g_OrigCi_PmAnon6662);
+    HookOneScriptTable("anon@7920@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p7920", (PVOID)Hook_Ci_PmAnon7920, &g_OrigCi_PmAnon7920);
+    HookOneScriptTable("anon@9698@gml_Object_Profile_Manager_obj_Create_0", "fp_ci_p9698", (PVOID)Hook_Ci_PmAnon9698, &g_OrigCi_PmAnon9698);
     // Raw object-event names (no "gml_Script_" prefix) - see the comment
     // above these hooks' CITRACE_HOOK_NAMED declarations for why this is a
     // genuinely new code path, not a repeat of anything tried before.
@@ -6505,9 +6597,9 @@ static void InstallEquipTraceHooks()
 {
     if (g_HhTraceHooksInstalled) return;
     g_HhTraceHooksInstalled = true;
-    HookOneScript("RunItemEquipped", "fp_tr_rie", (PVOID)Hook_TraceRunItemEquipped, &g_OrigTrace_RunItemEquipped);
-    HookOneScript("ItemEquip", "fp_tr_ie", (PVOID)Hook_TraceItemEquip, &g_OrigTrace_ItemEquip);
-    HookOneScript("EquipItemUnequip", "fp_tr_eiu", (PVOID)Hook_TraceEquipItemUnequip, &g_OrigTrace_EquipItemUnequip);
+    HookOneScriptTable("RunItemEquipped", "fp_tr_rie", (PVOID)Hook_TraceRunItemEquipped, &g_OrigTrace_RunItemEquipped);
+    HookOneScriptTable("ItemEquip", "fp_tr_ie", (PVOID)Hook_TraceItemEquip, &g_OrigTrace_ItemEquip);
+    HookOneScriptTable("EquipItemUnequip", "fp_tr_eiu", (PVOID)Hook_TraceEquipItemUnequip, &g_OrigTrace_EquipItemUnequip);
 }
 #endif
 
@@ -8875,36 +8967,12 @@ static void InstallHeadhunterHook()
     if (g_HhHookInstalled) return;
     if (HookOneScript("EnemyDestroyKillProc", "fp_headhunter_kill", (PVOID)Hook_EnemyDestroyKillProc, &g_Orig_EnemyDestroyKillProc)) {
         g_HhHookInstalled = true;
-
-        // Supplemental native detour (2026-09 review follow-up, PR #2 issue
-        // #1): HookOneScript's table-pointer swap only intercepts calls made
-        // through this script's own GameMaker dispatch entry, not a compiled
-        // call straight to the function's address. A review reported exactly
-        // such a call reaching EnemyDestroyKillProc directly; confirmed live
-        // (naddrorig) that this function's real address is
-        // Hero_Siege.exe+0x189A070, matching the reviewer's reported target
-        // exactly. Unlike DropRelic (see DropManager.hpp's comment on
-        // Hook_DropRelic) or the custom-forge item hooks, this target has
-        // exactly one install call site - guarded above - so it never needs
-        // the table swap's idempotent-re-install behavior, making a native
-        // inline detour safe to layer on top here without touching the
-        // shared mechanism every other hook still relies on.
-        //
-        // MmCreateHook patches the address itself, so Hook_EnemyDestroyKillProc
-        // must not call back through it directly (infinite recursion) - repoint
-        // g_Orig_EnemyDestroyKillProc at the trampoline MmCreateHook returns
-        // (the real, unpatched original code) instead. That is exactly what
-        // Hook_EnemyDestroyKillProc already calls through, so no other change
-        // is needed for the chain to stay correct.
-        PVOID nativeTramp = nullptr;
-        AurieStatus ns = MmCreateHook(g_ArSelfModule, "fp_headhunter_kill_native",
-            (PVOID)g_Orig_EnemyDestroyKillProc, (PVOID)Hook_EnemyDestroyKillProc, &nativeTramp);
-        if (AurieSuccess(ns)) {
-            g_Orig_EnemyDestroyKillProc = reinterpret_cast<PFUNC_YYGMLScript>(nativeTramp);
-            Out("headhunter: native detour installed on EnemyDestroyKillProc (direct-call coverage)");
-        } else {
-            Out("headhunter: native detour on EnemyDestroyKillProc failed st=" + std::to_string((int)ns) + " (script-table hook still active)");
-        }
+        // The supplemental native detour that used to be layered on here is
+        // gone, and deliberately: HookOneScript now installs one itself, for
+        // every gameplay hook rather than for the one target a review
+        // happened to verify. Keeping this would have patched the trampoline
+        // HookOneScript just handed back in g_Orig_EnemyDestroyKillProc,
+        // detouring our own code instead of the game's.
     }
 }
 
@@ -9546,7 +9614,7 @@ static RValue& Hook_TraceCreatorCheckSpawn(CInstance* S, CInstance* O, RValue& R
 static void InstallSpawnTraceHook()
 {
     if (g_OrigCreatorCheckSpawn) return;
-    HookOneScript("anon@849@gml_Object_Enemy_Creator_obj_Create_0", "bp_tr_checkspawn", (PVOID)Hook_TraceCreatorCheckSpawn, &g_OrigCreatorCheckSpawn);
+    HookOneScriptTable("anon@849@gml_Object_Enemy_Creator_obj_Create_0", "bp_tr_checkspawn", (PVOID)Hook_TraceCreatorCheckSpawn, &g_OrigCreatorCheckSpawn);
 }
 #endif
 #ifndef FORGEPACT_RELEASE
@@ -9558,19 +9626,19 @@ static void InstallItemInspectHooks()
     InstallAggroTraceHooks();
     InstallBeaconHook();
     InstallTyrantHook();   // research build: always, for raritytrace / experiments
-    HookOneScript("DrawTooltip",         "bp_drawtip",  (PVOID)Hook_DrawTooltip,         &g_Orig_DrawTooltip);
+    HookOneScriptTable("DrawTooltip",         "bp_drawtip",  (PVOID)Hook_DrawTooltip,         &g_Orig_DrawTooltip);
     InstallForgedTooltipHooks();   // research build: always, so tiptrace can watch any item
-    HookOneScript("draw_text_outline",   "bp_dto",      (PVOID)Hook_TraceDrawTextOutline, &g_Orig_DrawTextOutline);
-    HookOneScript("GetItemTooltipString","bp_gitip",    (PVOID)Hook_GetItemTooltipString,&g_Orig_GetItemTooltipString);
-    HookOneScript("GetItemStatString",   "bp_gistat",   (PVOID)Hook_GetItemStatString,   &g_Orig_GetItemStatString);
+    HookOneScriptTable("draw_text_outline",   "bp_dto",      (PVOID)Hook_TraceDrawTextOutline, &g_Orig_DrawTextOutline);
+    HookOneScriptTable("GetItemTooltipString","bp_gitip",    (PVOID)Hook_GetItemTooltipString,&g_Orig_GetItemTooltipString);
+    HookOneScriptTable("GetItemStatString",   "bp_gistat",   (PVOID)Hook_GetItemStatString,   &g_Orig_GetItemStatString);
     if (!g_Orig_CreateItemNew)
-        HookOneScript("CreateItemNew",       "bp_citemn",   (PVOID)Hook_CreateItemNew,       &g_Orig_CreateItemNew);
+        HookOneScriptTable("CreateItemNew",       "bp_citemn",   (PVOID)Hook_CreateItemNew,       &g_Orig_CreateItemNew);
     if (!g_Orig_CreateItemInit)
-        HookOneScript("CreateItemInit",      "bp_citemi",   (PVOID)Hook_CreateItemInit,      &g_Orig_CreateItemInit);
+        HookOneScriptTable("CreateItemInit",      "bp_citemi",   (PVOID)Hook_CreateItemInit,      &g_Orig_CreateItemInit);
     if (!g_Orig_GenerateItemRandomStats)
-        HookOneScript("GenerateItemRandomStats","bp_girs",  (PVOID)Hook_GenerateItemRandomStats,&g_Orig_GenerateItemRandomStats);
-    HookOneScript("LootGroundCreate",    "bp_lgc",      (PVOID)Hook_LootGroundCreate,    &g_Orig_LootGroundCreate);
-    HookOneScript("LootGroundCreateFromItem", "bp_lgcfi", (PVOID)Hook_LootGroundCreateFromItem, &g_Orig_LootGroundCreateFromItem);
+        HookOneScriptTable("GenerateItemRandomStats","bp_girs",  (PVOID)Hook_GenerateItemRandomStats,&g_Orig_GenerateItemRandomStats);
+    HookOneScriptTable("LootGroundCreate",    "bp_lgc",      (PVOID)Hook_LootGroundCreate,    &g_Orig_LootGroundCreate);
+    HookOneScriptTable("LootGroundCreateFromItem", "bp_lgcfi", (PVOID)Hook_LootGroundCreateFromItem, &g_Orig_LootGroundCreateFromItem);
 }
 #endif
 
@@ -9792,7 +9860,7 @@ static void SCountCmd(const std::string& rest)
         static char kimlik[8][16];
         sprintf_s(kimlik[i], "fp_sc%d", i);
         g_Yuva[i].ad = _strdup(ad.c_str());
-        if (!HookOneScript(ad.c_str(), kimlik[i], SayacKancasi(i), &g_Yuva[i].orij)) {
+        if (!HookOneScriptTable(ad.c_str(), kimlik[i], SayacKancasi(i), &g_Yuva[i].orij)) {
             g_Yuva[i].ad = nullptr;
             Out("scount: " + ad + " kancalanamadi");
         }
@@ -9865,7 +9933,7 @@ static void ZoneGenLogKur()
     };
     int kurulan = 0;
     for (const auto& k : kTablo) {
-        if (!*k.o) HookOneScript(k.ad, k.kimlik, k.k, k.o);
+        if (!*k.o) HookOneScriptTable(k.ad, k.kimlik, k.k, k.o);
         if (*k.o) kurulan++;
     }
     Out("zonegenlog: " + std::to_string(kurulan) + "/8 kanca kurulu -> bp_ipc\\zonegen.txt");
@@ -10981,19 +11049,19 @@ static void SocketProbeCmd(const std::string& rest)
     while (!v.empty() && std::isspace((unsigned char)v.back())) v.pop_back();
     if (v == "off") { g_SockProbe = false; Out("socketprobe: OFF"); return; }
     if (!g_OrigCprIrandom
-        && !HookOneScript("cpr_irandom", "fp_cprir", (PVOID)HookCprIrandom, &g_OrigCprIrandom)) {
+        && !HookOneScriptTable("cpr_irandom", "fp_cprir", (PVOID)HookCprIrandom, &g_OrigCprIrandom)) {
         Out("socketprobe: could not hook cpr_irandom"); return;
     }
     if (!g_OrigCreateItemNew
-        && !HookOneScript("CreateItemNew", "fp_citemnew", (PVOID)HookCreateItemNew, &g_OrigCreateItemNew)) {
+        && !HookOneScriptTable("CreateItemNew", "fp_citemnew", (PVOID)HookCreateItemNew, &g_OrigCreateItemNew)) {
         Out("socketprobe: could not hook CreateItemNew"); return;
     }
     if (!g_OrigLoadCommonItems
-        && !HookOneScript("LoadCommonItems", "fp_loadcommon", (PVOID)HookLoadCommonItems, &g_OrigLoadCommonItems)) {
+        && !HookOneScriptTable("LoadCommonItems", "fp_loadcommon", (PVOID)HookLoadCommonItems, &g_OrigLoadCommonItems)) {
         Out("socketprobe: could not hook LoadCommonItems"); return;
     }
     if (!g_OrigCreateItemInit
-        && !HookOneScript("CreateItemInit", "fp_citeminit", (PVOID)HookCreateItemInit, &g_OrigCreateItemInit)) {
+        && !HookOneScriptTable("CreateItemInit", "fp_citeminit", (PVOID)HookCreateItemInit, &g_OrigCreateItemInit)) {
         Out("socketprobe: could not hook CreateItemInit"); return;
     }
     g_SockItems = 0;
@@ -13232,7 +13300,7 @@ static void DungeonKeyCmd(const std::string& rest)
         // "all" -> tarama suresince TUM esyalarin ic zari da 1'e cekilir
         g_TypeMapTumOranlar = (Lower(bayrak).find("all") != std::string::npos);
         if (!g_OrigLoadDrops)
-            HookOneScript("LoadDrops", "fp_loaddrops", (PVOID)Hook_LoadDrops, &g_OrigLoadDrops);
+            HookOneScriptTable("LoadDrops", "fp_loaddrops", (PVOID)Hook_LoadDrops, &g_OrigLoadDrops);
         g_TypeMapIste = (g_OrigLoadDrops != nullptr);
         if (!g_TypeMapIste) { Out("dungeonkey typemap: kanca kurulamadi"); return; }
         char b[200];
@@ -13249,7 +13317,7 @@ static void DungeonKeyCmd(const std::string& rest)
         // Kancayi BURADA da kur.  Yoksa sonda kurulur ama LoadDrops hic
         // yakalanmaz ve dosya bos kalir - bir kez yasandi.
         if (!g_OrigLoadDrops)
-            HookOneScript("LoadDrops", "fp_loaddrops", (PVOID)Hook_LoadDrops, &g_OrigLoadDrops);
+            HookOneScriptTable("LoadDrops", "fp_loaddrops", (PVOID)Hook_LoadDrops, &g_OrigLoadDrops);
         Out("dungeonkey: sonraki " + std::to_string(n) + " LoadDrops cagrisinin chances dizisi -> bp_ipc\\chances.txt"
             + (g_OrigLoadDrops ? "" : "  (UYARI: kanca kurulamadi)"));
         return;
@@ -13351,7 +13419,7 @@ static void DungeonKeyCmd(const std::string& rest)
         Out("dungeonkey probe: yayin derlemesinde yok");
 #else
         try { g_DkProbe = std::stoi(a2); } catch (...) { g_DkProbe = 60; }
-        if (!g_OrigLoadDrops) HookOneScript("LoadDrops", "fp_loaddrops", (PVOID)Hook_LoadDrops, &g_OrigLoadDrops);
+        if (!g_OrigLoadDrops) HookOneScriptTable("LoadDrops", "fp_loaddrops", (PVOID)Hook_LoadDrops, &g_OrigLoadDrops);
         Out("dungeonkey probe: " + std::to_string(g_DkProbe) + " cagri -> bp_ipc\\loaddrops.txt");
 #endif
         return;
@@ -14469,8 +14537,8 @@ static void RunCommand(const std::string& line)
         else if (v == "stat") {
             Out("gpvlog: " + std::to_string(g_GpvGorulen.size()) + " farkli kayit -> bp_ipc\\gpv.txt");
         } else {
-            if (!g_OrigGPV) HookOneScript("GPV", "fp_gpv", (PVOID)HookGPV, &g_OrigGPV);
-            if (!g_OrigSPV) HookOneScript("SPV", "fp_spv", (PVOID)HookSPV, &g_OrigSPV);
+            if (!g_OrigGPV) HookOneScriptTable("GPV", "fp_gpv", (PVOID)HookGPV, &g_OrigGPV);
+            if (!g_OrigSPV) HookOneScriptTable("SPV", "fp_spv", (PVOID)HookSPV, &g_OrigSPV);
             g_GpvLog = 1;
             Out(std::string("gpvlog -> ACIK  (GPV kanca=") + (g_OrigGPV ? "var" : "YOK")
                 + ", SPV kanca=" + (g_OrigSPV ? "var" : "YOK") + ")  -> bp_ipc\\gpv.txt");

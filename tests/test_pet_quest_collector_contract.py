@@ -70,13 +70,18 @@ class TestPetQuestCollectorContract(unittest.TestCase):
         self.assertIn("g_OrigCi_##SAFE ? g_OrigCi_##SAFE(S, O, R, argc, A) : R", macro_body)
         for candidate in ("CheckPlayerInteraction", "CheckUseKey", "PlayerInteracting", "LootBlocksUseKey", "PickupLoot"):
             self.assertIn(f"CITRACE_HOOK({candidate})", self.plugin_code)
-            self.assertIn(f'HookOneScript("{candidate}"', self.plugin_code)
+            # Table-ONLY, deliberately. `citrace nativetrace` runs a native
+            # detour alongside these and prints both counters; that comparison
+            # is what proved compiled GML bypasses the script table, and it
+            # only means something while one side really is table-only. Every
+            # shipped gameplay hook uses HookOneScript, which installs both.
+            self.assertIn(f'HookOneScriptTable("{candidate}"', self.plugin_code)
         # Plan §3's "one chokepoint" finding: the only script-table entries
         # inside Quest_Object_Parent_obj's own Create event, traced once the
         # five named candidates above measured 0 calls on a real collect.
         for anon_id in ("1400", "1584", "2113", "2786", "3858", "4737", "5164"):
             script_name = f"anon@{anon_id}@gml_Object_Quest_Object_Parent_obj_Create_0"
-            self.assertIn(f'HookOneScript("{script_name}"', self.plugin_code)
+            self.assertIn(f'HookOneScriptTable("{script_name}"', self.plugin_code)
         guard = self.plugin_code.split("static std::atomic<bool> g_CiTraceOn{ false };", 1)[0][-300:]
         self.assertIn("#ifndef FORGEPACT_RELEASE", guard)
         self.assertIn('lc == "citrace"', self.plugin_code)

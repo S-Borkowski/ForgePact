@@ -29,25 +29,36 @@ def function_body(source: str, signature: str) -> str:
 
 
 def strip_research_blocks(source: str) -> str:
-    """What the player build compiles: `#ifndef FORGEPACT_RELEASE` bodies removed.
+    """What the player build compiles, i.e. with FORGEPACT_RELEASE defined.
 
-    Nesting-aware, so a research block containing its own `#if` does not end
-    early and leak dev-only code into what this file treats as shipped.
+    This evaluates the conditional rather than pattern-matching one spelling
+    of it. Research code is written BOTH ways in this file - as
+    `#ifndef FORGEPACT_RELEASE ... #endif` and as the `#else` half of
+    `#ifdef FORGEPACT_RELEASE ... #else ... #endif` - and an earlier version
+    of this helper only understood the first, so it reported a research-only
+    call as shipping. Conditionals on anything other than FORGEPACT_RELEASE
+    are passed through untouched; nesting is tracked so an inner `#if` cannot
+    end an outer block early.
     """
-    kept, depth, dropping_at = [], 0, None
+    kept = []
+    # One entry per open conditional: (is it about FORGEPACT_RELEASE,
+    # is its current branch compiled). Unrelated conditionals keep both
+    # halves, so `#else` must not flip them.
+    stack = []
     for line in source.split("\n"):
         stripped = line.strip()
-        if stripped.startswith("#if"):
-            depth += 1
-            if dropping_at is None and stripped.startswith("#ifndef FORGEPACT_RELEASE"):
-                dropping_at = depth
-        elif stripped.startswith("#endif"):
-            if dropping_at == depth:
-                dropping_at = None
-                depth -= 1
-                continue
-            depth -= 1
-        if dropping_at is None:
+        if stripped.startswith("#ifdef FORGEPACT_RELEASE"):
+            stack.append([True, True])
+        elif stripped.startswith("#ifndef FORGEPACT_RELEASE"):
+            stack.append([True, False])
+        elif stripped.startswith("#if"):
+            stack.append([False, True])
+        elif stripped.startswith("#else") and stack:
+            if stack[-1][0]:
+                stack[-1][1] = not stack[-1][1]
+        elif stripped.startswith("#endif") and stack:
+            stack.pop()
+        elif all(active for _, active in stack):
             kept.append(line)
     return "\n".join(kept)
 
@@ -261,6 +272,66 @@ class ReleaseHookContractTests(unittest.TestCase):
         native = stat.index("c == 1.0 && !*hedef->orig")
         install = stat.index("HookOneScript(hedef->name", native)
         self.assertLess(native, install)
+
+    def test_gameplay_hooks_intercept_direct_native_calls(self):
+        # REPORTED 2026-09-12 (origin's review of PR #2, issue 1): the script
+        # table swap alone is blind to compiled GML's direct `call rel32` -
+        # the finding this branch itself documented after 34 hooked call sites
+        # reported "0 calls" while the game was demonstrably running them.
+        # Read-only inspection of the shipped exe found direct callers for
+        # StatMovementSpeed, StatAttackSpeed, DropRelic, DropMonsterGold and
+        # DropGold, so stat scaling, drop multipliers and the max-level relic
+        # filter could report "HOOK INSTALLED" and change nothing.
+        #
+        # The interception belongs in the installer, not bolted onto whichever
+        # names a review happened to verify.
+        body = function_body(self.plugin, "static bool HookOneScript(")
+        self.assertIn("MmCreateHook", body)
+        self.assertIn("m_ScriptFunction", body)   # both routes, not one
+
+    def test_native_detour_is_installed_once_and_only_on_the_real_target(self):
+        # Three guards make repeat installation safe, which matters because
+        # shared chokepoints (DropRelic) are installed from more than one call
+        # site and re-install is how this file makes that idempotent.
+        body = function_body(self.plugin, "static bool HookOneScript(")
+        # 1. only the first install, when the table still holds the game's fn
+        self.assertIn("const bool firstInstall = (origOut && !*origOut);", body)
+        self.assertIn("if (firstInstall) {", body)
+        self.assertLess(body.index("if (firstInstall) {"), body.index("MmCreateHook"))
+        # 2. never patch a pointer that is not the game's code (another hook
+        #    may already have swapped the entry to something in this module)
+        self.assertIn("AddrIsExecutableInModule(GetModuleHandleA(nullptr)", body)
+        self.assertLess(body.index("AddrIsExecutableInModule"), body.index("MmCreateHook"))
+        # 3. a failed detour degrades to table-only and says so, rather than
+        #    leaving *origOut null or pretending it worked
+        self.assertIn("*origOut = tableEntry;", body)
+        self.assertIn("TABLE-ONLY", body)
+
+    def test_hook_bodies_call_through_the_trampoline(self):
+        # MmCreateHook patches the bytes at the target, so a hook body that
+        # called the original address directly would re-enter itself forever.
+        # *origOut must become the trampoline.
+        body = function_body(self.plugin, "static bool HookOneScript(")
+        self.assertIn("*origOut = reinterpret_cast<PFUNC_YYGMLScript>(tramp);", body)
+        # The Headhunter's hand-rolled supplemental detour must be gone - it
+        # would now patch the trampoline HookOneScript just returned.
+        install = function_body(self.plugin, "static void InstallHeadhunterHook()")
+        self.assertNotIn("MmCreateHook", install)
+
+    def test_research_hooks_stay_table_only(self):
+        # `citrace nativetrace` runs a native detour beside a table hook on the
+        # same target and prints both counters; that comparison is what proved
+        # the blindness, and it only means something while one side really is
+        # table-only. So the research hooks keep the old installer.
+        table = function_body(self.plugin, "static bool HookOneScriptTable(")
+        self.assertNotIn("MmCreateHook", table)
+        # ...and nothing in the player build may use it.
+        shipped = strip_comments(strip_research_blocks(self.plugin))
+        calls = [m for m in re.findall(r"HookOneScriptTable\(", shipped)]
+        self.assertEqual(
+            len(calls), 1,  # the definition itself
+            "HookOneScriptTable is reachable from the player build; gameplay hooks must use HookOneScript",
+        )
 
     def test_player_binary_calls_no_hand_resolved_game_address(self):
         # The defect that killed `relicgate` and nearly shipped in the pet

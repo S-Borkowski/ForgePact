@@ -1537,6 +1537,29 @@ question from the previous section (whether the method-value helper dispatches
 through the table or through the pointer in the method object) is answered:
 **through the method object.** A table swap never touches it.
 
+#### This was also a shipping bug, not only a research one (2026-09-12)
+
+Everything above was written about *instruments*. Origin's review of PR #2
+made the obvious next point, which nobody here had made: the shipped gameplay
+hooks install the same way, so they were blind in the same places — reporting
+`HOOK INSTALLED` and then changing nothing on the paths the game actually
+uses. Read-only inspection of the shipped executable found direct native
+callers for `StatMovementSpeed`, `StatAttackSpeed`, `DropRelic`,
+`DropMonsterGold` and `DropGold` (`StatMovementSpeed` caller RVA `0x59914ed` →
+target `0x5b06870`; `DropGold` with 12 verified direct callers), i.e. stat
+scaling, the drop multipliers and the max-level relic filter.
+
+`HookOneScript` now installs both routes and hands the hook body the
+trampoline; `HookOneScriptTable` keeps the old behaviour for the 58
+research-only installs, because `citrace nativetrace`'s table-vs-native
+comparison — the measurement on this very page — needs one side to really be
+table-only. Details in `docs/submodules/ForgePact/instructions.md`, Known
+Limitations item 12.
+
+The lesson worth carrying: this page had the finding for a day and drew only
+the research conclusion from it. **When an instrument turns out to be blind,
+check whether anything shipped is built the same way.**
+
 ### 2. The collect, measured
 
 In order, from one F press:
