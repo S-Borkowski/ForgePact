@@ -145,27 +145,55 @@ class TestMapRevealContract(unittest.TestCase):
         self.assertIn("CloseSpawnWindow();", tick)
         self.assertLess(tick.index("CloseSpawnWindow();"), tick.index("m_PacksPending = true"))
 
-    def test_window_is_checked_every_frame_not_only_when_throttled(self):
-        # Same report: the identity work runs one tick in 20, so a transition
-        # between checks could hand up to 20 frames of an open window to the
-        # next zone's loading creators. While a window is open the room is
-        # verified every frame instead.
+    def test_authorization_is_checked_where_the_distance_is_changed(self):
+        # REPORTED 2026-09-12, second round: OnFrame runs at EVENT_FRAME,
+        # which this YYToolkit dispatches from HkPresent - the END of the
+        # frame - while the creators consume the permission during their step
+        # events, earlier in the same frame. A window invalidated at Present
+        # is already too late for the first call in a new zone, and no amount
+        # of extra identity tracking at Present can fix that ordering.
+        #
+        # So the authorization asks the creator in hand, at the point its
+        # distance would be changed. Behaviour is covered by
+        # test_map_reveal_behavior.py, which calls the real hook before the
+        # next OnFrame; this pins the structure.
+        self.assertIn("bool MayPopulate(const RValue& creator) const", self.header)
+        self.assertIn("static bool CreatorIsReady(const RValue& creator)", self.header)
+        self.assertIn("enemyCreatorTimer", self.header[self.header.index("static bool CreatorIsReady"):][:600])
+
+        hook = self.plugin_code[self.plugin_code.index("static void Hook_distance_to_object("):]
+        hook = hook[: hook.index("\nstatic void InstallDistanceLieHook")]
+        self.assertIn("CreatorIsReady(inst)", hook)
+        self.assertIn("MayPopulate(inst)", hook)
+        # The guard must precede the assignment it guards.
+        self.assertLess(hook.index("CreatorIsReady(inst)"), hook.index("Result = RValue(0.0);"))
+        self.assertLess(hook.index("MayPopulate(inst)"), hook.index("Result = RValue(0.0);"))
+
+    def test_window_identity_is_full_and_never_unknown(self):
+        # Two related gaps reported with the above: the per-frame check
+        # compared only the room key, so a replaced or removed minimap with an
+        # unchanged room key kept the window; and TryOpenSpawnWindow stored
+        # INT64_MIN when the room was unreadable, so every later failed read
+        # compared equal to it and the window was never invalidated.
         frame = self.header[self.header.index("void OnFrame("):]
         frame = frame[: frame.index("private:")]
-        self.assertIn("RoomKey() != m_WindowRoom", frame)
-        # ...and the check must come before the countdown, so a stale window
-        # cannot serve even one more frame.
-        self.assertLess(frame.index("RoomKey() != m_WindowRoom"),
+        self.assertIn("!WindowIdentityValid()", frame)
+        self.assertLess(frame.index("!WindowIdentityValid()"),
                         frame.index("m_SpawnWindow.store(w - 1"))
-        self.assertLess(frame.index("RoomKey() != m_WindowRoom"), frame.index("% 20"))
-        # An unreadable room must read as "not our room" (closes the window),
-        # never as "same room" (keeps lying).
-        room = self.header[self.header.index("int64_t RoomKey()"):][:600]
-        self.assertEqual(room.count("return INT64_MIN;"), 3)
-        # The window records which room it belongs to when it opens.
-        opener = self.header[self.header.index("void TryOpenSpawnWindow"):][:2200]
-        self.assertIn("m_WindowRoom = RoomKey();", opener)
-        self.assertLess(opener.index("m_WindowRoom = RoomKey();"), opener.index("m_SpawnWindow.store(kSpawnWindowFrames"))
+        self.assertLess(frame.index("!WindowIdentityValid()"), frame.index("% 20"))
+
+        # Identity is room + minimap instance + grid, and a failed read is a
+        # failure rather than a sentinel value that can compare equal.
+        valid = self.header[self.header.index("bool WindowIdentityValid()"):][:500]
+        for field in ("m_WindowRoom", "m_WindowInstance", "m_WindowGrid"):
+            self.assertIn(field, valid)
+        self.assertIn("if (!ReadIdentity(room, inst, grid)) return false;", valid)
+
+        # A window is never opened against an identity that could not be read.
+        opener = self.header[self.header.index("void TryOpenSpawnWindow"):][:2600]
+        self.assertIn("if (!ReadIdentity(room, minimap, grid)) return;", opener)
+        self.assertLess(opener.index("ReadIdentity(room, minimap, grid)"),
+                        opener.index("m_SpawnWindow.store(kSpawnWindowFrames"))
 
     def test_enabling_packs_applies_to_the_current_zone(self):
         # REPORTED 2026-09-12 (issue 3): SetPacks(true) only flipped the flag.

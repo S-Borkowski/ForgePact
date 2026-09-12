@@ -423,11 +423,57 @@ closes the old window before arming the next pass.
 
 **2. The 20-frame throttle left a hole.** The identity work runs one tick in
 20, so even with the fix above a transition could hand up to 20 frames of open
-window to the next zone. While a window is open the room is now verified
-**every** frame — one member read, only for the few seconds a window lasts —
-against the room the window was opened for (`m_WindowRoom`, recorded in
-`TryOpenSpawnWindow`). An unreadable room reads as "not our room" and closes
-the window, which is the safe direction.
+window to the next zone. The first attempt at this checked the room every
+frame in `OnFrame` instead — **which was still wrong, and is the more useful
+half of this section.**
+
+### Why a frame-boundary check cannot work here (2026-09-12, second round)
+
+`OnFrame` runs at `EVENT_FRAME`, which this bundled YYToolkit dispatches from
+`HkPresent` — the **end** of the frame. The creators consume the permission in
+their **step** events, earlier in the same frame. So on the first frame in a
+new zone the distance hook still saw the previous zone's open window, and the
+window only closed afterwards. Too late for exactly the call that does the
+damage. Origin's review reproduced it against the production class:
+
+```text
+ready_zone                window=900 wants=1 creator_ready=1 distance=0
+new_room_before_present   window=900 wants=1 creator_ready=0 distance=0   <- the damage
+new_room_after_present    window=0   wants=0 creator_ready=0 distance=2500
+```
+
+No amount of extra identity tracking at Present fixes that ordering. A
+render-time check cannot make a guarantee about a step-time consumer.
+
+**The authorization moved to the consumer, and to the thing that actually
+matters.** The damage mechanism is specific: answering 0 to a creator that has
+not finished initialising makes it take its spawn branch once, early, and come
+out inert. That is a property of *the creator in hand* — not of the zone, the
+room key, or the map identity. So `Hook_distance_to_object` asks the creator,
+at the moment it would change the result: a real `enemyCreatorTimer` means
+initialised, and lying to it is safe however stale the window is.
+
+This also makes the window's staleness a performance question rather than a
+correctness one, and it means the pass keeps working across a transition
+instead of failing closed: a *ready* creator in a newly-entered zone is still
+served.
+
+The same guard applies to the Beacon's lie. The spawner comes out inert
+whichever feature answered, so the invariant belongs to the hook, not to one
+caller; the Beacon's wake radius and continuous behaviour are otherwise
+unchanged.
+
+The per-frame identity check stays as defence in depth — it stops a window
+lingering past its zone — but it is no longer load-bearing. It now compares
+the **full** identity (room + minimap instance + grid), because a replaced or
+missing minimap with an unchanged room key is a zone change too, which was the
+second gap reported.
+
+**And a window is never opened against an identity that could not be read.**
+The first version stored `INT64_MIN` as its "unreadable" sentinel and opened
+anyway, so a later failed read compared *equal* to it — "unreadable closes the
+window" only held if the window had been opened with a valid key. `ReadIdentity`
+now fails as a unit, and both callers treat failure as invalid.
 
 ### `reveal packs` on did not apply to the zone you were standing in
 
@@ -445,6 +491,32 @@ itself is on). Deliberately `m_PacksPending = true` rather than opening the
 window directly — the readiness gate is the whole reason the pass is safe, and
 short-circuiting it here would have reintroduced the original bug by a third
 route.
+
+### The tests these produced
+
+`tests/test_map_reveal_behavior.py` compiles the **real** `MapRevealManager`
+and the **real** `Hook_distance_to_object` against controlled game-API
+responses and calls the hook at the point in the frame order where it matters
+— before the next `OnFrame`. Source-string assertions passed throughout the
+period when the ordering was wrong, which is precisely the failure mode
+`agents.md` warns about; they are kept for structure, but they are not the
+regression net.
+
+Each scenario was verified to fail against the code it describes before being
+relied on. Reverting the authorization to the countdown alone reproduces the
+reported result exactly:
+
+```text
+FAIL new_room_before_present/unready_creator got=0 want=2500
+FAIL same_room_new_map/unready_before_present got=0 want=2500
+FAIL map_lost/unready_before_present got=0 want=2500
+```
+
+One of those controls also caught a mistake in the *first* control: removing
+the hook's standalone readiness guard changed nothing, because `MayPopulate`
+checks readiness too. The guard is load-bearing only for the Beacon path, so
+that path got its own scenario rather than leaving a line no test could fail
+without.
 
 ## What this changes about the original plan
 

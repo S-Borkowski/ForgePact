@@ -74,9 +74,50 @@ public:
         Out(std::string("reveal packs: ") + (m_Packs ? "ACIK" : "KAPALI"));
     }
 
-    // Read by Hook_distance_to_object on a hot builtin path - one relaxed
-    // atomic load, nothing else, and false for all but a few seconds per zone.
+    // Cheap pre-filter for Hook_distance_to_object: one relaxed atomic load,
+    // false for all but a few seconds per zone. It answers "is a pack pass
+    // running at all", NOT "may this creator be lied to" - see MayPopulate.
     bool WantsPackSpawn() const { return m_SpawnWindow.load(std::memory_order_relaxed) > 0; }
+
+    // The authorization, evaluated at the exact point the distance result
+    // would be changed, for the ONE creator it would be changed for.
+    //
+    // REPORTED 2026-09-12 (PR #2 issue 2, second round). The previous fix
+    // invalidated a stale window in OnFrame - but OnFrame runs at EVENT_FRAME,
+    // which this YYToolkit dispatches from HkPresent, i.e. at the END of the
+    // frame. The creators run their step events BEFORE that. So on the first
+    // frame in a new zone the distance hook could still consume the previous
+    // zone's permission, and the window only closed afterwards - too late for
+    // exactly the call that does the damage. A render-time check cannot
+    // guarantee anything about a step-time consumer, and no amount of extra
+    // identity tracking at Present would have fixed that ordering.
+    //
+    // So the check moved to the consumer, and to the thing that actually
+    // matters. The damage mechanism is specific: answering 0 to a creator
+    // that has not finished initialising makes it take its spawn branch once,
+    // early, and come out inert. That is a property of the creator in hand,
+    // not of the zone, the room key, or the map identity - so ask the
+    // creator. A creator reporting a real enemyCreatorTimer is initialised,
+    // and lying to it is safe no matter how stale the window is or which zone
+    // it was opened for.
+    //
+    // Cost: one variable_instance_get, paid only while a window is open and
+    // only for instances the hook has already confirmed are creators. The
+    // hook does the same kind of read for object_index one line earlier.
+    bool MayPopulate(const RValue& creator) const {
+        if (m_SpawnWindow.load(std::memory_order_relaxed) <= 0) return false;
+        return CreatorIsReady(creator);
+    }
+
+    // Whether one creator instance has finished initialising. The window's
+    // opening gate asks this of the zone's first creator; MayPopulate asks it
+    // of the creator actually being answered.
+    static bool CreatorIsReady(const RValue& creator) {
+        try {
+            RValue t = g_Yytk->CallBuiltin("variable_instance_get", { creator, RValue("enemyCreatorTimer") });
+            return (t.m_Kind == VALUE_REAL || t.m_Kind == VALUE_INT32 || t.m_Kind == VALUE_INT64);
+        } catch (...) { return false; }
+    }
 
     // Diagnostics for `reveal stat`.
     long PacksZones() const { return m_ZonesPopulated; }
@@ -102,7 +143,13 @@ public:
             // While a window is open, check the room every frame instead. It
             // is one member read, it only runs for the few seconds a window
             // lasts, and being wrong here is the expensive direction.
-            if (RoomKey() != m_WindowRoom) { CloseSpawnWindow(); return; }
+            // Defence in depth, not the safety property. MayPopulate is what
+            // makes a stale window harmless; this just stops one lingering
+            // longer than the zone it belongs to. It compares the FULL
+            // identity (room + minimap instance + grid), because a replaced
+            // or missing minimap with an unchanged room key is a zone change
+            // too - reported 2026-09-12 as a second reproduction.
+            if (!WindowIdentityValid()) { CloseSpawnWindow(); return; }
             m_SpawnWindow.store(w - 1, std::memory_order_relaxed);
         }
         if ((frameCount % 20) != 0) return;
@@ -129,7 +176,11 @@ private:
     // zone is written off as one whose creators never initialise.
     static constexpr int kPendingGiveUpTicks = 1800;
     std::atomic<int> m_SpawnWindow{ 0 };
-    int64_t m_WindowRoom{ INT64_MIN };   // the room the open window belongs to
+    // The zone identity an open window belongs to. INT64_MIN means "no
+    // window / unknown", and is never a value ReadIdentity produces.
+    int64_t m_WindowRoom{ INT64_MIN };
+    int64_t m_WindowInstance{ INT64_MIN };
+    int64_t m_WindowGrid{ INT64_MIN };
     bool m_PacksPending{ false };
     int  m_PendingTicks{ 0 };
     long m_ZonesPopulated{ 0 };
@@ -143,6 +194,8 @@ private:
         m_PacksPending = false;
         m_PendingTicks = 0;
         m_WindowRoom = INT64_MIN;
+        m_WindowInstance = INT64_MIN;
+        m_WindowGrid = INT64_MIN;
     }
 
     // REPORTED 2026-09-12 (PR #2 issue 2): ResetIdentity is what Tick() calls
@@ -158,15 +211,49 @@ private:
         CloseSpawnWindow();
     }
 
-    // The `room` global, or INT64_MIN when it cannot be read. An unreadable
-    // room reads as "not the room the window was opened for", which closes the
-    // window - the safe direction.
+    // The `room` global, or INT64_MIN when it cannot be read.
     int64_t RoomKey() const {
         CInstance* global = nullptr;
         if (!AurieSuccess(g_Yytk->GetGlobalInstance(&global)) || !global) return INT64_MIN;
         RValue* room = nullptr;
         if (!AurieSuccess(g_Yytk->GetInstanceMember(RValue(global), "room", room)) || !room) return INT64_MIN;
         try { return static_cast<int64_t>(std::llround(room->ToDouble())); } catch (...) { return INT64_MIN; }
+    }
+
+    // The full zone identity: room, the live minimap instance, and its grid.
+    // Returns false if any part is missing or unreadable - which is the state
+    // during a room load, and is never a valid identity to act on.
+    //
+    // REPORTED 2026-09-12: the previous version compared only the room key and
+    // used INT64_MIN as its "unreadable" sentinel, so a window opened while
+    // the room was unreadable stored INT64_MIN and every later failed read
+    // compared equal to it. "Unreadable closes the window" only held if the
+    // window had been opened with a valid key. Now an unreadable identity is
+    // never stored and never matches: ReadIdentity fails, and both callers
+    // treat failure as invalid.
+    bool ReadIdentity(int64_t& roomOut, int64_t& instOut, int64_t& gridOut) const {
+        try {
+            RValue oi = g_Yytk->CallBuiltin("asset_get_index", { RValue("objMinimap") });
+            RValue id = g_Yytk->CallBuiltin("instance_find", { oi, RValue(0.0) });
+            if (id.ToDouble() < 0) return false;
+            if (!g_Yytk->CallBuiltin("variable_instance_exists", { id, RValue("minimapDiscoveredGrid") }).ToBoolean()) return false;
+            RValue grid = g_Yytk->CallBuiltin("variable_instance_get", { id, RValue("minimapDiscoveredGrid") });
+            const double gid = grid.ToDouble();
+            if (gid < 0) return false;
+            if (!g_Yytk->CallBuiltin("ds_exists", { RValue(gid), RValue(1.0) }).ToBoolean()) return false;
+            const int64_t room = RoomKey();
+            if (room == INT64_MIN) return false;
+            roomOut = room;
+            instOut = static_cast<int64_t>(std::llround(id.ToDouble()));
+            gridOut = static_cast<int64_t>(std::llround(gid));
+            return true;
+        } catch (...) { return false; }
+    }
+
+    bool WindowIdentityValid() const {
+        int64_t room = INT64_MIN, inst = INT64_MIN, grid = INT64_MIN;
+        if (!ReadIdentity(room, inst, grid)) return false;
+        return room == m_WindowRoom && inst == m_WindowInstance && grid == m_WindowGrid;
     }
 
     void Tick() {
@@ -235,10 +322,16 @@ private:
         const bool ready = (t.m_Kind == VALUE_REAL || t.m_Kind == VALUE_INT32 || t.m_Kind == VALUE_INT64);
         if (!ready) return;   // creators still initialising - check again next tick
 
-        // Remember which room this window was opened for, so OnFrame can shut
-        // it the moment the player leaves rather than at the next throttled
-        // identity check (PR #2 issue 2).
-        m_WindowRoom = RoomKey();
+        // Never open a window against an identity we could not read. An
+        // unknown identity cannot be invalidated later - it has nothing to
+        // compare against - so the pass waits for the next tick instead
+        // (reported 2026-09-12).
+        int64_t room = INT64_MIN, minimap = INT64_MIN, grid = INT64_MIN;
+        if (!ReadIdentity(room, minimap, grid)) return;
+
+        m_WindowRoom = room;
+        m_WindowInstance = minimap;
+        m_WindowGrid = grid;
         m_SpawnWindow.store(kSpawnWindowFrames, std::memory_order_relaxed);
         m_PacksPending = false;
         m_PendingTicks = 0;

@@ -4764,17 +4764,39 @@ static void Hook_distance_to_object(RValue& Result, CInstance* S, CInstance* O, 
         RValue inst = S->ToRValue();
         RValue oi = g_Yytk->CallBuiltin("variable_instance_get", { inst, RValue("object_index") });
         if (!IsCreatorObject((int)oi.ToDouble())) return;
-        if (!revealWants && g_BeWakeRadius > 0.0) {
-            RValue player; if (!HhResolveLocalPlayer(player)) return;
-            const double px = g_Yytk->CallBuiltin("variable_instance_get", { player, RValue("x") }).ToDouble();
-            const double py = g_Yytk->CallBuiltin("variable_instance_get", { player, RValue("y") }).ToDouble();
-            const double cx = g_Yytk->CallBuiltin("variable_instance_get", { inst, RValue("x") }).ToDouble();
-            const double cy = g_Yytk->CallBuiltin("variable_instance_get", { inst, RValue("y") }).ToDouble();
-            const double dx = cx - px, dy = cy - py;
-            if (dx * dx + dy * dy > g_BeWakeRadius * g_BeWakeRadius) return;
+
+        // Never answer 0 to a creator that has not finished initialising: it
+        // takes its spawn branch once, early, and comes out inert, leaving
+        // the zone emptier than vanilla and permanently so (measured
+        // 2026-09-11, docs/map-reveal-research.md).
+        //
+        // This is checked HERE, at the moment the result would be changed,
+        // rather than at a frame boundary. EVENT_FRAME is dispatched from
+        // HkPresent - the end of the frame - and creators run their step
+        // events before that, so a window invalidated at Present is already
+        // too late for the first call in a new zone (reported 2026-09-12).
+        // The creator in hand is the only thing that can answer this
+        // question at the only moment it matters.
+        if (!ForgePact::MapRevealManager::CreatorIsReady(inst)) return;
+
+        const bool revealOk = revealWants
+            && ForgePact::MapRevealManager::Instance().MayPopulate(inst);
+        if (!revealOk) {
+            // Reveal declined (or was never asking). The Beacon's own lie is
+            // unchanged, wake radius and all.
+            if (!beaconWants) return;
+            if (g_BeWakeRadius > 0.0) {
+                RValue player; if (!HhResolveLocalPlayer(player)) return;
+                const double px = g_Yytk->CallBuiltin("variable_instance_get", { player, RValue("x") }).ToDouble();
+                const double py = g_Yytk->CallBuiltin("variable_instance_get", { player, RValue("y") }).ToDouble();
+                const double cx = g_Yytk->CallBuiltin("variable_instance_get", { inst, RValue("x") }).ToDouble();
+                const double cy = g_Yytk->CallBuiltin("variable_instance_get", { inst, RValue("y") }).ToDouble();
+                const double dx = cx - px, dy = cy - py;
+                if (dx * dx + dy * dy > g_BeWakeRadius * g_BeWakeRadius) return;
+            }
         }
         Result = RValue(0.0);
-        if (revealWants) ++g_RevealSpawnLies; else ++g_BeSpawnLies;
+        if (revealOk) ++g_RevealSpawnLies; else ++g_BeSpawnLies;
     } catch (...) {}
 }
 // Map-reveal's pack pass needs the same builtin detour the Beacon uses, but
